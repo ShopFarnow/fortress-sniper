@@ -144,7 +144,7 @@ RANKS = [
 
 CFG = dict(
     vol_ratio        = 2.5,
-    turnover_lakhs   = 300,
+    turnover_lakhs   = 150,
     atr_t2           = 1.5,
     atr_t3           = 1.75,
     alt_warn_pct     = 40.0,
