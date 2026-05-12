@@ -2071,25 +2071,77 @@ def calc_mfi(df, period=14):
     mfr = pos.rolling(period).sum()/neg.rolling(period).sum().replace(0,np.nan)
     return 100-(100/(1+mfr))
 
-def calc_vpoc(df, lookback: int = 252, n_bins: int = 100) -> float:
+def _calc_vpoc_single(df: pd.DataFrame, lookback: int, n_bins: int = 100) -> float:
+    """
+    Internal: bin-histogram VPOC for a single lookback window.
+    Bars are time-weighted so that recent sessions count more than old ones.
+    This prevents a strong recent downtrend from dragging VPOC to current price
+    when the structural HVN (High Volume Node) lies higher.
+    """
     r = df.tail(lookback).copy()
     if len(r) < 20:
         return float(df["close"].iloc[-1])
     price_min = float(r["low"].min()); price_max = float(r["high"].max())
     if price_max <= price_min:
         return float(r["close"].iloc[-1])
-    bins       = np.linspace(price_min, price_max, n_bins+1)
+    bins       = np.linspace(price_min, price_max, n_bins + 1)
     bin_volume = np.zeros(n_bins)
-    lows=r["low"].values.astype(float); highs=r["high"].values.astype(float)
-    volumes=r["volume"].values.astype(float)
-    for i in range(len(r)):
-        bl,bh,vol = lows[i],highs[i],volumes[i]
-        if vol<=0 or bh<=bl: continue
+    n          = len(r)
+    lows    = r["low"].values.astype(float)
+    highs   = r["high"].values.astype(float)
+    volumes = r["volume"].values.astype(float)
+    # Recency weight: oldest bar=0.5, newest bar=1.0 (linear ramp)
+    # This ensures the dominant trading zone from a prior range isn't buried by
+    # a thin-volume recent drawdown.
+    recency_weights = np.linspace(0.5, 1.0, n)
+    for i in range(n):
+        bl, bh, vol = lows[i], highs[i], volumes[i]
+        if vol <= 0 or bh <= bl:
+            continue
         overlap = np.maximum(0.0,
-                    np.minimum(bh,bins[1:])-np.maximum(bl,bins[:-1]))
-        bin_volume += vol*(overlap/(bh-bl))
+                    np.minimum(bh, bins[1:]) - np.maximum(bl, bins[:-1]))
+        bin_volume += recency_weights[i] * vol * (overlap / (bh - bl))
     vpoc_idx = int(np.argmax(bin_volume))
-    return float((bins[vpoc_idx]+bins[vpoc_idx+1])/2.0)
+    return float((bins[vpoc_idx] + bins[vpoc_idx + 1]) / 2.0)
+
+
+def calc_vpoc(df: pd.DataFrame, lookback: int = 252, n_bins: int = 100) -> float:
+    """
+    Multi-timeframe weighted VPOC — implements the vpoc_3m_wt / vpoc_6m_wt /
+    vpoc_12m_wt weights defined in SNIPER_CFG (previously configured but unused).
+
+    Three lookback windows:
+      3M  ≈  63 bars  weight 0.40  (near-term HVN — most actionable)
+      6M  ≈ 126 bars  weight 0.35  (medium-term structure)
+     12M  ≈ 252 bars  weight 0.25  (annual structural floor)
+
+    The weighted blend prevents a downtrend from dragging the VPOC to the
+    current price when the real High Volume Node sits higher (e.g. INOXWIND
+    traded 3M of heavy volume at 110-116 before the sell-off — that HVN is
+    the true VPOC, not the thin-volume bounce zone at 97-99).
+    """
+    wt_3m  = SNIPER_CFG.get("vpoc_3m_wt",  0.40)
+    wt_6m  = SNIPER_CFG.get("vpoc_6m_wt",  0.35)
+    wt_12m = SNIPER_CFG.get("vpoc_12m_wt", 0.25)
+
+    lb_3m  = min(63,  len(df))
+    lb_6m  = min(126, len(df))
+    lb_12m = min(252, len(df))
+
+    vpoc_3m  = _calc_vpoc_single(df, lb_3m,  n_bins)
+    vpoc_6m  = _calc_vpoc_single(df, lb_6m,  n_bins)
+    vpoc_12m = _calc_vpoc_single(df, lb_12m, n_bins)
+
+    # If 3M and 6M are far apart (>10%), the structure is trending —
+    # lean more on the 6M/12M node which holds the dominant HVN.
+    divergence = abs(vpoc_3m - vpoc_6m) / max(vpoc_6m, 1e-6)
+    if divergence > 0.10:
+        # Structural divergence: shift weight toward longer-term HVN
+        wt_3m, wt_6m, wt_12m = 0.20, 0.45, 0.35
+
+    total_wt = wt_3m + wt_6m + wt_12m
+    vpoc_blended = (vpoc_3m * wt_3m + vpoc_6m * wt_6m + vpoc_12m * wt_12m) / total_wt
+    return round(float(vpoc_blended), 2)
 
 def calc_adx(df, period=14):
     h,l,c = df["high"],df["low"],df["close"]
@@ -2949,6 +3001,17 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
 
     if result.get("fog_block"):
         result["alloc"] = "PROBE 10% 🌫️"
+        # Inject FOG into the directive text so Telegram matches Pine's
+        # "FOG — CAUTION · HOLD FIRE" label instead of silently showing
+        # the action directive while fog_block is quietly overriding alloc.
+        fog_tier = result.get("fog_tier", "FOG_WARNING")
+        existing_dir = result.get("sniper_directive", "")
+        if "FOG" not in existing_dir:
+            result["sniper_directive"] = (
+                f"🌫️ {fog_tier} — CAUTION · HOLD FIRE\n"
+                f"  ({existing_dir})"
+            )
+        result["sniper_deploy"] = 0   # hard-zero deploy under fog
 
     if PAPER_MODE:
         result.update(paper_score(symbol, hist, close))
@@ -3027,17 +3090,38 @@ def _get_macro_regime() -> dict:
 
 # ── SN-1: Composite + Directive ────────────────────────────────────
 
-def calc_sniper_composite(fort: dict, fii_pts: int, macro_state: str) -> int:
+def calc_sniper_composite(fort: dict, fii_pts: int, macro_state: str,
+                           sn_layers: dict = None) -> int:
+    """
+    SN-1 composite score (0-100).
+
+    IMPORTANT: uses SN-2 layers (sn_layer1..3) when available, NOT the
+    fortress scoring layers (layer1/2/3). The two layer sets use different
+    VPOC tolerances and liquidity gates. Mixing them inflated the composite
+    and caused false PROBE signals (INOXWIND: Python 62 vs Pine 13).
+    """
     macro_map = {"CLEAR":100,"CHOP":50,"PANIC":20,"MASSACRE":0}
     macro_score = macro_map.get(macro_state, 50)
-    l1=fort.get("layer1",False); l2=fort.get("layer2",False); l3=fort.get("layer3",False)
-    vcp_coil=fort.get("vcp_coil","LOOSE")=="TIGHT 🟢"
-    alt_ok=fort.get("alt_pct",100)<SNIPER_CFG["alt_warn_pct"]
-    sect_ok=fort.get("sector_mult",1.0)>=1.0
-    vcp_score = (25 if l1 else 0)+(20 if l2 else 0)+(25 if l3 else 0)+(15 if vcp_coil else 0)+(10 if sect_ok else 0)+(5 if alt_ok else 0)
-    rsi_v=fort.get("rsi",50.0)
-    flow_score = (100 if rsi_v<40 else 70 if rsi_v<50 else 40 if rsi_v<60 else 20)
-    composite = round(macro_score*0.30 + vcp_score*0.50 + flow_score*0.20)
+
+    # Prefer SN-2 layers; fall back to fortress layers if SN-2 not yet computed
+    if sn_layers:
+        l1 = sn_layers.get("sn_layer1", False)
+        l2 = sn_layers.get("sn_layer2", False)
+        l3 = sn_layers.get("sn_layer3", False)
+        vcp_coil = fort.get("vcp_coil","LOOSE") == "TIGHT 🟢"
+    else:
+        l1 = fort.get("layer1", False)
+        l2 = fort.get("layer2", False)
+        l3 = fort.get("layer3", False)
+        vcp_coil = fort.get("vcp_coil","LOOSE") == "TIGHT 🟢"
+
+    alt_ok  = fort.get("alt_pct", 100) < SNIPER_CFG["alt_warn_pct"]
+    sect_ok = fort.get("sector_mult", 1.0) >= 1.0
+    vcp_score = ((25 if l1 else 0) + (20 if l2 else 0) + (25 if l3 else 0) +
+                 (15 if vcp_coil else 0) + (10 if sect_ok else 0) + (5 if alt_ok else 0))
+    rsi_v      = fort.get("rsi", 50.0)
+    flow_score = (100 if rsi_v < 40 else 70 if rsi_v < 50 else 40 if rsi_v < 60 else 20)
+    composite  = round(macro_score * 0.30 + vcp_score * 0.50 + flow_score * 0.20)
     return min(100, max(0, composite))
 
 
@@ -3077,11 +3161,13 @@ def calc_sniper_directive(symbol, fort, result, macro_state, breadth_ok,
         if r2_hit:
             return {"sniper_directive":"📈 HOLD — R2 HIT — trail 2.5×ATR","sniper_action":"TRAIL",
                     "sniper_deploy":0,"sniper_entry":active_stop,"sn_active_stop":active_stop,
-                    "is_pristine":is_pristine,"is_good":is_good,"is_marginal":is_marginal}
+                    "is_pristine":is_pristine,"is_good":is_good,"is_marginal":is_marginal,
+                    "is_probe":is_probe,"all_layers":all_layers}
         if r1_hit:
             return {"sniper_directive":"🎯 PARTIAL SELL — R1 HIT (30% sell)","sniper_action":"PARTIAL_SELL",
                     "sniper_deploy":0,"sniper_entry":active_stop,"sn_active_stop":active_stop,
-                    "is_pristine":is_pristine,"is_good":is_good,"is_marginal":is_marginal}
+                    "is_pristine":is_pristine,"is_good":is_good,"is_marginal":is_marginal,
+                    "is_probe":is_probe,"all_layers":all_layers}
 
     if is_pristine:
         entry_price=t1; deploy=100
@@ -3102,7 +3188,8 @@ def calc_sniper_directive(symbol, fort, result, macro_state, breadth_ok,
 
     return {"sniper_directive":directive,"sniper_action":"BUY" if deploy>0 else "WATCH",
             "sniper_deploy":deploy,"sniper_entry":entry_price,"sn_active_stop":active_stop,
-            "is_pristine":is_pristine,"is_good":is_good,"is_marginal":is_marginal}
+            "is_pristine":is_pristine,"is_good":is_good,"is_marginal":is_marginal,
+            "is_probe":is_probe,"all_layers":all_layers}
 
 
 # ── SN-2: 6-Layer VPOC Validation ──────────────────────────────────
@@ -3316,8 +3403,10 @@ def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
     result.update(sn_bayes)
     result["total_score"] = min(MAX_SCORE, result["total_score"] + sn_bayes["sn_bayes_bonus"])
 
-    # SN-1 composite
-    composite = calc_sniper_composite(fort, result.get("score_fii",15), macro_state)
+    # SN-1 composite — pass SN-2 layers so composite uses the stricter 6-layer
+    # validation gates rather than fortress scoring layers (prevents inflation)
+    composite = calc_sniper_composite(fort, result.get("score_fii",15), macro_state,
+                                      sn_layers=layers6)
     result["sniper_composite"] = composite
 
     # SN-6 exit plan
@@ -3333,8 +3422,23 @@ def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
                                       breadth_ok, composite, has_position)
     result.update(directive)
 
-    # SN-5 sizing
-    sn_pos = calc_sniper_position(close, atr14, composite, directive["sniper_deploy"])
+    # ── FOG post-directive override ──────────────────────────────────
+    # assemble_result() already set fog_block and overrode alloc to PROBE 10% 🌫️
+    # but the directive text was set before FOG was checked. Re-apply here
+    # so the Telegram directive label matches Pine's "FOG — CAUTION · HOLD FIRE".
+    if result.get("fog_block"):
+        fog_tier = result.get("fog_tier", "FOG_WARNING")
+        existing_dir = result.get("sniper_directive", "")
+        if "FOG" not in existing_dir:
+            result["sniper_directive"] = (
+                f"🌫️ {fog_tier} — CAUTION · HOLD FIRE\n"
+                f"  ({existing_dir})"
+            )
+        result["sniper_deploy"] = 0   # hard-zero deploy under fog
+
+    # SN-5 sizing — recompute after fog may have zeroed deploy
+    sn_pos = calc_sniper_position(close, atr14, composite,
+                                   result.get("sniper_deploy", directive["sniper_deploy"]))
     result.update(sn_pos)
 
     result["macro_state"] = macro_state
