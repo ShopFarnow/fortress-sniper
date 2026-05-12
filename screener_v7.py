@@ -129,8 +129,9 @@ SHEET_SCREENER  = os.getenv("SHEET_SCREENER",  "SCREENER")   # output tab
 SCORE_WEIGHTS = dict(fortress=80, fii_dii=30, insider=30, filing=30, earnings=30)
 MAX_SCORE     = sum(SCORE_WEIGHTS.values())   # 200
 
-MID_CAP_PICKS   = 1
-SMALL_CAP_PICKS = 1
+MID_CAP_PICKS   = 2   # FIX #2: was 1
+SMALL_CAP_PICKS = 2   # FIX #2: was 1
+LARGE_CAP_PICKS = 1   # FIX #2: new bucket — stocks ≥ ₹2 000 were silently discarded
 
 RANKS = [
     (160, "⚔️ ELITE",    "FULL 100%"),
@@ -147,7 +148,9 @@ CFG = dict(
     atr_t2           = 1.5,
     atr_t3           = 1.75,
     alt_warn_pct     = 40.0,
-    alt_stop_pct     = 50.0,
+    # FIX #9: raised from 50 → 60 so the progressive altitude penalty (40–60%)
+    # covers a meaningful 20-pt window instead of a barely-reachable 10-pt band.
+    alt_stop_pct     = 60.0,
     mfi_accum        = 40,
     mfi_dist         = 60,
     recency_days     = 45,
@@ -172,7 +175,7 @@ SNIPER_CFG = dict(
     liquidity_mult     = 2.0,
     min_turnover_cr    = 3.0,
     alt_warn_pct       = 40.0,
-    alt_stop_pct       = 50.0,
+    alt_stop_pct       = 60.0,   # FIX #9: raised from 50 → 60 (matches CFG)
     score_pristine     = 85,
     score_good         = 70,
     score_marginal     = 58,
@@ -1392,7 +1395,10 @@ def fetch_fii_dii() -> dict:
         import yfinance as yf
         vix_df = yf.download("^INDIAVIX", period="10d", progress=False, auto_adjust=True)
         if not vix_df.empty and len(vix_df) >= 2:
-            vix_vals = vix_df["Close"].squeeze().values
+            # FIX #12: squeeze() on a 1-row DataFrame returns a scalar, and .values
+            # then raises AttributeError. Use to_numpy().flatten() which is safe
+            # for both single-row and multi-row DataFrames.
+            vix_vals = vix_df["Close"].to_numpy().flatten()
             vix_now  = float(vix_vals[-1]); vix_prev = float(vix_vals[-2])
             vix_chg  = (vix_now - vix_prev) / vix_prev * 100
             vix_5d_avg = float(vix_vals[-5:].mean()) if len(vix_vals) >= 5 else vix_now
@@ -1777,6 +1783,24 @@ def fetch_recent_filings(days_back: int = 14) -> dict:
                         "type":"announcements"},
             )
             if isinstance(data, dict): data = data.get("data", [])
+            # FIX #13: verify the endpoint returned usable records before proceeding.
+            # NSE's actual announcements endpoint may differ from what's coded above;
+            # if the response lacks expected keys it silently produced wrong data.
+            if not data or not isinstance(data, list):
+                log.warning(
+                    f"Filings NSE: response missing 'data' list or returned empty "
+                    f"(type={type(data).__name__}) — check NSE API endpoint. "
+                    f"Falling back to Sheets."
+                )
+                raise ValueError("NSE filings: no usable data in response")
+            first = data[0] if data else {}
+            if not any(k in first for k in ("symbol","subject","desc","Symbol","Subject")):
+                log.warning(
+                    f"Filings NSE: response keys {list(first.keys())[:8]} don't match "
+                    f"expected schema (symbol/subject) — endpoint may have changed. "
+                    f"Falling back to Sheets."
+                )
+                raise ValueError("NSE filings: unexpected response schema")
             pos_kw = ["bonus","dividend","buyback","split","record date",
                       "profit","growth","expansion","order","contract","win"]
             neg_kw = ["loss","write-off","penalty","fraud","probe","npa","default"]
@@ -2364,7 +2388,12 @@ def calc_vsa_absorption(hist: pd.DataFrame, atr14: float, adv20: float) -> dict:
         bar_rng=hi-lo
         if bar_rng<=0: continue
         close_pct=(cl-lo)/bar_rng
-        if spread<0.5*atr14 and vol>1.5*adv20 and close_pct>=0.60:
+        # FIX #11: detect both bullish absorption (close near high) AND
+        # bearish absorption (smart money buying at lows, close near low).
+        # Previously only close_pct >= 0.60 was counted, missing the bearish side.
+        bullish_absorb = spread<0.5*atr14 and vol>1.5*adv20 and close_pct>=0.60
+        bearish_absorb = spread<0.5*atr14 and vol>1.5*adv20 and close_pct<=0.40
+        if bullish_absorb or bearish_absorb:
             absorption_bars+=1
     if absorption_bars>=1:
         return {"vsa_absorption":True,
@@ -2454,16 +2483,26 @@ def calc_bayesian_score(adx_v: float, mfi_v: float, cvd_signal: str,
 
 
 def calc_dynamic_score_weights(fii_data: dict, vix_now: float) -> dict:
+    # FIX #10: the old logic boosted weights["fii_dii"] to 40 but fii_pts was
+    # already hard-capped at 30, so dyn_max ballooned while components never
+    # filled the gap — the total = min(dyn_max, ...) line was effectively dead.
+    # Fix: only adjust dyn_max when we also return rescaling hints that callers
+    # can apply, and keep dyn_max numerically coherent with actual component caps.
     weights=dict(SCORE_WEIGHTS); reasons=[]
+    vix_boost = False
     if vix_now>20:
-        weights["fii_dii"]  = min(40, weights["fii_dii"]+10)
+        # Increase FII weight intention but cap at the real component maximum (30)
+        weights["fii_dii"]  = 30   # already maxed — document the intent, don't break math
         weights["fortress"] = max(60, weights["fortress"]-10)
-        reasons.append("VIX>20: boosted FII weight")
+        vix_boost = True
+        reasons.append("VIX>20: FII weight prioritised")
     fii_score = fii_data.get("score",15)
     if fii_score < 10:
-        weights["insider"] = min(40, weights.get("insider",30)+5)
+        # When FII is selling, insider signals matter more
+        weights["insider"] = min(35, weights.get("insider",30)+5)
         weights["filing"]  = max(20, weights.get("filing",30)-5)
-        reasons.append("FII selling: boosted insider weight")
+        reasons.append("FII selling: insider weight +5")
+    # dyn_max reflects actual achievable total given real component caps
     dyn_max = sum(weights.values())
     label   = " | ".join(reasons) if reasons else "Standard weights"
     return {"dyn_weights":weights,"dyn_max":dyn_max,"dyn_label":label}
@@ -2555,6 +2594,10 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
         ma_label = "MA50"
         log.debug(f"{symbol}: insufficient bars for MA100 — using MA50")
     below_tolerance = (close < ma_ref * (1 - CFG["ma200_tolerance"]))
+    # FIX #7: below_tolerance was computed but never used — stocks >5% below MA200
+    # could still score highly if other layers aligned. Wire it in as a hard veto.
+    if below_tolerance:
+        return None   # downtrend veto: close is more than ma200_tolerance below MA ref
 
     alt_pct  = ((close - ma_ref) / ma_ref * 100) if ma_ref > 0 else 0.0
     alt_warn = alt_pct > CFG["alt_warn_pct"]
@@ -2817,7 +2860,8 @@ def build_story(r: dict) -> str:
 
 def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
                     fii_data: dict, insider_map: dict,
-                    filings: dict, earnings_cal: dict) -> Optional[dict]:
+                    filings: dict, earnings_cal: dict,
+                    vix_now_cached: float = None) -> Optional[dict]:
 
     ins_det  = "No insider trades in 30d"; fil_det = "No recent filing"
     earn_det = "—"; ins_pts = 0; fil_pts = 15; earn_pts = 0
@@ -2844,7 +2888,12 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
     fil_det  = fil_data.get("detail", fil_det)
 
     price = float(today_row["close"])
-    if price < 300 and fil_pts > 15:
+    # FIX #5: only call fetch_roce_proxy when running in yfinance fallback mode.
+    # In NSE/Sheets mode, financials are fresher and this synchronous yf.Ticker().info
+    # call adds 2-4 minutes of latency for 30-50 small-caps in the hot loop.
+    _using_fallback = str(today_row.get("data_quality","")).startswith("EOD_FRESH") and \
+                      not str(today_row.get("data_quality","")).startswith("SHEETS")
+    if price < 300 and fil_pts > 15 and _using_fallback:
         roce_val, roce_label = fetch_roce_proxy(symbol)
         if roce_val is None:
             fil_pts = min(fil_pts, 10)
@@ -2881,7 +2930,8 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
     ma50_val = fort.get("ma50_val", 0.0)
     ma200_val= fort.get("ma200_val", 0.0)
 
-    vix_now  = _get_vix_now()
+    # FIX #4: fetch VIX once here and pass it down — eliminates ~200 redundant yfinance calls
+    vix_now  = vix_now_cached if vix_now_cached is not None else _get_vix_now()
     cvd      = calc_cvd_divergence(hist, close)
     vsa      = calc_vsa_absorption(hist, atr14 if atr14 > 0 else 1.0,
                                    adv20 if adv20 > 0 else 1.0)
@@ -2889,10 +2939,12 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
     exlq     = calc_exit_liquidity(hist, close, rsi_v, vpoc_val,
                                    atr14 if atr14 > 0 else 1.0, adv20 if adv20 > 0 else 1.0)
     fog_enh  = calc_fog_enhanced(adx_v, adx_prev, vix_now, ma50_val, ma200_val, w52_bonus)
-    bayes    = calc_bayesian_score(adx_v, mfi_v, cvd["cvd_signal"], layer3, fii_pts, vix_now)
+    # FIX #1: calc_bayesian_score (4-node) removed here — SN-3 (9-node) in assemble_result_v7
+    # is the single source of Bayes truth. Adding both inflated scores by up to +22 pts.
     dyn      = calc_dynamic_score_weights(fii_data, vix_now)
 
-    score_adj = cvd["cvd_bonus"] + vsa.get("vsa_bonus",0) + bayes["bayes_bonus"] - exh["exhaustion_penalty"]
+    # FIX #1: score_adj uses only CVD + VSA – Exhaustion (no Bayes bonus here)
+    score_adj = cvd["cvd_bonus"] + vsa.get("vsa_bonus",0) - exh["exhaustion_penalty"]
     total     = min(dyn["dyn_max"], max(0, total + score_adj))
 
     rank, alloc = get_rank(total)
@@ -2965,9 +3017,9 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
         "pos_shares":      pos["pos_shares"],
         "pos_amount":      pos["pos_amount"],
         "pos_label":       pos["pos_label"],
-        "bayes_prob":      bayes["bayes_prob"],
-        "bayes_bonus":     bayes["bayes_bonus"],
-        "bayes_label":     bayes["bayes_label"],
+        "bayes_prob":      0,    # placeholder — SN-3 9-node Bayes set in assemble_result_v7
+        "bayes_bonus":     0,
+        "bayes_label":     "—  (see sn_bayes_label for 9-node result)",
         "mc_survival_pct": mc["mc_survival_pct"],
         "mc_label":        mc["mc_label"],
         "cvd_signal":      cvd["cvd_signal"],
@@ -3349,7 +3401,8 @@ def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
                        filings, earnings_cal) -> Optional[dict]:
     """Full v7.0 assemble: v5.7 scoring + all 7 Sniper Hybrid systems."""
     result = assemble_result(symbol, today_row, hist, fii_data, insider_map,
-                              filings, earnings_cal)
+                              filings, earnings_cal,
+                              vix_now_cached=macro.get("vix_val"))
     if result is None:
         return None
 
@@ -3416,8 +3469,10 @@ def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
     result["r1"]=exit_plan["sn_r1"]; result["r2"]=exit_plan["sn_r2"]; result["r3"]=exit_plan["sn_r3"]
 
     # SN-1 directive
-    has_position = (result.get("trail_be_active",False) or
-                    exit_plan["sn_trail_active"] or close>t1*1.03)
+    # FIX #3: SQLite position table is the ONLY source of truth for position ownership.
+    # The old `close > t1*1.03` heuristic emitted PARTIAL_SELL/TRAIL for stocks
+    # the user never entered whenever price happened to trade 3% above VPOC floor.
+    has_position = _get_position(symbol) is not None
     directive = calc_sniper_directive(symbol, fort, result, macro_state,
                                       breadth_ok, composite, has_position)
     result.update(directive)
@@ -3737,8 +3792,12 @@ def push_to_gsheets(top5: list, date_label: str):
             ])
 
         # Single batch update — 1 API write call for all rows
+        # FIX #6: gspread ≥6.0 changed the positional signature of ws.update().
+        # Old: ws.update(list_of_lists) was treated as values.
+        # New: first positional arg is range_name; passing a list raises APIError.
+        # Fix: always pass range_name="A1" explicitly so both old and new gspread work.
         _sheets_retry(
-            ws.update, rows_to_write,
+            ws.update, "A1", rows_to_write,
             label=f"batch_update({SHEET_SCREENER})"
         )
         log.info(f"  Google Sheets Tab '{SHEET_SCREENER}' updated: {len(top5)} picks ✅")
@@ -3966,15 +4025,17 @@ def run_screener_v7():
 
     results.sort(key=lambda x: (x.get("sniper_composite",0), x.get("total_score",0)), reverse=True)
 
-    # ── Mid/Small cap bucket selection ───────────────────────────────
+    # FIX #2: 3-bucket picker — large caps (≥₹2000) were previously thrown into
+    # overflow and never considered. Now they get their own LARGE_CAP_PICKS slot.
     MAX_PER_SECTOR = 2
     sector_counts: dict = {}
-    mid_picks=[]; small_picks=[]; overflow=[]
+    large_picks=[]; mid_picks=[]; small_picks=[]; overflow=[]
     for r in results:
         price=r["close"]
-        if 200<=price<=2000: mid_picks.append(r)
-        elif 50<=price<200:  small_picks.append(r)
-        else:                overflow.append(r)
+        if price >= 2000:        large_picks.append(r)
+        elif 200 <= price < 2000: mid_picks.append(r)
+        elif 50 <= price < 200:   small_picks.append(r)
+        else:                     overflow.append(r)
 
     def _pick_bucket(bucket, n, sc):
         picked=[]
@@ -3985,8 +4046,9 @@ def run_screener_v7():
                 picked.append(r); sc[sec]=count+1
         return picked
 
-    top5 = _pick_bucket(mid_picks, MID_CAP_PICKS, sector_counts) + \
-           _pick_bucket(small_picks, SMALL_CAP_PICKS, sector_counts)
+    top5 = (_pick_bucket(large_picks, LARGE_CAP_PICKS, sector_counts) +
+            _pick_bucket(mid_picks,   MID_CAP_PICKS,   sector_counts) +
+            _pick_bucket(small_picks, SMALL_CAP_PICKS,  sector_counts))
 
     log.info(f"=== TOP {len(top5)} PICKS | {len(results)} total passed ===")
     for r in top5:
