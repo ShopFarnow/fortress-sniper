@@ -101,11 +101,26 @@ GOOGLE_SHEET_ID    = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_CREDS_JSON  = os.getenv("GOOGLE_CREDS_JSON", "")
 EXCEL_OUTPUT_PATH  = Path("outputs/fortress_screener.xlsx")
 HTML_OUTPUT_PATH   = Path("outputs/report.html")
-DB_PATH            = Path("outputs/fortress_cache.db")
+# INFRA-3: Cache path now configurable via CACHE_PATH env var (was hardcoded).
+DB_PATH            = Path(os.getenv("CACHE_PATH", "outputs/fortress_cache.db"))
 
 PAPER_MODE         = os.getenv("PAPER_MODE", "false").lower() == "true"
-ACCOUNT_EQUITY     = float(os.getenv("ACCOUNT_EQUITY", "500000"))
-ACCOUNT_RISK_PCT   = float(os.getenv("ACCOUNT_RISK_PCT", "0.01"))
+
+# INFRA-4: Validated inputs — catch bad env var values at startup, not mid-run.
+def _parse_positive_float(env_key: str, default: float, min_val: float, max_val: float) -> float:
+    raw = os.getenv(env_key, str(default))
+    try:
+        val = float(raw)
+    except (ValueError, TypeError):
+        log.warning(f"{env_key}='{raw}' is not a valid number — using default {default}")
+        return default
+    if not (min_val <= val <= max_val):
+        log.warning(f"{env_key}={val} outside [{min_val}, {max_val}] — clamping")
+        return max(min_val, min(val, max_val))
+    return val
+
+ACCOUNT_EQUITY     = _parse_positive_float("ACCOUNT_EQUITY",   500_000.0, 1_000.0, 1_000_000_000.0)
+ACCOUNT_RISK_PCT   = _parse_positive_float("ACCOUNT_RISK_PCT", 0.01,      0.001,   0.05)
 
 # ── v7.0: Force data source flags ──────────────────────────────────
 # FORCE_SHEETS=true → skip NSE attempt, go straight to workbook data
@@ -210,13 +225,21 @@ SNIPER_CFG = dict(
 )
 
 SECTOR_INDICES = {
-    "NIFTY BANK":   "NIFTYBANK",
     "NIFTY IT":     "CNXIT",
     "NIFTY PHARMA": "CNXPHARMA",
     "NIFTY AUTO":   "CNXAUTO",
     "NIFTY FMCG":   "CNXFMCG",
     "NIFTY METAL":  "CNXMETAL",
 }
+
+# LOW-8: Assert CFG and SNIPER_CFG agree on overlapping keys (single source of truth).
+# If values diverge a future edit will silently use whichever dict is read first.
+_OVERLAPPING_KEYS = {"alt_warn_pct", "alt_stop_pct"}
+for _k in _OVERLAPPING_KEYS:
+    assert CFG[_k] == SNIPER_CFG[_k], (
+        f"CFG['{_k}']={CFG[_k]} != SNIPER_CFG['{_k}']={SNIPER_CFG[_k]}. "
+        f"Keep these in sync or remove the duplicate."
+    )
 
 SECTOR_TRUTH = {
     "NIFTY PHARMA":  1.15,
@@ -244,9 +267,12 @@ HALAL_EXCLUDED = {
 
 HALAL_KW = (
     "bank","bancorp","finance","finserv","fincorp","financial",
-    "insurance","insur","nifty","bees","etf","reit","invit",
+    "insurance","insur","nifty","etf","reit","invit",
     "liquid","overnight","gilt","treasury",
 )
+# MED-2: "bees" as a substring matches "beeswax", "beeswing" etc. → use word-boundary regex.
+import re as _re
+_HALAL_KW_REGEX_EXACT = _re.compile(r'\bbees\b', _re.IGNORECASE)
 
 SYMBOL_SECTOR = {
     "TCS":"NIFTY IT","INFY":"NIFTY IT","WIPRO":"NIFTY IT",
@@ -312,10 +338,15 @@ _HALAL_FALLBACK_85 = {
     # ── Energy Transition ────────────────────────────────────────────────────
     "SUZLON","INOXWIND","WEBELSOLAR","TATAPOWER","TORNTPOWER",
 }
-# Alias so existing code that references _HALAL_FALLBACK_85 keeps working
-_HALAL_FALLBACK_150 = _HALAL_FALLBACK_85   # same set; name reflects ~150 symbols now
+# LOW-1: Renamed from _HALAL_FALLBACK_150 (which was an alias to _HALAL_FALLBACK_85
+# with ~144 symbols, not 150). _HALAL_FALLBACK is the canonical name.
+# _HALAL_FALLBACK_85 and _HALAL_FALLBACK_150 kept as aliases for any callers.
+_HALAL_FALLBACK      = _HALAL_FALLBACK_85
+_HALAL_FALLBACK_150  = _HALAL_FALLBACK_85   # legacy alias
 
-_YF_UNIVERSE_300 = [
+# LOW-2: Renamed from _YF_UNIVERSE_300 — the list has ~133 symbols, not 300.
+# _YF_UNIVERSE_150 is more accurate. Expand to 300 if wider yfinance coverage is needed.
+_YF_UNIVERSE_150 = [
     "TCS","INFY","WIPRO","HCLTECH","TECHM","LTIM","MPHASIS","COFORGE",
     "PERSISTENT","KPITTECH","TATAELXSI","ROUTE","TANLA","MASTEK",
     "NEWGEN","SAKSOFT","INTELLECT","DATAMATICS","ZENSAR",
@@ -837,8 +868,9 @@ def is_halal(symbol: str) -> bool:
         return False
 
     # PRIORITY 3: Keyword exclusion (catches "bank", "finance", "nifty", etc.).
+    # MED-2: "bees" uses a word-boundary regex to avoid matching "beeswax" etc.
     sl = symbol.lower()
-    if any(kw in sl for kw in HALAL_KW):
+    if any(kw in sl for kw in HALAL_KW) or _HALAL_KW_REGEX_EXACT.search(sl):
         return False
 
     # PRIORITY 4: Nifty 500 Shariah universe (live CSV → SQLite cache → fallback ~150).
@@ -973,14 +1005,16 @@ def _init_db():
             fetched_at    TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS positions (
-            symbol        TEXT PRIMARY KEY,
+            entry_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol        TEXT NOT NULL,
             entry_price   REAL NOT NULL,
             entry_date    TEXT NOT NULL,
             initial_t3    REAL NOT NULL,
             peak_price    REAL NOT NULL,
             trailing_stop REAL NOT NULL,
             be_triggered  INTEGER DEFAULT 0,
-            updated_at    TEXT NOT NULL
+            updated_at    TEXT NOT NULL,
+            UNIQUE(symbol, entry_date)
         );
     """)
     con.commit()
@@ -1060,9 +1094,12 @@ def _get_position(symbol: str) -> Optional[dict]:
     try:
         con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
+        # HIGH-4: positions table now has composite UNIQUE(symbol, entry_date).
+        # Return the most recent open position for this symbol.
         cur.execute(
             "SELECT entry_price,entry_date,initial_t3,peak_price,trailing_stop,be_triggered "
-            "FROM positions WHERE symbol=?", (symbol.upper(),)
+            "FROM positions WHERE symbol=? ORDER BY entry_date DESC LIMIT 1",
+            (symbol.upper(),)
         )
         row = cur.fetchone()
         con.close()
@@ -1079,6 +1116,8 @@ def _put_position(symbol: str, entry_price: float, entry_date: str,
                   trailing_stop: float, be_triggered: int = 0):
     try:
         con = sqlite3.connect(DB_PATH)
+        # HIGH-4: UNIQUE(symbol, entry_date) — same-day re-entry updates the row;
+        # a new entry_date adds a new row (pyramiding support).
         con.execute(
             "INSERT OR REPLACE INTO positions "
             "(symbol,entry_price,entry_date,initial_t3,peak_price,trailing_stop,be_triggered,updated_at) "
@@ -1285,11 +1324,11 @@ def build_yfinance_universe() -> pd.DataFrame:
         return pd.DataFrame()
 
     universe = get_halal_universe()
-    candidates = ([s for s in _YF_UNIVERSE_300 if s.upper() in universe]
+    candidates = ([s for s in _YF_UNIVERSE_150 if s.upper() in universe]
                   if universe is not _HALAL_FALLBACK_85
-                  else [s for s in _YF_UNIVERSE_300 if is_halal(s)])
+                  else [s for s in _YF_UNIVERSE_150 if is_halal(s)])
     if len(candidates) < 50:
-        candidates = [s for s in _YF_UNIVERSE_300 if is_halal(s)]
+        candidates = [s for s in _YF_UNIVERSE_150 if is_halal(s)]
 
     log.info(f"yfinance batch fallback: {len(candidates)} halal candidates")
     _, trade_date = get_last_trading_day()
@@ -1313,8 +1352,8 @@ def build_yfinance_universe() -> pd.DataFrame:
             sub_chunks = [chunk]
 
         for sub_chunk in sub_chunks:
-          tickers = " ".join(f"{s}.NS" for s in sub_chunk)
-          for attempt, backoff in enumerate(BACKOFF, 1):
+            tickers = " ".join(f"{s}.NS" for s in sub_chunk)
+            for attempt, backoff in enumerate(BACKOFF, 1):
               try:
                   raw = yf.download(tickers, period="2d", interval="1d",
                                     progress=False, auto_adjust=False, group_by="ticker")
@@ -1596,6 +1635,9 @@ def fetch_fii_dii() -> dict:
         return sheets_result
 
     # ── 3. VIX proxy (last resort) ───────────────────────────────────
+    # MED-6: VIX proxy scores (e.g. 25 for "falling sharply") are heuristic
+    # estimates, not empirically calibrated values. They proxy market regime
+    # direction only — treat them as directional signals, not precise measurements.
     try:
         import yfinance as yf
         vix_df = yf.download("^INDIAVIX", period="10d", progress=False, auto_adjust=True)
@@ -2144,7 +2186,12 @@ def _load_earnings_from_sheets() -> Optional[dict]:
             raw_date = str(row[date_col]).strip()
             if not raw_date:
                 continue
-            dt = pd.to_datetime(raw_date, dayfirst=True, errors="coerce")
+            # MED-1: Try explicit DD-MM-YYYY format first (NSE default).
+            # Fall back to dayfirst=True for other common formats.
+            try:
+                dt = pd.to_datetime(raw_date, format="%d-%m-%Y", errors="raise")
+            except (ValueError, TypeError):
+                dt = pd.to_datetime(raw_date, dayfirst=True, errors="coerce")
             if pd.isna(dt):
                 continue
 
@@ -3136,17 +3183,14 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
     fil_det  = fil_data.get("detail", fil_det)
 
     price = float(today_row["close"])
-    # FIX #5 (corrected): skip ROCE proxy only when in yfinance degraded mode —
-    # SNAPSHOT_FALLBACK/STALE data means financials are unreliable anyway.
-    # In NSE/Sheets mode (EOD_FRESH, SHEETS_EOD, EOD_CACHED) ROCE IS gated
-    # because fresh data makes the quality check meaningful and worth the latency.
-    # Previous version had this inverted: it ran ROCE for EOD_FRESH and skipped
-    # it for Sheets — backwards from the intent.
+    # MED-5: ROCE gate now applies to ALL price ranges, not just price < 300.
+    # Mid-caps (₹200–₹800) were previously skipping the quality check entirely.
+    # Skip ROCE only when in yfinance degraded mode (financials unreliable).
     _is_yfinance_fallback = (
-        str(today_row.get("data_quality","")) in ("SNAPSHOT_FALLBACK", "STALE")
+        str(today_row.get("data_quality", "")) in ("SNAPSHOT_FALLBACK", "STALE")
         or FORCE_YFINANCE
     )
-    if price < 300 and fil_pts > 15 and not _is_yfinance_fallback:
+    if fil_pts > 15 and not _is_yfinance_fallback:
         roce_val, roce_label = fetch_roce_proxy(symbol)
         if roce_val is None:
             fil_pts = min(fil_pts, 10)
@@ -3192,7 +3236,7 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
     exlq     = calc_exit_liquidity(hist, close, rsi_v, vpoc_val,
                                    atr14 if atr14 > 0 else 1.0, adv20 if adv20 > 0 else 1.0)
     fog_enh  = calc_fog_enhanced(adx_v, adx_prev, vix_now, ma50_val, ma200_val, w52_bonus)
-    # FIX #1: calc_bayesian_score (4-node) removed here — SN-3 (9-node) in assemble_result_v7
+    # FIX #1: calc_bayesian_score (4-node) removed here — SN-3 (9-node) in assemble_result_v8
     # is the single source of Bayes truth. Adding both inflated scores by up to +22 pts.
     dyn      = calc_dynamic_score_weights(fii_data, vix_now)
 
@@ -3273,7 +3317,7 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
         "pos_shares":      pos["pos_shares"],
         "pos_amount":      pos["pos_amount"],
         "pos_label":       pos["pos_label"],
-        "bayes_prob":      0,    # placeholder — SN-3 9-node Bayes set in assemble_result_v7
+        "bayes_prob":      0,    # placeholder — SN-3 9-node Bayes set in assemble_result_v8
         "bayes_bonus":     0,
         "bayes_label":     "—  (see sn_bayes_label for 9-node result)",
         "mc_survival_pct": mc["mc_survival_pct"],
@@ -3295,12 +3339,12 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
         "vpoc_val":        fort.get("vpoc_val",0.0),
     }
 
-    if price < 300:
+    if price < PRICE_CAP:
         cb_active, cb_msg = check_smallcap_circuit_breaker()
         result["alloc"]           = "PROBE 10% ⚠️ CB" if cb_active else result["alloc"]
         result["circuit_breaker"] = cb_msg
     else:
-        result["circuit_breaker"] = "N/A (large-cap)"
+        result["circuit_breaker"] = "N/A (≥₹800 excluded by PRICE_CAP filter)"
 
     result["story"] = build_story(result)
 
@@ -3664,9 +3708,11 @@ def calc_sniper_exit_plan(close, t1, t3, atr14, trail_stop_existing=None) -> dic
 
 # ── Assemble v6.0 enriched result ──────────────────────────────────
 
-def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
+def assemble_result_v8(symbol, today_row, hist, fii_data, insider_map,
                        filings, earnings_cal) -> Optional[dict]:
-    """Full v8.0 assemble: v5.7 scoring + all 7 Sniper Hybrid systems + v8.0 improvements."""
+    """Full v8.0 assemble: v5.7 scoring + all 7 Sniper Hybrid systems + v8.0 improvements.
+    Renamed from assemble_result_v7 (CRIT-2).
+    """
     # FIX: fetch macro BEFORE calling assemble_result so vix_now_cached is defined.
     # Previously macro was referenced before assignment, causing NameError on every stock.
     # _get_macro_regime() is thread-safe and cached — zero extra network calls.
@@ -3732,6 +3778,23 @@ def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
     )
     result.update(sn_bayes)
     result["total_score"] = min(MAX_SCORE, result["total_score"] + sn_bayes["sn_bayes_bonus"])
+
+    # HIGH-3: Recompute FOG with the actual live VIX (from macro) now that
+    # all score modifications (SN-3 Bayes, etc.) are done.
+    # assemble_result() computed FOG with vix_now_cached, which was correct,
+    # but any fields modified since (e.g. sn_bayes_bonus) could shift the
+    # environment context. Recomputing here ensures fog_block/tier are final.
+    fog_enh_final = calc_fog_enhanced(
+        fort.get("adx", 20.0),
+        fort.get("adx_prev", fort.get("adx", 20.0)),
+        result.get("vix_val", macro.get("vix_val", 18.0)),
+        fort.get("ma50_val", 0.0),
+        fort.get("ma200_val", 0.0),
+        fort.get("w52_bonus", 0),
+    )
+    result["fog_block"] = fog_enh_final["fog_block"]
+    result["fog_label"] = fog_enh_final["fog_label"]
+    result["fog_tier"]  = fog_enh_final["fog_tier"]
 
     # SN-1 composite — pass SN-2 layers so composite uses the stricter 6-layer
     # validation gates rather than fortress scoring layers (prevents inflation)
@@ -3847,7 +3910,7 @@ def validate_telegram_token(token: str) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SN-7: SNIPER TELEGRAM FORMAT  v7.1
+# SN-7: SNIPER TELEGRAM FORMAT  v8.0
 # ──────────────────────────────────────────────────────────────────────
 # Improvements over v7.0:
 #   • MarkdownV2 (escaping-safe) with graceful Markdown fallback
@@ -3901,6 +3964,8 @@ def _split_telegram_message_v2(msg: str, limit: int = 4000) -> list:
     """
     Split message at blank-line card boundaries first, then hard-split
     oversized blocks. Avoids tearing a stock card across two messages.
+    MED-7: Single cards > limit are now pre-split at line boundaries before
+    the hard-char split to avoid tearing mid-word.
     """
     if len(msg) <= limit:
         return [msg]
@@ -3911,7 +3976,26 @@ def _split_telegram_message_v2(msg: str, limit: int = 4000) -> list:
     cur = ""
     for card in cards:
         block = card + "\n\n"
-        if len(cur) + len(block) > limit:
+        # MED-7: If a single card is itself larger than the limit, split it
+        # at line boundaries rather than a blind character split.
+        if len(block) > limit:
+            # Flush current buffer first
+            if cur.strip():
+                chunks.append(cur.rstrip())
+                cur = ""
+            # Split oversized card at line boundaries
+            lines = block.split("\n")
+            card_buf = ""
+            for line in lines:
+                if len(card_buf) + len(line) + 1 > limit:
+                    if card_buf.strip():
+                        chunks.append(card_buf.rstrip())
+                    card_buf = line + "\n"
+                else:
+                    card_buf += line + "\n"
+            if card_buf.strip():
+                cur = card_buf
+        elif len(cur) + len(block) > limit:
             if cur.strip():
                 chunks.append(cur.rstrip())
             cur = block
@@ -3977,7 +4061,7 @@ def _telegram_post(token: str, chat_id: str, text: str,
 def send_telegram_v7(top5, sector_trends, fii_data, date_label, macro,
                      using_fallback=False, data_source="NSE"):
     """
-    SN-7 v7.1 — Compact, reliable Telegram dispatcher.
+    SN-7 v8.0 — Compact, reliable Telegram dispatcher.
 
     Card format (6 lines per setup):
       Line 1  Symbol · price · rank · sector · data quality · warning badges
@@ -4019,7 +4103,7 @@ def send_telegram_v7(top5, sector_trends, fii_data, date_label, macro,
 
     # ── Build header ────────────────────────────────────────────────
     lines = [
-        f"⚔️ *FORTRESS SNIPER v7.1* | `{date_label}` | {src_badge}",
+        f"⚔️ *FORTRESS SNIPER v8.0* | `{date_label}` | {src_badge}",
         f"{ms_icon} *{ms}*  ·  VIX {vix:.1f}  ·  NIFTY {nifty_chg:+.2f}%  ·  {breadth_line}",
         f"📊 {sector_line}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -4161,7 +4245,7 @@ def send_telegram_v7(top5, sector_trends, fii_data, date_label, macro,
     # ── Footer ──────────────────────────────────────────────────────
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "_v8.0 · Halal+HALAL\_LIST · 9-node Bayes · 6-layer VPOC · CVD · VSA · VDU · MC · ≤₹800 · Not financial advice_",
+        r"_v8.0 · Halal+HALAL\_LIST · 9-node Bayes · 6-layer VPOC · CVD · VSA · VDU · MC · ≤₹800 · Not financial advice_",
     ]
 
     msg     = "\n".join(lines)
@@ -4288,16 +4372,21 @@ def push_to_gsheets(top5: list, date_label: str):
                 r.get("story",""),
             ])
 
-        # Single batch update — 1 API write call for all rows
-        # FIX #6 (hardened per audit round 2): gspread ≥6.0 uses update(range_name, values).
-        # gspread <6.0 uses update(values) or update(range_name, values).
-        # Use try/except to handle both versions gracefully instead of version-sniffing.
+        # MED-4: Use packaging.version for explicit gspread version detection
+        # instead of catching TypeError (which might mask unrelated errors).
         try:
+            import gspread as _gspread_mod
+            from packaging.version import Version as _Ver
+            _gspread_new_api = _Ver(_gspread_mod.__version__) >= _Ver("6.0.0")
+        except Exception:
+            _gspread_new_api = True   # assume new API if packaging unavailable
+
+        if _gspread_new_api:
             _sheets_retry(
                 ws.update, "A1", rows_to_write,
                 label=f"batch_update({SHEET_SCREENER})"
             )
-        except TypeError:
+        else:
             # gspread <6.0 fallback: positional arg is values directly
             _sheets_retry(
                 ws.update, rows_to_write,
@@ -4364,7 +4453,7 @@ def save_html_report(top5: list, date_label: str, fii_data: dict, sector_trends:
 
         html = f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⚔️ Fortress Sniper v7.0 | {date_label}</title>
+<title>⚔️ Fortress Sniper v8.0 | {date_label}</title>
 <style>body{{font-family:system-ui,sans-serif;margin:0;padding:20px;background:#f9fafb;color:#111}}
 h1{{font-size:22px;margin:0 0 4px}}.meta{{color:#666;font-size:14px;margin-bottom:20px}}
 .card{{background:#fff;border-radius:12px;border:1px solid #e5e7eb;padding:20px;margin-bottom:16px}}
@@ -4372,7 +4461,7 @@ table{{border-collapse:collapse;width:100%}}
 th{{background:#f3f4f6;padding:10px 12px;text-align:left;font-size:13px;color:#555;border-bottom:1px solid #e5e7eb}}
 td{{padding:10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-size:13px}}
 </style></head><body>
-<h1>⚔️ Fortress Sniper v7.0 — Unified Engine</h1>
+<h1>⚔️ Fortress Sniper v8.0 — Unified Engine</h1>
 <div class="meta">🕌 Halal | 9-node Bayes | 6-layer VPOC | Google Sheets data source | {date_label}</div>
 <div class="card">
   <b>🧠 Market Intelligence</b>
@@ -4391,7 +4480,7 @@ td{{padding:10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-size:13
   </table>
 </div>
 <div class="meta" style="margin-top:20px;text-align:center">
-  Fortress Screener v7.0 · Unified · Halal · NSE EQ · Not financial advice
+  Fortress Screener v8.0 · Unified · Halal · NSE EQ · Not financial advice
 </div></body></html>"""
         HTML_OUTPUT_PATH.write_text(html, encoding="utf-8")
         log.info(f"HTML report saved: {HTML_OUTPUT_PATH}")
@@ -4400,12 +4489,12 @@ td{{padding:10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-size:13
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SECTION 25 — MAIN SCREENER LOOP (v7.0 unified)
+# SECTION 25 — MAIN SCREENER LOOP (v8.0 unified)
 # ══════════════════════════════════════════════════════════════════════
 
-def run_screener_v7():
+def run_screener_v8():
     """
-    v7.0 main entry point.
+    v8.0 main entry point. (Renamed from run_screener_v7 — CRIT-2)
 
     Data priority:
       1. NSE bhavcopy (live, full 2000+ universe)
@@ -4422,6 +4511,13 @@ def run_screener_v7():
     log.info(f"=== FORTRESS SNIPER v8.0 | {date_label} ===")
     log.info(f"    FORCE_SHEETS={FORCE_SHEETS} | FORCE_YFINANCE={FORCE_YFINANCE}")
     log.info(f"    PRICE_CAP=₹{PRICE_CAP} | BUCKETS=Small(₹50–₹200)×{SMALL_CAP_PICKS} + Mid(₹200–₹{PRICE_CAP})×{MID_CAP_PICKS}")
+
+    # MED-8: Clear per-run caches so stale sector/macro data from a previous
+    # run in the same process doesn't bleed into the current run.
+    global _SECTOR_LIVE_CACHE, _MACRO_REGIME_CACHE, _smallcap_index_cache
+    _SECTOR_LIVE_CACHE    = {}
+    _MACRO_REGIME_CACHE   = None
+    _smallcap_index_cache = {}
 
     # v8.0: Load custom HALAL_LIST from Google Sheets (Tab 7) — once at startup.
     # This populates _HALAL_LIST_CUSTOM which is checked first in is_halal().
@@ -4533,7 +4629,7 @@ def run_screener_v7():
             if len(hist) < CFG["min_hist_bars"]:
                 log.debug(f"{sym}: only {len(hist)} bars — skipped")
                 continue
-            r = assemble_result_v7(sym, row, hist, fii_data, insider_map,
+            r = assemble_result_v8(sym, row, hist, fii_data, insider_map,
                                     filings, earnings_cal)
             if r: results.append(r)
             time.sleep(0.15)
@@ -4626,4 +4722,4 @@ def run_screener_v7():
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    run_screener_v7()
+    run_screener_v8()
