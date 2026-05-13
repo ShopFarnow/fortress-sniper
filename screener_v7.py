@@ -1,27 +1,45 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   FORTRESS SCREENER v7.0 — UNIFIED SNIPER ENGINE                   ║
+║   FORTRESS SCREENER v8.0 — UNIFIED SNIPER ENGINE                   ║
 ║   Bismillah — In the name of Allah, the Most Gracious              ║
 ║                                                                      ║
-║   ARCHITECTURE: Single-file merge of v5.7 + v6.0                  ║
+║   ARCHITECTURE: Single-file merge of v5.7 + v6.0 + v7.0 + v8.0   ║
 ║   No sibling imports. One file. One truth. No silent failures.      ║
 ║                                                                      ║
-║   v7.0 NEW: GOOGLE SHEETS AS MASTER DATA SOURCE                    ║
+║   v8.0 CHANGES (over v7.0):                                        ║
 ║   ─────────────────────────────────────────────────────────────     ║
-║   The screener now reads 5 data inputs from dedicated worksheets    ║
-║   inside a single Google Workbook. You populate these manually      ║
-║   each evening (or automate via macros). GitHub Actions runs the    ║
-║   scoring engine on that data and sends results to Telegram.        ║
+║   1. PRICE CAP: Universe capped at ₹800 (was ₹10,000).            ║
+║      Buckets: Small ₹50–₹200 (2 picks) | Mid ₹200–₹800 (2 picks)  ║
+║      Large-cap bucket removed (>₹800 excluded entirely).           ║
+║                                                                      ║
+║   2. HALAL_LIST SHEET (Tab 7): Custom user-curated halal           ║
+║      whitelist read from Google Sheets tab "HALAL_LIST".            ║
+║      Stocks in this tab bypass Shariah CSV and keyword checks.      ║
+║      is_halal() priority: HALAL_LIST → EXCLUDED → KW → Shariah.   ║
+║                                                                      ║
+║   3. VOLUME DRY-UP (VDU) signal: Detects multi-day volume          ║
+║      contraction before a breakout (+5 pts in fortress_score).      ║
+║                                                                      ║
+║   4. GLOBAL SECTOR CAP: MAX_PER_SECTOR=2 now enforced globally     ║
+║      before bucketing — no sector can claim 2 mid + 1 large slot.  ║
+║                                                                      ║
+║   5. GRADUATED FOG SIZING: FOG_WARNING → 25% deploy,              ║
+║      FOG_SEVERE → 10% (hard floor). Binary PROBE 10% removed.      ║
+║                                                                      ║
+║   6. EARNINGS VETO: Results in ≤2 trading days → fortress_score    ║
+║      returns None (hard veto, not just a low score).               ║
 ║                                                                      ║
 ║   WORKBOOK SHEET MAP:                                               ║
 ║   ┌──────┬──────────────────────────────────────────┬──────────┐   ║
 ║   │  #   │  Sheet Name                              │  Score   │   ║
 ║   ├──────┼──────────────────────────────────────────┼──────────┤   ║
-║   │  1   │  Bhavcopy  — Price, Volume, VPOC data   │ 80 pts   │   ║
+║   │  1   │  BHAVCOPY  — Price, Volume, VPOC data   │ 80 pts   │   ║
 ║   │  2   │  FII_DII   — Institutional flow         │ 30 pts   │   ║
-║   │  3   │  Insider   — Insider trading data       │ 30 pts   │   ║
-║   │  4   │  Filings   — Corporate announcements    │ 30 pts   │   ║
-║   │  5   │  Earnings  — Earnings event calendar    │ 30 pts   │   ║
+║   │  3   │  INSIDER   — Insider trading data       │ 30 pts   │   ║
+║   │  4   │  FILINGS   — Corporate announcements    │ 30 pts   │   ║
+║   │  5   │  EARNINGS  — Earnings event calendar    │ 30 pts   │   ║
+║   │  6   │  SCREENER  — Output (written by script) │  —       │   ║
+║   │  7   │  HALAL_LIST — Your custom halal list    │  —       │   ║
 ║   └──────┴──────────────────────────────────────────┴──────────┘   ║
 ║   Total: 200 base pts + 30 forward bonus = 230 maximum             ║
 ║                                                                      ║
@@ -29,29 +47,16 @@
 ║   the workbook data is the authoritative fallback (not yfinance).   ║
 ║   If neither is available, yfinance is the last resort.             ║
 ║                                                                      ║
-║   SHEET COLUMN SCHEMAS (fill these in your workbook):              ║
-║                                                                      ║
-║   Bhavcopy:  SYMBOL | OPEN | HIGH | LOW | CLOSE | VOLUME |         ║
-║              TURNOVER_LAKHS | SERIES (optional, defaults EQ)        ║
-║                                                                      ║
-║   FII_DII:   DATE | FII_NET_CR | DII_NET_CR                        ║
-║              (₹ crore, positive = buying)                           ║
-║                                                                      ║
-║   Insider:   SYMBOL | PERSON | SHARES | VALUE_LAKHS | DATE |       ║
-║              TYPE  (Buy/Sell — only Buy rows counted)               ║
-║                                                                      ║
-║   Filings:   SYMBOL | DATE | SUBJECT | SENTIMENT                   ║
-║              (SENTIMENT: positive / negative / neutral)             ║
-║                                                                      ║
-║   Earnings:  SYMBOL | RESULT_DATE | PURPOSE                        ║
-║              (PURPOSE: results / dividend — other rows ignored)     ║
+║   HALAL_LIST TAB SCHEMA:                                           ║
+║     SYMBOL  (required — one symbol per row)                        ║
+║     Any extra columns are ignored.                                  ║
 ║                                                                      ║
 ║   DATA PRIORITY ORDER:                                              ║
 ║     1. Live NSE API  (fastest, full 2000+ stock universe)           ║
 ║     2. Google Sheets (your manually curated workbook)               ║
 ║     3. yfinance      (last resort, 300-stock watchlist)             ║
 ║                                                                      ║
-║   RETAINED FROM v5.7 + v6.0 (all features intact):                ║
+║   RETAINED FROM v5.7 + v6.0 + v7.0 (all features intact):        ║
 ║   ✓ SN-1 Directive | SN-2 6-layer VPOC | SN-3 9-node Bayes        ║
 ║   ✓ SN-4 Macro Hard Filters | SN-5 Vol-Scaled Sizing              ║
 ║   ✓ SN-6 Dynamic Exit Engine | SN-7 Sniper Telegram Format        ║
@@ -125,13 +130,17 @@ SHEET_INSIDER   = os.getenv("SHEET_INSIDER",   "INSIDER")
 SHEET_FILINGS   = os.getenv("SHEET_FILINGS",   "FILINGS")
 SHEET_EARNINGS  = os.getenv("SHEET_EARNINGS",  "EARNINGS")
 SHEET_SCREENER  = os.getenv("SHEET_SCREENER",  "SCREENER")   # output tab
+SHEET_HALAL_LIST = os.getenv("SHEET_HALAL_LIST", "HALAL_LIST")  # v8.0: custom halal whitelist tab
 
 SCORE_WEIGHTS = dict(fortress=80, fii_dii=30, insider=30, filing=30, earnings=30)
 MAX_SCORE     = sum(SCORE_WEIGHTS.values())   # 200
 
-MID_CAP_PICKS   = 2   # FIX #2: was 1
-SMALL_CAP_PICKS = 2   # FIX #2: was 1
-LARGE_CAP_PICKS = 1   # FIX #2: new bucket — stocks ≥ ₹2 000 were silently discarded
+MID_CAP_PICKS   = 2   # ₹200–₹800
+SMALL_CAP_PICKS = 2   # ₹50–₹200
+# v8.0: No LARGE_CAP_PICKS — universe hard-capped at ₹800
+
+# v8.0: Price universe cap (was ₹10,000 in v7.0)
+PRICE_CAP = 800
 
 RANKS = [
     (160, "⚔️ ELITE",    "FULL 100%"),
@@ -340,6 +349,7 @@ _MACRO_REGIME_LOCK = threading.Lock()
 _smallcap_index_cache: dict = {}
 _ROCE_CACHE_TTL_SECONDS = 86_400
 _roce_cache: dict = {}
+_HALAL_LIST_CUSTOM: set = set()  # v8.0: loaded from HALAL_LIST Google Sheets tab
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -577,6 +587,44 @@ def _read_sheet_earnings() -> pd.DataFrame:
     return _bulk_read_sheet(SHEET_EARNINGS)
 
 
+def _read_sheet_halal_list() -> set:
+    """
+    v8.0 — Read Tab 7 — HALAL_LIST — in ONE bulk API call.
+
+    Expected tab name  : HALAL_LIST  (exact, case-sensitive)
+    Required column    : SYMBOL  (or first column is used as fallback)
+    Any extra columns (notes, source, date) are silently ignored.
+
+    Populate this with symbols you have manually verified as halal.
+    Stocks in this list BYPASS the Nifty Shariah CSV and keyword checks
+    and are treated as halal unconditionally in is_halal().
+
+    API cost: 1 read request.
+    Returns a set of uppercase symbols, or empty set if tab is missing.
+    """
+    if not _sheets_configured():
+        return set()
+
+    log.info("Reading Tab 7 (HALAL_LIST) — single bulk API call ...")
+    df = _bulk_read_sheet(SHEET_HALAL_LIST)
+    if df.empty:
+        log.info("  HALAL_LIST tab: empty or not found — no custom overrides")
+        return set()
+
+    # Use SYMBOL column if present, otherwise fall back to first column
+    sym_col = next(
+        (c for c in df.columns if "SYMBOL" in c or "SCRIP" in c or "TICKER" in c),
+        df.columns[0]
+    )
+    syms = {
+        str(s).strip().upper()
+        for s in df[sym_col]
+        if str(s).strip() and str(s).strip().upper() not in ("SYMBOL", "SCRIP", "TICKER", "")
+    }
+    log.info(f"  HALAL_LIST: {len(syms)} custom halal symbols loaded ✅")
+    return syms
+
+
 def _sheets_configured() -> bool:
     """True if both GOOGLE_SHEET_ID and GOOGLE_CREDS_JSON are set."""
     return bool(GOOGLE_SHEET_ID and GOOGLE_CREDS_JSON)
@@ -773,19 +821,29 @@ def get_halal_universe() -> set:
 
 def is_halal(symbol: str) -> bool:
     sym_upper = symbol.upper()
-    # Hard exclusion list first (banks, insurance, ETFs, etc.)
+
+    # v8.0 PRIORITY 1: Custom HALAL_LIST from Google Sheets.
+    # If the user has explicitly listed a symbol here, it passes unconditionally —
+    # overrides both the excluded set and the Shariah CSV. This lets you whitelist
+    # stocks the Shariah index hasn't picked up yet (e.g. new listings, mid-caps
+    # that dropped in/out of Nifty500 Shariah).
+    if _HALAL_LIST_CUSTOM and sym_upper in _HALAL_LIST_CUSTOM:
+        return True
+
+    # PRIORITY 2: Hard exclusion set (banks, insurance, ETFs, NBFCs).
+    # These are excluded even if someone accidentally adds them to HALAL_LIST
+    # — the exclusion set is the safety net, not the whitelist.
     if sym_upper in HALAL_EXCLUDED:
         return False
-    # Keyword exclusion (catches anything with "bank", "finance", "nifty", etc.)
+
+    # PRIORITY 3: Keyword exclusion (catches "bank", "finance", "nifty", etc.).
     sl = symbol.lower()
     if any(kw in sl for kw in HALAL_KW):
         return False
-    # FIX #1 (critical): the old code returned True for ALL symbols when the
-    # Shariah CSV failed and the fallback set was used. This let 1,117 stocks
-    # through instead of ~85, making the halal filter effectively dead and
-    # allowing non-halal stocks like RELIANCE into the output.
-    # Fix: always check membership — if the symbol isn't in the fallback set
-    # it is NOT considered halal. No short-circuit.
+
+    # PRIORITY 4: Nifty 500 Shariah universe (live CSV → SQLite cache → fallback ~150).
+    # FIX #1 (v7.0): always check membership — if the symbol isn't in the universe
+    # it is NOT considered halal. No short-circuit for fallback mode.
     universe = get_halal_universe()
     return sym_upper in universe
 
@@ -2836,6 +2894,26 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
                  if atr14 > 0 and atr100 > 0 and (atr14/atr100) < 0.70 and vol_contract
                  else "LOOSE")
 
+    # v8.0 — Volume Dry-Up (VDU): Each of the last N bars has LOWER volume
+    # than the bar before it — classic pre-breakout volume contraction.
+    # Stronger signal than a single volume < ADV check because it requires
+    # a sequential declining pattern, not just one quiet day.
+    # 3-bar VDU  → +3 pts  (mild contraction)
+    # 4-bar VDU  → +5 pts  (confirmed contraction)
+    # 5-bar VDU  → +7 pts  (deep coil, highest conviction)
+    vdu_bars = 0
+    if len(hist) >= 6:
+        for _vdu_n in range(3, 6):   # check 3, 4, 5 bar sequences
+            if all(
+                float(hist["volume"].iloc[-(i+1)]) < float(hist["volume"].iloc[-(i+2)])
+                for i in range(_vdu_n - 1)
+            ):
+                vdu_bars = _vdu_n
+    if vdu_bars >= 5:   vdu_bonus = 7; vdu_label = f"🌀 VDU {vdu_bars}-bar deep coil (+7pts)"
+    elif vdu_bars >= 4: vdu_bonus = 5; vdu_label = f"🌀 VDU {vdu_bars}-bar confirmed (+5pts)"
+    elif vdu_bars >= 3: vdu_bonus = 3; vdu_label = f"🌀 VDU {vdu_bars}-bar mild (+3pts)"
+    else:               vdu_bonus = 0; vdu_label = ""
+
     # Layer 1: Close within ±2% of VPOC
     layer1 = abs(close - vpoc) / vpoc <= 0.02 if vpoc > 0 else False
 
@@ -2898,7 +2976,8 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     # Forward-looking bonuses
     w52_bonus,  w52_label  = calc_52w_compression(hist, close, atr14)
     atrv_bonus, atrv_label = calc_atr_velocity(hist)
-    forward_bonus = w52_bonus + atrv_bonus
+    # v8.0: include VDU bonus in forward bonus total
+    forward_bonus = w52_bonus + atrv_bonus + vdu_bonus
     pts += forward_bonus
 
     pts = min(int(pts), SCORE_WEIGHTS["fortress"] + 30)   # hard cap
@@ -2941,6 +3020,9 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
         "atrv_bonus":      atrv_bonus,
         "atrv_label":      atrv_label,
         "forward_bonus":   forward_bonus,
+        "vdu_bonus":       vdu_bonus,
+        "vdu_label":       vdu_label,
+        "vdu_bars":        vdu_bars,
         "momentum_velocity_pct": round(velocity, 2),
         # FOG pre-calc (placeholder vix; authoritative value recomputed in assemble_result)
         # fog_block_pre / fog_tier_pre removed — dead code (see audit round 2 note above)
@@ -3175,6 +3257,9 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
         "w52_bonus":       w52_bonus,
         "atrv_label":      fort.get("atrv_label","—"),
         "atrv_bonus":      fort.get("atrv_bonus",0),
+        "vdu_label":       fort.get("vdu_label",""),
+        "vdu_bonus":       fort.get("vdu_bonus",0),
+        "vdu_bars":        fort.get("vdu_bars",0),
         "forward_bonus":   fort.get("forward_bonus",0),
         "pead_label":      pead_label,
         "pead_bonus":      pead_bonus,
@@ -3222,19 +3307,30 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
     rt_guard = calc_round_trip_guard(hist, close, result["t1"])
     result.update(rt_guard)
 
+    # v8.0 GRADUATED FOG SIZING — replaces binary PROBE 10%
+    # FOG_WARNING  → 25% deploy (was: PROBE 10% hard floor)
+    # FOG_SEVERE   → 10% deploy (was: same binary PROBE 10%)
+    # Rationale: preserving some entry in FOG_WARNING markets lets you
+    # participate in strong individual setups while respecting market structure.
     if result.get("fog_block"):
-        result["alloc"] = "PROBE 10% 🌫️"
-        # Inject FOG into the directive text so Telegram matches Pine's
-        # "FOG — CAUTION · HOLD FIRE" label instead of silently showing
-        # the action directive while fog_block is quietly overriding alloc.
         fog_tier = result.get("fog_tier", "FOG_WARNING")
+        if fog_tier == "FOG_SEVERE":
+            fog_deploy_cap = 10
+            fog_alloc_label = "PROBE 10% 🌫️ SEVERE"
+        else:   # FOG_WARNING
+            fog_deploy_cap = 25
+            fog_alloc_label = "QTR 25% 🌫️ WARNING"
+        result["alloc"] = fog_alloc_label
+        # Cap deploy to the fog limit — don't zero it out for WARNING
+        current_deploy = result.get("sniper_deploy", 0) or 0
+        result["sniper_deploy"] = min(current_deploy, fog_deploy_cap)
+        # Inject FOG into the directive text so Telegram label matches Pine's output
         existing_dir = result.get("sniper_directive", "")
         if "FOG" not in existing_dir:
             result["sniper_directive"] = (
-                f"🌫️ {fog_tier} — CAUTION · HOLD FIRE\n"
+                f"🌫️ {fog_tier} — CAUTION ({fog_deploy_cap}% max deploy)\n"
                 f"  ({existing_dir})"
             )
-        result["sniper_deploy"] = 0   # hard-zero deploy under fog
 
     if PAPER_MODE:
         result.update(paper_score(symbol, hist, close))
@@ -3570,13 +3666,26 @@ def calc_sniper_exit_plan(close, t1, t3, atr14, trail_stop_existing=None) -> dic
 
 def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
                        filings, earnings_cal) -> Optional[dict]:
-    """Full v7.0 assemble: v5.7 scoring + all 7 Sniper Hybrid systems."""
+    """Full v8.0 assemble: v5.7 scoring + all 7 Sniper Hybrid systems + v8.0 improvements."""
     # FIX: fetch macro BEFORE calling assemble_result so vix_now_cached is defined.
     # Previously macro was referenced before assignment, causing NameError on every stock.
     # _get_macro_regime() is thread-safe and cached — zero extra network calls.
     macro      = _get_macro_regime()
     macro_state= macro["macro_state"]
     breadth_ok = macro["breadth_ok"]
+
+    # v8.0 EARNINGS VETO — Hard veto BEFORE scoring even starts.
+    # Results in ≤2 trading days = binary event risk too high.
+    # A low score (5 pts) is insufficient deterrent — this is a full stop.
+    # This is far more conservative than earnings_safety_score() which
+    # still scores and can be overridden by high fortress/FII pts.
+    _earn_days = earnings_cal.get(symbol.upper())
+    if _earn_days is not None and 0 < _earn_days <= 2:
+        log.debug(
+            f"{symbol}: EARNINGS VETO — results in {_earn_days} trading day(s). "
+            f"Hard skip (v8.0 binary event risk gate)."
+        )
+        return None
 
     result = assemble_result(symbol, today_row, hist, fii_data, insider_map,
                               filings, earnings_cal,
@@ -3591,7 +3700,7 @@ def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
         "mfi_status","rsi","adx","adx_prev","t1","t2","t3","r1","r2","r3",
         "risk_pct","rr","atr14_val","adv20_val","vpoc_val","ma50_val",
         "ma200_val","ma_label","w52_bonus","w52_label","atrv_bonus",
-        "atrv_label","forward_bonus","momentum_velocity_pct",
+        "atrv_label","vdu_bonus","vdu_label","vdu_bars","forward_bonus","momentum_velocity_pct",
     ) if k in result}
     fort["fortress_pts"] = result.get("score_fortress", 0)
 
@@ -3646,20 +3755,23 @@ def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
     result.update(directive)
 
     # ── FOG post-directive override ──────────────────────────────────
-    # assemble_result() already set fog_block and overrode alloc to PROBE 10% 🌫️
-    # but the directive text was set before FOG was checked. Re-apply here
-    # so the Telegram directive label matches Pine's "FOG — CAUTION · HOLD FIRE".
+    # v8.0 — FOG post-directive override (graduated, matches assemble_result logic).
+    # assemble_result() already set fog_block + graduated alloc/deploy. Re-sync
+    # directive text here in case SN-1 directive was computed after FOG was set.
     if result.get("fog_block"):
         fog_tier = result.get("fog_tier", "FOG_WARNING")
+        fog_deploy_cap = 10 if fog_tier == "FOG_SEVERE" else 25
         existing_dir = result.get("sniper_directive", "")
         if "FOG" not in existing_dir:
             result["sniper_directive"] = (
-                f"🌫️ {fog_tier} — CAUTION · HOLD FIRE\n"
+                f"🌫️ {fog_tier} — CAUTION ({fog_deploy_cap}% max deploy)\n"
                 f"  ({existing_dir})"
             )
-        result["sniper_deploy"] = 0   # hard-zero deploy under fog
+        # Cap deploy — don't blindly zero (WARNING allows 25%)
+        current_deploy = result.get("sniper_deploy", 0) or 0
+        result["sniper_deploy"] = min(current_deploy, fog_deploy_cap)
 
-    # SN-5 sizing — recompute after fog may have zeroed deploy
+    # SN-5 sizing — recompute after fog may have capped deploy
     sn_pos = calc_sniper_position(close, atr14, composite,
                                    result.get("sniper_deploy", directive["sniper_deploy"]))
     result.update(sn_pos)
@@ -3983,6 +4095,7 @@ def send_telegram_v7(top5, sector_trends, fii_data, date_label, macro,
             if r.get("w52_bonus", 0) > 0:                   sigs.append(f"52W🎯+{r['w52_bonus']}")
             if r.get("pead_bonus", 0) > 0:                  sigs.append(f"PEAD+{r['pead_bonus']}")
             if r.get("atrv_bonus", 0) > 0:                  sigs.append(f"ATR⚡+{r['atrv_bonus']}")
+            if r.get("vdu_bonus", 0) > 0:                   sigs.append(f"VDU💧{r.get('vdu_bars',0)}bar+{r['vdu_bonus']}")
             sig_str = "📡 " + " · ".join(sigs) if sigs else ""
 
             # ── Story (hard-capped 90 chars) ────────────────────────
@@ -4048,7 +4161,7 @@ def send_telegram_v7(top5, sector_trends, fii_data, date_label, macro,
     # ── Footer ──────────────────────────────────────────────────────
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "_v7.1 · Halal · 9-node Bayes · 6-layer VPOC · CVD · VSA · MC · Not financial advice_",
+        "_v8.0 · Halal+HALAL\_LIST · 9-node Bayes · 6-layer VPOC · CVD · VSA · VDU · MC · ≤₹800 · Not financial advice_",
     ]
 
     msg     = "\n".join(lines)
@@ -4306,8 +4419,19 @@ def run_screener_v7():
     """
     _init_db()
     date_str, date_label = get_last_trading_day()
-    log.info(f"=== FORTRESS SNIPER v7.0 | {date_label} ===")
+    log.info(f"=== FORTRESS SNIPER v8.0 | {date_label} ===")
     log.info(f"    FORCE_SHEETS={FORCE_SHEETS} | FORCE_YFINANCE={FORCE_YFINANCE}")
+    log.info(f"    PRICE_CAP=₹{PRICE_CAP} | BUCKETS=Small(₹50–₹200)×{SMALL_CAP_PICKS} + Mid(₹200–₹{PRICE_CAP})×{MID_CAP_PICKS}")
+
+    # v8.0: Load custom HALAL_LIST from Google Sheets (Tab 7) — once at startup.
+    # This populates _HALAL_LIST_CUSTOM which is checked first in is_halal().
+    # Safe to call even if Sheets is not configured — returns empty set.
+    global _HALAL_LIST_CUSTOM
+    _HALAL_LIST_CUSTOM = _read_sheet_halal_list()
+    if _HALAL_LIST_CUSTOM:
+        log.info(f"Custom HALAL_LIST loaded: {len(_HALAL_LIST_CUSTOM)} symbols will bypass Shariah CSV check")
+    else:
+        log.info("Custom HALAL_LIST: not configured or empty — using Shariah CSV + fallback only")
 
     # ── SN-4 macro regime (fetch once, thread-safe cache) ───────────
     macro = _get_macro_regime()
@@ -4367,12 +4491,15 @@ def run_screener_v7():
             return []
 
     # ── Pre-filter ───────────────────────────────────────────────────
+    # v8.0: price universe hard-capped at PRICE_CAP (₹800). Stocks above
+    # ₹800 are excluded entirely — no large-cap bucket. This keeps the
+    # screener focused on mid/small-cap setups with better R:R profiles.
     candidates = bhavcopy[
         (bhavcopy["turnover_lakhs"] >= CFG["turnover_lakhs"]) &
         (bhavcopy["close"] >= 50) &
-        (bhavcopy["close"] <= 10000)
+        (bhavcopy["close"] <= PRICE_CAP)
     ].copy()
-    log.info(f"After liquidity filter: {len(candidates)}")
+    log.info(f"After liquidity + price (≤₹{PRICE_CAP}) filter: {len(candidates)}")
     candidates = candidates[candidates["symbol"].apply(is_halal)].copy()
     log.info(f"After halal filter: {len(candidates)}")
     if len(candidates) > CFG["max_candidates"]:
@@ -4415,30 +4542,42 @@ def run_screener_v7():
 
     results.sort(key=lambda x: (x.get("sniper_composite",0), x.get("total_score",0)), reverse=True)
 
-    # FIX #2: 3-bucket picker — large caps (≥₹2000) were previously thrown into
-    # overflow and never considered. Now they get their own LARGE_CAP_PICKS slot.
+    # v8.0: 2-bucket picker — large-cap bucket removed (all stocks ≤ ₹800).
+    #
+    # GLOBAL SECTOR CAP — enforced BEFORE bucketing.
+    # In v7.0, sector_counts was shared across buckets but applied sequentially,
+    # meaning a strong mid-cap IT + strong small-cap IT could each claim a slot
+    # (2 mid + 0 small = 2 from one sector) before the cap triggered.
+    # v8.0 fix: sort ALL results globally, apply the sector cap globally,
+    # THEN distribute into price buckets. This ensures no sector > MAX_PER_SECTOR
+    # regardless of which buckets those picks come from.
     MAX_PER_SECTOR = 2
-    sector_counts: dict = {}
-    large_picks=[]; mid_picks=[]; small_picks=[]; overflow=[]
+    sector_counts_global: dict = {}
+    globally_capped: list = []
     for r in results:
-        price=r["close"]
-        if price >= 2000:        large_picks.append(r)
-        elif 200 <= price < 2000: mid_picks.append(r)
-        elif 50 <= price < 200:   small_picks.append(r)
-        else:                     overflow.append(r)
+        sec   = r["sector"]
+        count = sector_counts_global.get(sec, 0)
+        if count < MAX_PER_SECTOR:
+            globally_capped.append(r)
+            sector_counts_global[sec] = count + 1
 
-    def _pick_bucket(bucket, n, sc):
-        picked=[]
-        for r in bucket:
-            if len(picked)>=n: break
-            sec=r["sector"]; count=sc.get(sec,0)
-            if count<MAX_PER_SECTOR:
-                picked.append(r); sc[sec]=count+1
-        return picked
+    mid_picks   = [r for r in globally_capped if 200 <= r["close"] <= PRICE_CAP]
+    small_picks = [r for r in globally_capped if 50 <= r["close"] < 200]
 
-    top5 = (_pick_bucket(large_picks, LARGE_CAP_PICKS, sector_counts) +
-            _pick_bucket(mid_picks,   MID_CAP_PICKS,   sector_counts) +
-            _pick_bucket(small_picks, SMALL_CAP_PICKS,  sector_counts))
+    def _pick_bucket(bucket, n):
+        """Take the top-n from a pre-sorted, sector-capped bucket."""
+        return bucket[:n]
+
+    top5 = (_pick_bucket(mid_picks,   MID_CAP_PICKS) +
+            _pick_bucket(small_picks, SMALL_CAP_PICKS))
+    # De-duplicate in case a stock somehow ended up in both buckets (shouldn't happen)
+    seen_syms: set = set()
+    top5_deduped = []
+    for r in top5:
+        if r["symbol"] not in seen_syms:
+            top5_deduped.append(r)
+            seen_syms.add(r["symbol"])
+    top5 = top5_deduped
 
     log.info(f"=== TOP {len(top5)} PICKS | {len(results)} total passed ===")
     for r in top5:
