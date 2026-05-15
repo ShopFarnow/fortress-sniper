@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   FORTRESS SCREENER v8.1 — AUDIT-PATCHED UNIFIED SNIPER ENGINE     ║
+║   FORTRESS SCREENER v8.2 — GAP-PATCHED UNIFIED SNIPER ENGINE       ║
 ║   Bismillah — In the name of Allah, the Most Gracious              ║
 ║                                                                      ║
 ║   v8.1 CHANGES (over v8.0) — ALL AUDIT FINDINGS RESOLVED:         ║
@@ -45,6 +45,35 @@
 ║   FIX-AUDIT-21  NSE bhavcopy retry loop reuses single session;     ║
 ║                 no redundant warmup per attempt                     ║
 ║   FIX-AUDIT-22  Footer raw-string MarkdownV2 escape corrected      ║
+║                                                                      ║
+║   v8.2 CHANGES (over v8.1) — POST-AUDIT GAP FIXES:                 ║
+║   ─────────────────────────────────────────────────────────────     ║
+║   CRITICAL                                                           ║
+║   FIX-GAP-01  Degraded mode: yfinance fallbacks for insider,       ║
+║               filings, earnings when NSE+Sheets blocked.           ║
+║               Empty earnings_cal was a silent safety failure —      ║
+║               earnings veto could never fire in degraded mode.      ║
+║   FIX-GAP-02  Earnings veto log elevated debug→warning; silently   ║
+║               skipped symbols now visible in production logs.       ║
+║   FIX-GAP-03  volume_reliable propagated into calc_cvd_divergence, ║
+║               calc_momentum_exhaustion, calc_exit_liquidity;        ║
+║               all three now return NEUTRAL/zero when vol absent.    ║
+║                                                                      ║
+║   HIGH                                                               ║
+║   FIX-GAP-04  MC convergence check: two half-batch runs compared;  ║
+║               gap>8pp flagged mc_converged=False in label.         ║
+║   FIX-GAP-05  VDU price confirmation: VDU+price drop→distribution  ║
+║               penalty (-3pts) instead of coil bonus.               ║
+║   FIX-GAP-06  Sector-aware ATR multiplier: METAL×1.20, IT×0.90    ║
+║               etc. Dead ≥1000 branch removed (PRICE_CAP=800).      ║
+║                                                                      ║
+║   MEDIUM                                                             ║
+║   FIX-GAP-07  DB migration verify: PRAGMA table_info post-ALTER;   ║
+║               DB-locked now raises RuntimeError, not silent pass.  ║
+║   FIX-GAP-08  Telegram hard-split walks back up to 20 chars to     ║
+║               avoid cutting inside a MarkdownV2 \X escape seq.     ║
+║   FIX-GAP-09  Sector RS fetch failure now logged at DEBUG (was      ║
+║               bare except: pass) — persistent outages now visible. ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -336,10 +365,16 @@ _ROCE_CACHE_TTL_SECONDS = 86_400
 _roce_cache: dict = {}
 _HALAL_LIST_CUSTOM: set = set()
 
+# FIX-GAP-01: alias used by degraded-mode fallbacks in fetch_insider_trades,
+# fetch_recent_filings, and fetch_earnings_calendar so they can probe a
+# representative subset of symbols via yfinance when NSE + Sheets are blocked.
+_YF_WATCHLIST: list = _YF_UNIVERSE_150
+
 # FIX-AUDIT-15: module-level shared NSE session cache to avoid creating
 # 400+ warmup sessions during sector-lookup and bhavcopy-retry loops.
 _NSE_SESSION_CACHE: Optional[requests.Session] = None
 _NSE_SESSION_LOCK  = threading.Lock()
+
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -796,14 +831,40 @@ def _init_db():
             UNIQUE(symbol, entry_date)
         );
     """)
-    # FIX-AUDIT-03: migrate existing rows that pre-date the status column.
-    # ALTER TABLE is a no-op if the column already exists (caught by exception).
+    # FIX-AUDIT-03 / FIX-GAP-07: ALTER TABLE can fail silently if the DB is
+    # locked by another process (sqlite3 raises OperationalError: database is
+    # locked, not the "duplicate column" error).  We now:
+    #   1. Attempt the ALTER.
+    #   2. Verify the column actually exists via PRAGMA table_info.
+    #   3. Raise on lock failure so the caller knows the DB is unhealthy.
     try:
         con.execute("ALTER TABLE positions ADD COLUMN status TEXT NOT NULL DEFAULT 'open'")
         con.commit()
         log.info("DB: positions.status column added (migration)")
-    except Exception:
-        pass   # column already exists
+    except Exception as alter_exc:
+        # Distinguish "column already exists" (benign) from DB-locked (fatal).
+        err_msg = str(alter_exc).lower()
+        if "duplicate column" in err_msg or "already exists" in err_msg:
+            pass  # column already present — expected on subsequent runs
+        elif "locked" in err_msg or "busy" in err_msg:
+            log.error(f"DB: positions migration FAILED — database locked: {alter_exc}")
+            # Don't silently swallow a lock; propagate so the caller can abort
+            con.close()
+            raise RuntimeError(f"DB locked during migration: {alter_exc}") from alter_exc
+        else:
+            log.warning(f"DB: ALTER TABLE positions unexpected error (proceeding): {alter_exc}")
+
+    # Verify migration succeeded regardless of path taken above
+    try:
+        pragma_rows = con.execute("PRAGMA table_info(positions)").fetchall()
+        col_names   = {row[1] for row in pragma_rows}
+        if "status" not in col_names:
+            log.error("DB: positions.status column MISSING after migration attempt — DB may be corrupt")
+        else:
+            log.debug("DB: positions.status column verified ✓")
+    except Exception as verify_exc:
+        log.warning(f"DB: could not verify positions schema: {verify_exc}")
+
     con.commit()
     con.close()
 
@@ -1518,6 +1579,41 @@ def fetch_insider_trades(days_back: int = 30) -> dict:
             log.warning(f"Insider NSE failed: {e}")
     sheets_insider = _load_insider_from_sheets()
     if sheets_insider: return sheets_insider
+    # FIX-GAP-01: DEGRADED MODE — NSE + Sheets both unavailable.
+    # Fall back to yfinance major_holders for stocks in the yfinance watchlist.
+    # This gives noisy but non-empty insider data so the screener isn't blind.
+    if not insider_map:
+        log.warning("Insider: NSE + Sheets unavailable — attempting yfinance major_holders fallback")
+        try:
+            import yfinance as yf
+            # Probe a small representative set; full universe is too slow
+            _yf_probe_syms = list(getattr(sys.modules[__name__], "_YF_WATCHLIST", []))[:30]
+            for sym in _yf_probe_syms:
+                try:
+                    mh = yf.Ticker(f"{sym}.NS").major_holders
+                    if mh is None or (hasattr(mh, "empty") and mh.empty):
+                        continue
+                    # yfinance major_holders[0] = % held by insiders (float row)
+                    insider_pct = None
+                    try:
+                        insider_pct = float(str(mh.iloc[0, 0]).replace("%", ""))
+                    except Exception:
+                        pass
+                    if insider_pct is not None and insider_pct > 30:
+                        score = min(20, max(5, int(insider_pct / 5)))
+                        insider_map[sym] = {
+                            "transactions": [],
+                            "total_shares": 0,
+                            "total_value_rupees": 0,
+                            "score": score,
+                            "detail": f"yfinance major_holders: {insider_pct:.1f}% insider held → {score}pts [DEGRADED]",
+                        }
+                except Exception:
+                    continue
+            if insider_map:
+                log.info(f"Insider degraded fallback: {len(insider_map)} symbols from yfinance")
+        except Exception as e:
+            log.warning(f"Insider yfinance degraded fallback failed: {e}")
     return insider_map
 
 
@@ -1594,6 +1690,34 @@ def fetch_recent_filings(days_back: int = 14) -> dict:
             log.warning(f"Filings NSE failed: {e}")
     sheets_filings = _load_filings_from_sheets()
     if sheets_filings: return sheets_filings
+    # FIX-GAP-01: DEGRADED MODE — NSE + Sheets both unavailable.
+    # yfinance news feed gives recent corporate announcements as a rudimentary proxy.
+    if not filings:
+        log.warning("Filings: NSE + Sheets unavailable — attempting yfinance news fallback [DEGRADED]")
+        try:
+            import yfinance as yf
+            pos_kw = ["bonus", "dividend", "buyback", "split", "profit", "growth",
+                      "expansion", "order", "contract", "win", "award", "acquisition"]
+            neg_kw = ["loss", "write-off", "penalty", "fraud", "probe", "npa",
+                      "default", "downgrade", "litigation"]
+            _yf_probe_syms = list(getattr(sys.modules[__name__], "_YF_WATCHLIST", []))[:40]
+            for sym in _yf_probe_syms:
+                try:
+                    news = yf.Ticker(f"{sym}.NS").news or []
+                    for item in news[:5]:
+                        title = str(item.get("title", "")).lower()
+                        pos   = sum(1 for k in pos_kw if k in title)
+                        neg   = sum(1 for k in neg_kw if k in title)
+                        score = min(30, max(0, 15 + pos * 5 - neg * 8))
+                        detail = title[:80].capitalize() + " [yfinance news — DEGRADED]"
+                        if sym not in filings or score > filings[sym]["score"]:
+                            filings[sym] = {"score": score, "detail": detail}
+                except Exception:
+                    continue
+            if filings:
+                log.info(f"Filings degraded fallback: {len(filings)} symbols from yfinance news")
+        except Exception as e:
+            log.warning(f"Filings yfinance degraded fallback failed: {e}")
     return filings
 
 
@@ -1659,6 +1783,63 @@ def fetch_earnings_calendar() -> dict:
             log.warning(f"Earnings NSE failed: {e}")
     sheets_cal = _load_earnings_from_sheets()
     if sheets_cal: return sheets_cal
+    # FIX-GAP-01: DEGRADED MODE — NSE + Sheets both unavailable.
+    # A SILENT empty earnings_cal means the earnings veto in assemble_result_v8
+    # can NEVER fire — stocks going ex-results tomorrow pass unvetted.
+    # yfinance calendar gives next_earnings_date for listed companies.
+    if not cal:
+        log.warning(
+            "Earnings: NSE + Sheets unavailable — attempting yfinance calendar fallback. "
+            "DEGRADED MODE: veto window may miss unlisted earnings dates."
+        )
+        try:
+            import yfinance as yf
+            _yf_probe_syms = list(getattr(sys.modules[__name__], "_YF_WATCHLIST", []))[:60]
+            today = datetime.today()
+            for sym in _yf_probe_syms:
+                try:
+                    t   = yf.Ticker(f"{sym}.NS")
+                    cal_data = t.calendar
+                    if cal_data is None:
+                        continue
+                    # calendar is a dict with key 'Earnings Date' → list of datetimes
+                    earn_dates = None
+                    if isinstance(cal_data, dict):
+                        earn_dates = cal_data.get("Earnings Date")
+                    elif hasattr(cal_data, "T"):
+                        # older yfinance returns a DataFrame
+                        try:
+                            earn_dates = cal_data.T.get("Earnings Date")
+                        except Exception:
+                            pass
+                    if not earn_dates:
+                        continue
+                    if not hasattr(earn_dates, "__iter__"):
+                        earn_dates = [earn_dates]
+                    for ed in earn_dates:
+                        try:
+                            dt = pd.to_datetime(ed)
+                            calendar_days = (dt.to_pydatetime() - today).days
+                            td_delta = (
+                                _count_nse_trading_days(today, dt.to_pydatetime())
+                                if calendar_days >= 0
+                                else -_count_nse_trading_days(dt.to_pydatetime(), today)
+                            )
+                            if sym not in cal or abs(td_delta) < abs(cal[sym]):
+                                cal[sym] = td_delta
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            if cal:
+                log.info(f"Earnings degraded fallback: {len(cal)} symbols from yfinance")
+            else:
+                log.warning(
+                    "Earnings: yfinance fallback also returned nothing. "
+                    "Earnings veto will be INACTIVE this run — exercise manual caution."
+                )
+        except Exception as e:
+            log.warning(f"Earnings yfinance degraded fallback failed: {e}")
     return cal
 
 
@@ -1889,11 +2070,40 @@ def get_entry_tolerance(price: float, atr14: float = 0.0, gap_buffer: float = 0.
     else:            return 0.008,0.006+gap_buffer
 
 
-def get_atr_stop_multiplier(price: float) -> float:
-    if price<100:    return 0.75
-    elif price<300:  return 1.00
-    elif price<1000: return 1.40
-    else:            return 1.75
+def get_atr_stop_multiplier(price: float, sector: str = "") -> float:
+    """
+    FIX-GAP-06: Sector-aware ATR multiplier.
+    Metals / commodities need wider stops (higher volatility regime);
+    IT / FMCG can use tighter stops.
+    Dead code: the ≥1000 branch was unreachable with PRICE_CAP=800 — removed.
+
+    Base multiplier by price tier:
+      <100  → 0.75  (micro-cap, tight range)
+      <300  → 1.00  (small-cap standard)
+      <800  → 1.40  (mid-cap standard)  ← PRICE_CAP ceiling
+
+    Sector overlay applied on top of price-tier base:
+      NIFTY METAL   → ×1.20  (high vol, gap risk)
+      NIFTY PHARMA  → ×1.10  (FDA event risk)
+      NIFTY AUTO    → ×1.05  (commodity input risk)
+      NIFTY IT      → ×0.90  (lower historical ATR)
+      NIFTY FMCG    → ×0.85  (defensive, low vol)
+    """
+    # Price-tier base
+    if price < 100:   base = 0.75
+    elif price < 300: base = 1.00
+    else:             base = 1.40   # covers 300–800 (PRICE_CAP)
+
+    # Sector overlay
+    _SECTOR_ATR_OVERLAY: dict = {
+        "NIFTY METAL":  1.20,
+        "NIFTY PHARMA": 1.10,
+        "NIFTY AUTO":   1.05,
+        "NIFTY IT":     0.90,
+        "NIFTY FMCG":   0.85,
+    }
+    overlay = _SECTOR_ATR_OVERLAY.get(sector, 1.0)
+    return round(base * overlay, 3)
 
 
 def check_smallcap_circuit_breaker() -> tuple:
@@ -2164,44 +2374,59 @@ def calc_monte_carlo_survival(hist: pd.DataFrame, t3: float,
     exhibit fat tails and circuit-breaker gaps that Normal distribution
     systematically underestimates.  t(df=4) has excess kurtosis ≈1.5 which
     better matches empirical NSE daily return distributions.
+
+    FIX-GAP-04: Convergence check.  500 sims at 20-bar horizon produce ±5%
+    natural variance, making the survival% unreliable for position sizing.
+    We now run two independent half-batches and compare; if the gap > 8pp
+    we flag mc_converged=False and add a caution note to mc_label.
     """
     if len(hist)<30 or t3<=0:
-        return {"mc_survival_pct":None,"mc_label":"MC: insufficient data"}
+        return {"mc_survival_pct":None,"mc_label":"MC: insufficient data","mc_converged":None}
     try:
         closes    = hist["close"].values.astype(float)
         log_ret   = np.diff(np.log(closes[closes>0]))
         if len(log_ret)<10:
-            return {"mc_survival_pct":None,"mc_label":"MC: insufficient returns"}
+            return {"mc_survival_pct":None,"mc_label":"MC: insufficient returns","mc_converged":None}
         mu, sigma = float(np.mean(log_ret)), float(np.std(log_ret))
         current   = float(closes[-1])
-        survived  = 0
         rng       = np.random.default_rng()
 
-        if MC_FAT_TAILS:
-            # Student-t: scale factor so variance = sigma² (for df>2: var = df/(df-2))
-            df = MC_FAT_TAILS_DF
-            t_scale = sigma * math.sqrt((df-2)/df) if df > 2 else sigma
-            for _ in range(n_sims):
-                # Draw from t-distribution, scale to match historical sigma
-                raw_ret = rng.standard_t(df, size=horizon)
-                ret     = np.cumsum(mu + t_scale * raw_ret)
-                path    = current * np.exp(ret)
-                if float(np.min(path)) > t3:
-                    survived += 1
-        else:
-            for _ in range(n_sims):
-                ret  = np.cumsum(rng.normal(mu, sigma, horizon))
-                path = current * np.exp(ret)
-                if float(np.min(path)) > t3:
-                    survived += 1
+        def _run_batch(n: int) -> int:
+            batch_survived = 0
+            if MC_FAT_TAILS:
+                df      = MC_FAT_TAILS_DF
+                t_scale = sigma * math.sqrt((df-2)/df) if df > 2 else sigma
+                for _ in range(n):
+                    raw_ret = rng.standard_t(df, size=horizon)
+                    ret     = np.cumsum(mu + t_scale * raw_ret)
+                    path    = current * np.exp(ret)
+                    if float(np.min(path)) > t3:
+                        batch_survived += 1
+            else:
+                for _ in range(n):
+                    ret  = np.cumsum(rng.normal(mu, sigma, horizon))
+                    path = current * np.exp(ret)
+                    if float(np.min(path)) > t3:
+                        batch_survived += 1
+            return batch_survived
 
-        pct   = round(survived/n_sims*100, 1)
-        model = f"t(df={MC_FAT_TAILS_DF})" if MC_FAT_TAILS else "Normal"
-        label = (f"✅ MC survival {pct}% ({n_sims} sims, {horizon}d, {model})" if pct>=70
-                 else f"⚠️ MC survival {pct}% ({model})")
-        return {"mc_survival_pct":pct,"mc_label":label}
+        half    = n_sims // 2
+        surv_a  = _run_batch(half)
+        surv_b  = _run_batch(n_sims - half)
+        survived= surv_a + surv_b
+        pct_a   = round(surv_a / half * 100, 1)
+        pct_b   = round(surv_b / (n_sims - half) * 100, 1)
+        pct     = round(survived / n_sims * 100, 1)
+
+        # Convergence: two half-batches within 8pp → converged
+        converged     = abs(pct_a - pct_b) <= 8.0
+        model         = f"t(df={MC_FAT_TAILS_DF})" if MC_FAT_TAILS else "Normal"
+        converge_note = "" if converged else f" ⚠️ HIGH VARIANCE ({pct_a}% vs {pct_b}% — use caution)"
+        label = (f"✅ MC survival {pct}% ({n_sims} sims, {horizon}d, {model}){converge_note}" if pct>=70
+                 else f"⚠️ MC survival {pct}% ({model}){converge_note}")
+        return {"mc_survival_pct":pct,"mc_label":label,"mc_converged":converged}
     except Exception as e:
-        return {"mc_survival_pct":None,"mc_label":f"MC error: {e}"}
+        return {"mc_survival_pct":None,"mc_label":f"MC error: {e}","mc_converged":None}
 
 
 def calc_round_trip_guard(hist: pd.DataFrame, close: float, t1: float) -> dict:
@@ -2273,6 +2498,8 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     # was successfully fetched.  Exception sets sect_20=None (not 0.0),
     # preventing the accidental unconditional boost that occurred when
     # velocity > 0 + 5 was always True after a silent exception.
+    # FIX-GAP-09: Silent exceptions previously hid when sector boost failed.
+    # Now logged at DEBUG so operators can detect persistent yfinance outages.
     sect_20: Optional[float] = None
     try:
         if sector in SECTOR_INDICES:
@@ -2282,7 +2509,11 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
             if not idx_df.empty and len(idx_df) >= 2:
                 ic = idx_df["Close"].squeeze().values
                 sect_20 = (ic[-1]-ic[-20])/ic[-20]*100 if len(ic)>=20 else None
-    except Exception:
+                log.debug(f"{symbol}: sector RS ({sector}) = {sect_20:.2f}% 20d change")
+            else:
+                log.debug(f"{symbol}: sector RS ({sector}) — yfinance returned empty data; boost skipped")
+    except Exception as _sect_exc:
+        log.debug(f"{symbol}: sector RS ({sector}) fetch failed — {_sect_exc}; boost skipped")
         sect_20 = None
 
     if sect_20 is not None and velocity > sect_20 + 5.0:
@@ -2308,7 +2539,7 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     entry_zone = "PRISTINE" if entry_lo <= close <= entry_hi else ("ABOVE" if close > entry_hi else "BELOW")
     entry_band = f"₹{entry_lo:.2f}–₹{entry_hi:.2f}"
 
-    atr_mult  = get_atr_stop_multiplier(close)
+    atr_mult  = get_atr_stop_multiplier(close, sector)
     t2        = round(close + CFG["atr_t2"] * atr14, 2)
     t3        = round(close - atr_mult * atr14, 2)
     if t3 <= 0: t3 = round(close * 0.93, 2)
@@ -2325,6 +2556,12 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
                     else "LOOSE")
 
     # VDU: Volume Dry-Up signal
+    # FIX-GAP-05: Price confirmation gate added.
+    # VDU is a bullish coil signal ONLY when price is flat or rising.
+    # VDU + falling price = distribution (quiet selling into declining mkt).
+    # We check whether close is above the N-bar-ago close; if price has
+    # dropped more than 1% over the VDU window, bonus is zeroed and label
+    # is overridden to warn of distribution.
     vdu_bars = 0
     if len(hist) >= 6 and volume_reliable:
         for _vdu_n in range(3, 6):
@@ -2333,7 +2570,21 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
                 for i in range(_vdu_n - 1)
             ):
                 vdu_bars = _vdu_n
-    if vdu_bars >= 5:   vdu_bonus=7; vdu_label=f"🌀 VDU {vdu_bars}-bar deep coil (+7pts)"
+
+    if vdu_bars >= 3:
+        # Check price direction over the VDU window
+        _vdu_close_now  = float(hist["close"].iloc[-1])
+        _vdu_close_start= float(hist["close"].iloc[-(vdu_bars + 1)])
+        _vdu_price_chg  = (_vdu_close_now - _vdu_close_start) / _vdu_close_start if _vdu_close_start > 0 else 0.0
+        _vdu_confirmed  = _vdu_price_chg >= -0.01  # price flat or rising (within -1% tolerance)
+    else:
+        _vdu_confirmed  = True  # no VDU, doesn't matter
+
+    if not _vdu_confirmed:
+        # Price drop during VDU window → distribution, not coil
+        vdu_bonus = -3
+        vdu_label = f"🔴 VDU {vdu_bars}-bar + price drop {_vdu_price_chg*100:.1f}% — DISTRIBUTION (-3pts)"
+    elif vdu_bars >= 5: vdu_bonus=7; vdu_label=f"🌀 VDU {vdu_bars}-bar deep coil (+7pts)"
     elif vdu_bars >= 4: vdu_bonus=5; vdu_label=f"🌀 VDU {vdu_bars}-bar confirmed (+5pts)"
     elif vdu_bars >= 3: vdu_bonus=3; vdu_label=f"🌀 VDU {vdu_bars}-bar mild (+3pts)"
     else:               vdu_bonus=0; vdu_label=""
@@ -2567,11 +2818,24 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
     ma200_val= fort.get("ma200_val", 0.0)
 
     vix_now  = vix_now_cached if vix_now_cached is not None else _get_vix_now()
-    cvd      = calc_cvd_divergence(hist, close)
-    vsa      = calc_vsa_absorption(hist, atr14 if atr14>0 else 1.0, adv20 if adv20>0 else 1.0)
-    exh      = calc_momentum_exhaustion(hist, rsi_v, close, adv20 if adv20>0 else 1.0)
-    exlq     = calc_exit_liquidity(hist, close, rsi_v, vpoc_val,
+
+    # FIX-GAP-03: volume_reliable propagated from fortress_score so that
+    # calc_cvd_divergence, calc_momentum_exhaustion, and calc_exit_liquidity
+    # do not produce false signals when underlying volume data is absent.
+    volume_reliable = fort.get("volume_reliable", True)
+
+    if volume_reliable:
+        cvd  = calc_cvd_divergence(hist, close)
+        exh  = calc_momentum_exhaustion(hist, rsi_v, close, adv20 if adv20>0 else 1.0)
+        exlq = calc_exit_liquidity(hist, close, rsi_v, vpoc_val,
                                    atr14 if atr14>0 else 1.0, adv20 if adv20>0 else 1.0)
+    else:
+        log.debug(f"{symbol}: CVD/exhaustion/exit-liq suppressed — volume data unreliable")
+        cvd  = {"cvd_signal": "NEUTRAL", "cvd_label": "⚠️ Volume unreliable — CVD skipped", "cvd_bonus": 0}
+        exh  = {"exhaustion_flag": False, "exhaustion_label": "", "exhaustion_penalty": 0}
+        exlq = {"exit_liq_score": 0, "exit_liq_flag": False, "exit_liq_label": ""}
+
+    vsa      = calc_vsa_absorption(hist, atr14 if atr14>0 else 1.0, adv20 if adv20>0 else 1.0)
     fog_enh  = calc_fog_enhanced(adx_v, adx_prev, vix_now, ma50_val, ma200_val, w52_bonus)
     dyn      = calc_dynamic_score_weights(fii_data, vix_now)
 
@@ -3003,11 +3267,11 @@ def calc_sniper_exit_plan(close, t1, t3, atr14, trail_stop_existing=None) -> dic
             "sn_gain_pct":round(gain_pct,1)}
 
 
-# ── Assemble v8.1 enriched result ──────────────────────────────────
+# ── Assemble v8.2 enriched result ──────────────────────────────────
 
 def assemble_result_v8(symbol, today_row, hist, fii_data, insider_map,
                        filings, earnings_cal) -> Optional[dict]:
-    """Full v8.1 assemble — all audit fixes applied."""
+    """Full v8.2 assemble — all audit + gap fixes applied."""
     macro       = _get_macro_regime()
     macro_state = macro["macro_state"]
     breadth_ok  = macro["breadth_ok"]
@@ -3017,9 +3281,12 @@ def assemble_result_v8(symbol, today_row, hist, fii_data, insider_map,
     # (stock in live results-day trading — maximum binary event risk).
     _earn_days = earnings_cal.get(symbol.upper())
     if _earn_days is not None and 0 <= _earn_days <= 2:
-        log.debug(
+        # FIX-GAP-02: Elevated from log.debug → log.warning so production users
+        # can see exactly which symbols were hard-vetoed due to imminent earnings.
+        # log.debug is invisible at INFO level; this is a safety-critical skip.
+        log.warning(
             f"{symbol}: EARNINGS VETO — results in {_earn_days} trading day(s) "
-            f"(including today). Hard skip."
+            f"(including today). Hard skip — not scored."
         )
         return None
 
@@ -3194,33 +3461,56 @@ def validate_telegram_token(token: str) -> tuple:
 
 
 def _split_telegram_message_v2(msg: str, limit: int = 4000) -> list:
-    """Split at blank-line card boundaries; hard-split oversized blocks."""
+    """Split at blank-line card boundaries; hard-split oversized blocks.
+
+    FIX-GAP-08: Character-level hard split (chunk[:limit]) can land the
+    cut-point immediately after a backslash, splitting a MarkdownV2 escape
+    sequence across two messages (e.g. "\\-" becomes "\\" + "-").  Telegram
+    then renders the second chunk with a bare "-" that fails parse validation.
+
+    Safe hard-split: walk backwards from `limit` up to 20 chars to find a
+    position that is not immediately after a backslash.  If no safe position
+    is found (pathological case), fall back to the character boundary with a
+    warning logged.
+    """
+    def _safe_split(chunk: str, at: int) -> tuple:
+        """Return (head, tail) split at `at`, walking back to avoid mid-escape."""
+        for offset in range(0, min(20, at)):
+            pos = at - offset
+            if pos > 0 and chunk[pos - 1] == "\\":
+                continue  # would split a \X escape — try one character earlier
+            return chunk[:pos], chunk[pos:]
+        # Fallback: no safe position found, split at original boundary
+        log.warning(f"Telegram split: could not find escape-safe boundary near {at} — hard-splitting")
+        return chunk[:at], chunk[at:]
+
     if len(msg) <= limit:
         return [msg]
     cards  = msg.split("\n\n")
-    chunks: list = []; cur=""
+    chunks: list = []; cur = ""
     for card in cards:
-        block = card+"\n\n"
+        block = card + "\n\n"
         if len(block) > limit:
-            if cur.strip(): chunks.append(cur.rstrip()); cur=""
-            lines    = block.split("\n"); card_buf=""
+            if cur.strip(): chunks.append(cur.rstrip()); cur = ""
+            lines    = block.split("\n"); card_buf = ""
             for line in lines:
-                if len(card_buf)+len(line)+1 > limit:
+                if len(card_buf) + len(line) + 1 > limit:
                     if card_buf.strip(): chunks.append(card_buf.rstrip())
-                    card_buf = line+"\n"
+                    card_buf = line + "\n"
                 else:
-                    card_buf += line+"\n"
-            if card_buf.strip(): cur=card_buf
-        elif len(cur)+len(block) > limit:
+                    card_buf += line + "\n"
+            if card_buf.strip(): cur = card_buf
+        elif len(cur) + len(block) > limit:
             if cur.strip(): chunks.append(cur.rstrip())
-            cur=block
+            cur = block
         else:
-            cur+=block
+            cur += block
     if cur.strip(): chunks.append(cur.rstrip())
-    result=[]
+    result = []
     for chunk in chunks:
         while len(chunk) > limit:
-            result.append(chunk[:limit]); chunk=chunk[limit:]
+            head, chunk = _safe_split(chunk, limit)
+            if head.strip(): result.append(head)
         if chunk.strip(): result.append(chunk)
     return result
 
@@ -3255,7 +3545,7 @@ def _telegram_post(token: str, chat_id: str, text: str,
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SECTION 22b — SN-7: SNIPER TELEGRAM FORMAT v8.1
+# SECTION 22b — SN-7: SNIPER TELEGRAM FORMAT v8.2
 # ══════════════════════════════════════════════════════════════════════
 
 def _fmt_price(val) -> str:
@@ -3279,7 +3569,7 @@ def _rank_clean(rank: str) -> str:
 
 def send_telegram_v7(top5, sector_trends, fii_data, date_label, macro,
                      using_fallback=False, data_source="NSE"):
-    """SN-7 v8.1 — FIX-AUDIT-01: all data values passed through _escape_md
+    """SN-7 v8.2 — FIX-AUDIT-01: all data values passed through _escape_md
     which now covers all 18 MarkdownV2 special characters."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.info("Telegram not configured — skipping"); return
@@ -3410,7 +3700,7 @@ def send_telegram_v7(top5, sector_trends, fii_data, date_label, macro,
             lines.extend(card)
 
     # FIX-AUDIT-22: footer uses _escape_md so all special chars are safe.
-    footer_text = "v8.1 · Halal+HALAL_LIST · 9-node Bayes · 6-layer VPOC · CVD · VSA · VDU · MC · ≤₹800 · Not financial advice"
+    footer_text = "v8.2 · Halal+HALAL_LIST · 9-node Bayes · 6-layer VPOC · CVD · VSA · VDU · MC · ≤₹800 · Not financial advice"
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"_{_escape_md(footer_text)}_",
@@ -3592,14 +3882,14 @@ def save_html_report(top5: list, date_label: str, fii_data: dict, sector_trends:
             for sec,v in sector_trends.items()
         )
         html=f"""<!DOCTYPE html><html lang="en"><head>
-<meta charset="UTF-8"><title>⚔️ Fortress Sniper v8.1 | {date_label}</title>
+<meta charset="UTF-8"><title>⚔️ Fortress Sniper v8.2 | {date_label}</title>
 <style>body{{font-family:system-ui,sans-serif;margin:0;padding:20px;background:#f9fafb;color:#111}}
 h1{{font-size:22px;margin:0 0 4px}}.meta{{color:#666;font-size:14px;margin-bottom:20px}}
 .card{{background:#fff;border-radius:12px;border:1px solid #e5e7eb;padding:20px;margin-bottom:16px}}
 table{{border-collapse:collapse;width:100%}}
 th{{background:#f3f4f6;padding:10px 12px;text-align:left;font-size:13px;color:#555;border-bottom:1px solid #e5e7eb}}
 td{{padding:10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-size:13px}}</style></head><body>
-<h1>⚔️ Fortress Sniper v8.1 — Audit-Patched</h1>
+<h1>⚔️ Fortress Sniper v8.2 — Gap-Patched</h1>
 <div class="meta">🕌 Halal · 9-node Bayes · 6-layer VPOC · t(df=4) MC · Student-t · {date_label}</div>
 <div class="card"><b>🧠 Market Intelligence</b>
   <div style="background:#e0f2fe;border-radius:8px;padding:12px 16px;margin:12px 0">
@@ -3616,7 +3906,7 @@ td{{padding:10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-size:13
   </table>
 </div>
 <div class="meta" style="margin-top:20px;text-align:center">
-  Fortress Screener v8.1 · Audit-Patched · Halal · NSE EQ · Not financial advice
+  Fortress Screener v8.2 · Gap-Patched · Halal · NSE EQ · Not financial advice
 </div></body></html>"""
         HTML_OUTPUT_PATH.write_text(html, encoding="utf-8")
         log.info(f"HTML report saved: {HTML_OUTPUT_PATH}")
@@ -3625,18 +3915,18 @@ td{{padding:10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-size:13
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SECTION 25 — MAIN SCREENER LOOP (v8.1)
+# SECTION 25 — MAIN SCREENER LOOP (v8.2)
 # ══════════════════════════════════════════════════════════════════════
 
 def run_screener_v8():
     """
-    v8.1 main entry point — all audit fixes applied.
+    v8.2 main entry point — all audit + gap fixes applied.
     FIX-AUDIT-21: bhavcopy retry loop reuses the shared NSE session
     (one warmup) instead of creating a new session per date attempt.
     """
     _init_db()
     date_str, date_label = get_last_trading_day()
-    log.info(f"=== FORTRESS SNIPER v8.1 (AUDIT-PATCHED) | {date_label} ===")
+    log.info(f"=== FORTRESS SNIPER v8.2 (GAP-PATCHED) | {date_label} ===")
     log.info(f"    FORCE_SHEETS={FORCE_SHEETS} | FORCE_YFINANCE={FORCE_YFINANCE}")
     log.info(f"    PRICE_CAP=₹{PRICE_CAP} | CB_FAIL_SAFE={CB_FAIL_SAFE} | MC_FAT_TAILS={MC_FAT_TAILS}(df={MC_FAT_TAILS_DF})")
     log.info(f"    SHARIAH_CACHE_TTL={SHARIAH_CACHE_TTL_DAYS}d")
@@ -3770,7 +4060,7 @@ def run_screener_v8():
 
     results.sort(key=lambda x: (x.get("sniper_composite",0), x.get("total_score",0)), reverse=True)
 
-    # ── v8.1 bucket picker — global sector cap applied first ──────────
+    # ── v8.2 bucket picker — global sector cap applied first ──────────
     MAX_PER_SECTOR       = 2
     sector_counts_global: dict = {}
     globally_capped: list      = []
@@ -3840,4 +4130,3 @@ def run_screener_v8():
 
 if __name__ == "__main__":
     run_screener_v8()
-
