@@ -275,27 +275,75 @@ def _llm_filing_sentiment(subject: str, symbol: str = "") -> dict:
         return {"score": 15, "detail": result[:80], "sentiment": "PARSE_ERROR"}
 
 
-def _llm_story_enhance(symbol: str, story_parts: list, technicals: dict) -> Optional[str]:
+def _llm_structured_reasoning(symbol: str, signal_dict: dict) -> Optional[dict]:
     """
-    Use LLM to craft a compelling investment narrative from raw signals.
-    Input: list of signal strings + technical dict
-    Output: 1-2 sentence human-readable story
+    Feed full signal dict as JSON to LLM. Returns structured reasoning:
+    {conviction: 0-100, key_risk: str, weight_override: dict, regime_note: str}
+    Cached per signal hash (SHA256 of sorted JSON).
     """
-    if not LLM_ENABLED or not story_parts:
+    if not LLM_ENABLED:
         return None
 
-    signals_text = "; ".join(story_parts[:6])
-    prompt = f"Write a 1-sentence investment thesis for {symbol} based on these signals:\n"
-    prompt += f"{signals_text}\n\n"
-    prompt += f"Technical context: RSI {technicals.get('rsi','?')}, ADX {technicals.get('adx','?')}, "
-    prompt += f"MFI {technicals.get('mfi','?')}, ATR {technicals.get('atr14','?')}\n\n"
-    prompt += "Rules:\n"
-    prompt += "- Max 25 words\n"
-    prompt += "- Plain English, no jargon\n"
-    prompt += "- Mention the strongest signal first\n"
-    prompt += "- End with expected outcome if clear"
+    import json, hashlib
+    signal_json = json.dumps(signal_dict, sort_keys=True, default=str)
+    signal_hash = hashlib.sha256(signal_json.encode()).hexdigest()[:16]
 
-    return _llm_call(prompt, "story")
+    cached = _llm_cached(signal_hash, "structured_reasoning")
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+
+    prompt = "You are a quantitative trading analyst. Analyze this stock signal JSON and return ONLY a JSON object.\n\n"
+    prompt += f"Symbol: {symbol}\n"
+    prompt += f"Signals: {signal_json[:2000]}\n\n"
+    prompt += "Return EXACTLY this JSON format (no markdown, no explanation):\n"
+    prompt += '{"conviction": 0-100, "key_risk": "single sentence", "weight_override": {"whale_radar": 0.0-1.0, "divergence": 0.0-1.0, "vol_profile": 0.0-1.0, "pattern": 0.0-1.0, "bayesian": 0.0-1.0}, "regime_note": "single sentence"}'
+    prompt += "\n\nRules:\n"
+    prompt += "- conviction: 0=avoid, 50=neutral, 80+ strong buy\n"
+    prompt += "- weight_override: only override if strong reason, else null\n"
+    prompt += "- key_risk: the single biggest reason this trade could fail\n"
+    prompt += "- regime_note: how current market regime affects this setup"
+
+    result = _llm_call(prompt, "structured_reasoning", max_tokens=800)
+    if not result:
+        return None
+
+    try:
+        json_str = result
+        if "```json" in result:
+            json_str = result.split("```json")[1].split("```")[0].strip()
+        elif "```" in result:
+            json_str = result.split("```")[1].split("```")[0].strip()
+
+        parsed = json.loads(json_str)
+        parsed["conviction"] = max(0, min(100, int(parsed.get("conviction", 50))))
+        parsed["key_risk"] = str(parsed.get("key_risk", ""))[:100]
+        parsed["regime_note"] = str(parsed.get("regime_note", ""))[:100]
+
+        wo = parsed.get("weight_override")
+        if isinstance(wo, dict):
+            for k in ["whale_radar", "divergence", "vol_profile", "pattern", "bayesian"]:
+                if k in wo:
+                    wo[k] = max(0.0, min(1.0, float(wo[k])))
+        else:
+            parsed["weight_override"] = None
+
+        _llm_store_cache(signal_hash, "structured_reasoning", json.dumps(parsed), LLM_MODEL)
+        return parsed
+    except Exception as e:
+        log.debug(f"LLM structured parse failed for {symbol}: {e}")
+        return None
+
+
+def _llm_story_enhance(symbol: str, story_parts: list, technicals: dict) -> Optional[str]:
+    """Backward compatibility wrapper."""
+    signal_dict = {"parts": story_parts, "technicals": technicals}
+    result = _llm_structured_reasoning(symbol, signal_dict)
+    if result:
+        return result.get("regime_note", "")
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -379,6 +427,49 @@ def get_sector(sym: str) -> str:
     _SECTOR_LIVE_CACHE[s] = sec
     return sec
 
+
+
+
+def _live_sector_momentum(sector: str, days: int = 20) -> dict:
+    """Compute sector vs CNX500 relative momentum. Returns bonus/penalty."""
+    try:
+        import yfinance as yf
+        sector_ticker = SECTOR_INDICES.get(sector)
+        if not sector_ticker:
+            return {"rel_5d": 0.0, "rel_20d": 0.0, "momentum_tier": "NEUTRAL", "bonus": 0}
+
+        sector_df = yf.download(f"^{sector_ticker}", period="30d", progress=False, auto_adjust=True)
+        cnx_df = yf.download("^CNX500", period="30d", progress=False, auto_adjust=True)
+
+        if sector_df.empty or cnx_df.empty or len(sector_df) < 20:
+            return {"rel_5d": 0.0, "rel_20d": 0.0, "momentum_tier": "NEUTRAL", "bonus": 0}
+
+        sector_close = sector_df["Close"].squeeze().values
+        cnx_close = cnx_df["Close"].squeeze().values
+
+        sec_5d = (sector_close[-1] - sector_close[-5]) / sector_close[-5] * 100 if len(sector_close) >= 5 else 0
+        cnx_5d = (cnx_close[-1] - cnx_close[-5]) / cnx_close[-5] * 100 if len(cnx_close) >= 5 else 0
+        rel_5d = sec_5d - cnx_5d
+
+        sec_20d = (sector_close[-1] - sector_close[-20]) / sector_close[-20] * 100 if len(sector_close) >= 20 else 0
+        cnx_20d = (cnx_close[-1] - cnx_close[-20]) / cnx_close[-20] * 100 if len(cnx_close) >= 20 else 0
+        rel_20d = sec_20d - cnx_20d
+
+        if rel_5d > 2.0 and rel_20d > 3.0:
+            tier, bonus = "STRONG", 6
+        elif rel_5d > 1.0 and rel_20d > 1.5:
+            tier, bonus = "MODERATE", 3
+        elif rel_5d < -2.0 or rel_20d < -3.0:
+            tier, bonus = "WEAK", -4
+        elif rel_5d < -1.0:
+            tier, bonus = "FADING", -2
+        else:
+            tier, bonus = "NEUTRAL", 0
+
+        return {"rel_5d": round(rel_5d, 2), "rel_20d": round(rel_20d, 2), "momentum_tier": tier, "bonus": bonus}
+    except Exception as e:
+        log.debug(f"Sector momentum {sector}: {e}")
+        return {"rel_5d": 0.0, "rel_20d": 0.0, "momentum_tier": "NEUTRAL", "bonus": 0}
 
 def _lookup_sector_nse(sym: str) -> str:
     try:
@@ -2015,6 +2106,103 @@ _BAYES_PRIOR_VERSION = "v1.0-conservative"  # Tracks which prior set is active
 _MIN_CALIBRATION_SAMPLES = 20  # Minimum trades before trusting empirical rate
 
 
+
+
+def _walkforward_engine_correlation(days: int = 90) -> dict:
+    """
+    Correlate each sub-engine score with realized P&L from closed picks.
+    Returns: {engine_name: spearman_r, p_value, edge_status}
+    edge_status: 'GENUINE' | 'NOISE' | 'INSUFFICIENT'
+    """
+    try:
+        import scipy.stats as stats
+        con = sqlite3.connect(DB_PATH)
+
+        # Get closed picks with their scores and P&L
+        rows = con.execute(
+            "SELECT whale_score, div_score, vp_score, pat_score, bayes_pct, pnl_pct, status "
+            "FROM pick_outcomes WHERE status IN ('r1_hit','r2_hit','r3_hit','stopped','expired') "
+            "AND run_date > ?",
+            ((datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d"),)
+        ).fetchall()
+        con.close()
+
+        if len(rows) < 15:
+            return {"status": "INSUFFICIENT", "message": f"Only {len(rows)} closed picks (< 15)"}
+
+        results = {}
+        engines = [
+            ("whale_radar", 0),
+            ("divergence", 1),
+            ("vol_profile", 2),
+            ("pattern", 3),
+            ("bayesian", 4),
+        ]
+
+        for name, idx in engines:
+            scores = [r[idx] for r in rows]
+            pnls = [r[5] for r in rows]
+
+            if len(set(scores)) < 3:
+                results[name] = {"r": 0.0, "p": 1.0, "status": "NOISE", "n": len(rows)}
+                continue
+
+            r, p = stats.spearmanr(scores, pnls)
+            status = "GENUINE" if r > 0.3 and p < 0.10 else "NOISE" if r < 0.1 else "MARGINAL"
+            results[name] = {
+                "r": round(r, 3),
+                "p": round(p, 3),
+                "status": status,
+                "n": len(rows)
+            }
+
+        return results
+    except Exception as e:
+        log.debug(f"Walkforward correlation: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+
+def _walkforward_engine_correlation(days: int = 90) -> dict:
+    """
+    Correlate each sub-engine score with realized P&L from closed picks.
+    Returns: {engine_name: {spearman_r, p_value, edge_status, n}}
+    edge_status: 'GENUINE' | 'NOISE' | 'MARGINAL' | 'INSUFFICIENT'
+    """
+    try:
+        import scipy.stats as stats
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute(
+            "SELECT whale_score, div_score, vp_score, pat_score, bayes_pct, pnl_pct, status "
+            "FROM pick_outcomes WHERE status IN ('r1_hit','r2_hit','r3_hit','stopped','expired') "
+            "AND run_date > ?",
+            ((datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d"),)
+        ).fetchall()
+        con.close()
+
+        if len(rows) < 15:
+            return {"status": "INSUFFICIENT", "message": f"Only {len(rows)} closed picks (< 15)"}
+
+        results = {}
+        engines = [("whale_radar", 0), ("divergence", 1), ("vol_profile", 2), ("pattern", 3), ("bayesian", 4)]
+
+        for name, idx in engines:
+            scores = [r[idx] for r in rows]
+            pnls = [r[5] for r in rows]
+
+            if len(set(scores)) < 3:
+                results[name] = {"r": 0.0, "p": 1.0, "status": "NOISE", "n": len(rows)}
+                continue
+
+            r, p = stats.spearmanr(scores, pnls)
+            status = "GENUINE" if r > 0.3 and p < 0.10 else "NOISE" if r < 0.1 else "MARGINAL"
+            results[name] = {"r": round(r, 3), "p": round(p, 3), "status": status, "n": len(rows)}
+
+        return results
+    except Exception as e:
+        log.debug(f"Walkforward correlation: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
 def _calibrate_bayes_priors() -> dict:
     """
     Read pick_outcomes table, group by which Bayesian nodes were true/false,
@@ -2400,23 +2588,60 @@ def assemble_pick(
     r1_pct=round((r1-close)/close*100,1); r2_pct=round((r2-close)/close*100,1)
     r3_pct=round((r3-close)/close*100,1)
 
-    # ── Position size ──────────────────────────────────────────────────
-    rps    = max(close-stop_loss, close*0.02)
-    risk_r = ACCOUNT_EQUITY*ACCOUNT_RISK_PCT
-    sh_v   = math.floor(risk_r/rps) if rps>0 else 0
-    deploy = (1.00 if fused>=GRADE_APEX else 0.75 if fused>=GRADE_PRISTINE
-              else 0.50 if fused>=GRADE_GOOD else 0.25)
-    sh_f   = min(math.floor(sh_v*(0.5+0.5*(fused/100)**0.5)*deploy),
-                 math.floor(ACCOUNT_EQUITY*0.10/close) if close>0 else 0)
-    pos_v  = sh_f*close
-    pos_lb = (f"{sh_f} sh × ₹{close:.2f} = ₹{pos_v:,.0f} | Risk ₹{sh_f*rps:,.0f}"
-              if sh_f>0 else "— (below sizing min)")
+    # ── Kelly-fraction position sizing ─────────────────────────────────
+    def _kelly_fraction(p: float, b: float, max_frac: float = ACCOUNT_RISK_PCT) -> float:
+        """f = (p*b - q) / b, half-Kelly conservative, capped at max_frac."""
+        q = 1.0 - p
+        if b <= 0 or p <= 0 or p >= 1:
+            return max_frac * 0.5
+        raw_kelly = (p * b - q) / b
+        return max(0.0, min(max_frac, raw_kelly * 0.5))
+
+    def _get_avg_win_loss() -> tuple:
+        """Return (avg_win_pct, avg_loss_pct) from closed picks."""
+        try:
+            con = sqlite3.connect(DB_PATH)
+            wins = con.execute(
+                "SELECT AVG(pnl_pct) FROM pick_outcomes WHERE status IN ('r1_hit','r2_hit','r3_hit') AND pnl_pct > 0"
+            ).fetchone()[0]
+            losses = con.execute(
+                "SELECT ABS(AVG(pnl_pct)) FROM pick_outcomes WHERE status IN ('stopped','expired') AND pnl_pct < 0"
+            ).fetchone()[0]
+            con.close()
+            return float(wins or 8.0), float(losses or 4.0)
+        except Exception:
+            return 8.0, 4.0
+
+    avg_win, avg_loss = _get_avg_win_loss()
+    b = avg_win / avg_loss if avg_loss > 0 else 2.0
+    p = bayes["bayes_prob"] if bayes else 0.50
+
+    kelly_frac = _kelly_fraction(p, b, max_frac=ACCOUNT_RISK_PCT)
+
+    rps = max(close - stop_loss, close * 0.02)
+    risk_r = ACCOUNT_EQUITY * kelly_frac
+    sh_v = math.floor(risk_r / rps) if rps > 0 else 0
+
+    deploy = (1.00 if fused >= GRADE_APEX else 0.75 if fused >= GRADE_PRISTINE
+              else 0.50 if fused >= GRADE_GOOD else 0.25)
+
+    sh_f = min(math.floor(sh_v * deploy),
+               math.floor(ACCOUNT_EQUITY * 0.10 / close) if close > 0 else 0)
+    pos_v = sh_f * close
+    pos_lb = (f"{sh_f} sh × ₹{close:.2f} = ₹{pos_v:,.0f} | Risk ₹{sh_f*rps:,.0f} | Kelly {kelly_frac*100:.2f}%"
+              if sh_f > 0 else "— (below sizing min)")
 
     # Circuit breaker for small caps
     alloc_note = ""
     if close < MAX_PRICE:
         cb_active, cb_msg = check_smallcap_cb()
         if cb_active: alloc_note=f" ⚠️ CB: {cb_msg[:40]}"
+
+    # ── Sector momentum bonus/penalty ──────────────────────────────────
+    sector_mom = _live_sector_momentum(sector)
+    mom_bonus = sector_mom["bonus"]
+    fused = max(0, min(100, fused + mom_bonus))
+    mom_note = f" | Sector {sector_mom['momentum_tier']} ({sector_mom['rel_5d']:+.1f}% 5d)" if mom_bonus != 0 else ""
 
     # ── FOG sizing cap ─────────────────────────────────────────────────
     fog_note=""
@@ -3157,6 +3382,148 @@ def _alert_open_positions():
 # SECTION 16 — MAIN PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+
+def _data_quality_gate(bhavcopy: pd.DataFrame, data_source: str) -> dict:
+    """
+    Auto-adjust thresholds if data quality degrades.
+    Returns: {apex_min_score: int, apex_top_n: int, alert: str}
+    """
+    halal_uni = get_halal_universe()
+    halal_in_bhav = len(bhavcopy[bhavcopy["symbol"].isin(halal_uni)])
+
+    # Default thresholds
+    min_score = APEX_MIN_SCORE
+    top_n = APEX_TOP_N
+    alert = ""
+
+    # Degraded mode: yfinance fallback with shrunk universe
+    if data_source == "YFINANCE" and len(bhavcopy) <= 100:
+        min_score = 65
+        top_n = 3
+        alert = "🚨 DEGRADED: YFinance fallback, universe shrunk. Raising bar."
+        log.warning(alert)
+
+    # Moderate degradation: fewer halal symbols than expected
+    elif halal_in_bhav < 50:
+        min_score = min(65, APEX_MIN_SCORE + 5)
+        top_n = max(3, APEX_TOP_N - 1)
+        alert = f"⚠️ Only {halal_in_bhav} halal symbols in bhavcopy. Tightening filters."
+        log.warning(alert)
+
+    return {"apex_min_score": min_score, "apex_top_n": top_n, "alert": alert}
+
+
+
+def _data_quality_gate(bhavcopy: pd.DataFrame, data_source: str) -> dict:
+    """
+    Auto-adjust thresholds if data quality degrades.
+    Returns: {apex_min_score: int, apex_top_n: int, alert: str}
+    """
+    halal_uni = get_halal_universe()
+    halal_in_bhav = len(bhavcopy[bhavcopy["symbol"].isin(halal_uni)])
+
+    min_score = APEX_MIN_SCORE
+    top_n = APEX_TOP_N
+    alert = ""
+
+    if data_source == "YFINANCE" and len(bhavcopy) <= 100:
+        min_score = 65
+        top_n = 3
+        alert = "🚨 DEGRADED: YFinance fallback, universe shrunk. Raising bar."
+        log.warning(alert)
+    elif halal_in_bhav < 50:
+        min_score = min(65, APEX_MIN_SCORE + 5)
+        top_n = max(3, APEX_TOP_N - 1)
+        alert = f"⚠️ Only {halal_in_bhav} halal symbols in bhavcopy. Tightening filters."
+        log.warning(alert)
+
+    return {"apex_min_score": min_score, "apex_top_n": top_n, "alert": alert}
+
+
+
+def _intraday_watchdog(symbol: str, trailing_stop: float, db_path: str = DB_PATH) -> dict:
+    """
+    Check live LTP against trailing_stop in DB.
+    Returns: {action: str, ltp: float, distance_pct: float}
+    action: 'HOLD' | 'STOP_HIT' | 'TRAIL_UPDATE' | 'ERROR'
+    """
+    try:
+        # Get live price from NSE
+        sess = _get_nse_session()
+        data = _nse_json(sess, "https://www.nseindia.com/api/quote-equity", 
+                        params={"symbol": symbol}, timeout=10)
+        ltp = float(data.get("priceInfo", {}).get("lastPrice", 0))
+
+        if ltp <= 0:
+            return {"action": "ERROR", "ltp": 0, "distance_pct": 0}
+
+        # Check stop hit
+        if ltp <= trailing_stop:
+            return {"action": "STOP_HIT", "ltp": ltp, "distance_pct": -999}
+
+        # Check if we should update trailing stop (peak * 0.95)
+        con = sqlite3.connect(db_path)
+        row = con.execute(
+            "SELECT peak_price, entry_price FROM positions WHERE symbol=? AND status='open' ORDER BY entry_date DESC LIMIT 1",
+            (symbol.upper(),)
+        ).fetchone()
+        con.close()
+
+        if row:
+            peak = float(row[0])
+            entry = float(row[1])
+            new_trail = max(trailing_stop, ltp * 0.95, entry * 1.02)  # Never trail below BE+2%
+
+            if new_trail > trailing_stop:
+                # Update DB
+                con = sqlite3.connect(db_path)
+                con.execute(
+                    "UPDATE positions SET trailing_stop=?, peak_price=?, updated_at=? WHERE symbol=? AND status='open'",
+                    (new_trail, ltp, datetime.today().isoformat(), symbol.upper())
+                )
+                con.commit(); con.close()
+                return {"action": "TRAIL_UPDATE", "ltp": ltp, "distance_pct": (ltp - new_trail) / ltp * 100}
+
+        distance = (ltp - trailing_stop) / trailing_stop * 100
+        return {"action": "HOLD", "ltp": ltp, "distance_pct": distance}
+
+    except Exception as e:
+        log.debug(f"Watchdog {symbol}: {e}")
+        return {"action": "ERROR", "ltp": 0, "distance_pct": 0}
+
+
+def _early_exit_alert(symbol: str, entry_price: float, current_ltp: float) -> dict:
+    """
+    Alert if top pick drops 3% intraday — early exit signal before EOD stop hits.
+    Returns: {alert: bool, drop_pct: float, severity: str, note: str}
+    """
+    if entry_price <= 0 or current_ltp <= 0:
+        return {"alert": False, "drop_pct": 0, "severity": "NONE", "note": ""}
+
+    drop_pct = (current_ltp - entry_price) / entry_price * 100
+
+    if drop_pct <= -5.0:
+        severity = "CRITICAL"
+        note = f"🚨 {symbol}: {drop_pct:.1f}% from entry — consider immediate exit"
+    elif drop_pct <= -3.0:
+        severity = "WARNING"
+        note = f"⚠️ {symbol}: {drop_pct:.1f}% from entry — tighten stop, watch closely"
+    elif drop_pct <= -1.5:
+        severity = "CAUTION"
+        note = f"📉 {symbol}: {drop_pct:.1f}% from entry — early weakness"
+    else:
+        severity = "NONE"
+        note = ""
+
+    return {
+        "alert": severity in ["CRITICAL", "WARNING"],
+        "drop_pct": round(drop_pct, 2),
+        "severity": severity,
+        "note": note
+    }
+
+
 def run():
     """
     Single-pass unified pipeline:
@@ -3275,6 +3642,14 @@ def run():
     except Exception as e:
         log.debug(f"DB quality log: {e}")
     # 7. Rank + sector cap + bucket
+    # Apply data quality gate adjustments
+    dq_gate = _data_quality_gate(bhavcopy, data_source)
+    effective_min_score = dq_gate["apex_min_score"]
+    effective_top_n = dq_gate["apex_top_n"]
+
+    # Filter by effective minimum
+    results = [r for r in results if r["fused"] >= effective_min_score]
+
     results.sort(key=lambda x: (x["fused"]*1000 + x["whale_score"]*10 + x["div_score"]), reverse=True)
     sec_counts: dict = {}; globally_capped=[]
     for r in results:
@@ -3359,8 +3734,8 @@ def run():
     small_picks = [r for r in globally_capped if SMALL_CAP_MIN <= r["mcap_proxy"] < MID_CAP_MIN]
     micro_picks = [r for r in globally_capped if r["mcap_proxy"] < SMALL_CAP_MIN]
 
-    # Dynamic allocation: up to APEX_TOP_N total, distributed by availability
-    total_slots = APEX_TOP_N  # 5
+    # Dynamic allocation: up to effective_top_n total, distributed by availability
+    total_slots = effective_top_n
     allocation = []
 
     # Priority: Large > Mid > Small > Micro (skip micro in chop/fog)
