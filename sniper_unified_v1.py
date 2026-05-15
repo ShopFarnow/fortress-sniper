@@ -1913,6 +1913,7 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     Returns dict or None (hard-veto).
     """
     if len(hist) < MIN_HIST_BARS:
+        log.info(f"FORTRESS VETO {symbol}: insufficient bars ({len(hist)} < {MIN_HIST_BARS})")
         return None
 
     close  = float(today_row["close"])
@@ -1940,13 +1941,16 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     alt_pct  = (close-ma_ref)/ma_ref*100 if ma_ref>0 else 0.0
 
     if alt_pct < -SNIPER_CFG["ma200_tolerance"]*100 and ma_label=="MA200":
+        log.info(f"FORTRESS VETO {symbol}: alt_pct below MA200 tolerance")
         return None
     if alt_pct > SNIPER_CFG["alt_stop_pct"]:
+        log.info(f"FORTRESS VETO {symbol}: alt_pct above stop threshold")
         return None
 
     sector      = get_sector(symbol)
     sector_mult = SECTOR_TRUTH.get(sector, 1.0)
     if sector in SECTOR_BLOCKED:
+        log.info(f"FORTRESS VETO {symbol}: sector is BLOCKED")
         return None
 
     # Sector RS override
@@ -1965,6 +1969,7 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
 
     turnover_lakhs = float(today_row.get("turnover_lakhs", 0))
     if turnover_lakhs < SNIPER_CFG["turnover_lakhs"]:
+        log.info(f"FORTRESS VETO {symbol}: turnover below minimum")
         return None
 
     # Entry zone
@@ -2056,6 +2061,7 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     pts += forward_bonus
     pts  = min(int(pts), FORT_SCORE_MAX["fortress"]+30)
 
+    log.info(f"FORTRESS PASS {symbol}: pts={pts:.0f} | layers={layer1},{layer2},{layer3} | zone={entry_zone}")
     return {
         "fortress_pts": pts,
         "layer1": layer1, "layer2": layer2, "layer3": layer3,
@@ -2854,7 +2860,7 @@ def assemble_pick(
         return None
 
     # DEBUG: Log symbols that pass fortress (to see pipeline flow)
-    log.debug(f"  PIPELINE {symbol}: fortress_pts={fort['fortress_pts']:.0f} | "
+    log.info(f"  PIPELINE {symbol}: fortress_pts={fort['fortress_pts']:.0f} | "
              f"macro={macro_state} | vix={vix:.1f} | sector={get_sector(symbol)}")
 
     close    = float(today_row["close"])
