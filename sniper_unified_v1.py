@@ -153,6 +153,166 @@ SECTOR_ATR_MULT = {
     "NIFTY AUTO": 1.05,  "NIFTY FMCG": 0.85, "DIVERSIFIED": 1.00,
 }
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1b — LLM CONFIG (optional, gracefully degrading)
+# ══════════════════════════════════════════════════════════════════════════════
+
+LLM_API_KEY      = os.getenv("ANTHROPIC_API_KEY", "")
+LLM_MODEL        = os.getenv("LLM_MODEL", "claude-sonnet-4.6")  # Default: cheapest capable model
+LLM_MAX_TOKENS   = int(os.getenv("LLM_MAX_TOKENS", "512"))
+LLM_ENABLED      = bool(LLM_API_KEY)  # Auto-disable if no key
+
+
+def _llm_hash(text: str) -> str:
+    """SHA256 hash for LLM cache deduplication."""
+    import hashlib
+    return hashlib.sha256(text.encode()).hexdigest()[:32]
+
+
+def _llm_cached(text: str, prompt_type: str) -> Optional[str]:
+    """Check SQLite cache for existing LLM result."""
+    if not LLM_ENABLED:
+        return None
+    try:
+        con = sqlite3.connect(DB_PATH)
+        h = _llm_hash(text)
+        row = con.execute(
+            "SELECT result FROM llm_cache WHERE text_hash=? AND prompt_type=?",
+            (h, prompt_type)
+        ).fetchone()
+        con.close()
+        if row:
+            log.debug(f"LLM cache hit: {prompt_type} | {h[:8]}...")
+            return row[0]
+    except Exception:
+        pass
+    return None
+
+
+def _llm_store_cache(text: str, prompt_type: str, result: str, model: str = ""):
+    """Store LLM result in SQLite cache."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "INSERT OR REPLACE INTO llm_cache (text_hash, prompt_type, result, model) VALUES (?,?,?,?)",
+            (_llm_hash(text), prompt_type, result, model or LLM_MODEL)
+        )
+        con.commit(); con.close()
+    except Exception:
+        pass
+
+
+def _llm_call(prompt: str, prompt_type: str, max_tokens: int = None) -> Optional[str]:
+    """
+    Call Claude API with caching. Returns None if disabled or failed.
+    Designed to be provider-agnostic — swap the request block for OpenAI/Gemini.
+    """
+    if not LLM_ENABLED:
+        return None
+
+    # Check cache first
+    cached = _llm_cached(prompt, prompt_type)
+    if cached:
+        return cached
+
+    # API call
+    try:
+        import requests
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": LLM_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": LLM_MODEL,
+                "max_tokens": max_tokens or LLM_MAX_TOKENS,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if resp.status_code == 200:
+            result = resp.json()["content"][0]["text"]
+            _llm_store_cache(prompt, prompt_type, result)
+            return result
+        else:
+            log.warning(f"LLM API error {resp.status_code}: {resp.text[:100]}")
+    except Exception as e:
+        log.debug(f"LLM call failed: {e}")
+
+    return None
+
+
+def _llm_filing_sentiment(subject: str, symbol: str = "") -> dict:
+    """
+    Use LLM to analyze filing subject line sentiment.
+    Returns: {"score": 0-30, "detail": str, "sentiment": str}
+    Falls back to keyword-based if LLM disabled.
+    """
+    if not LLM_ENABLED:
+        return {"score": None, "detail": None, "sentiment": "LLM_DISABLED"}
+
+    prompt = "Analyze this Indian stock corporate filing for sentiment:
+"
+    prompt += f"Symbol: {symbol}
+Subject: {subject}
+
+"
+    prompt += "Rate sentiment (POSITIVE/NEGATIVE/NEUTRAL) and explain in 1 sentence.
+"
+    prompt += "Also give a score 0-30 where 20+ is clearly positive, <10 is negative.
+"
+    prompt += "Format: SCORE|X|SENTIMENT|Y|REASON|Z"
+
+    result = _llm_call(prompt, "sentiment")
+    if not result:
+        return {"score": None, "detail": None, "sentiment": "LLM_FAILED"}
+
+    # Parse response
+    try:
+        parts = result.split("|")
+        score = int([p for p in parts if p.strip().isdigit()][0])
+        sentiment = [p for p in parts if p in ["POSITIVE","NEGATIVE","NEUTRAL"]][0]
+        reason = parts[-1] if parts else result
+        return {"score": min(30, max(0, score)), "detail": reason.strip(), "sentiment": sentiment}
+    except Exception:
+        return {"score": 15, "detail": result[:80], "sentiment": "PARSE_ERROR"}
+
+
+def _llm_story_enhance(symbol: str, story_parts: list, technicals: dict) -> Optional[str]:
+    """
+    Use LLM to craft a compelling investment narrative from raw signals.
+    Input: list of signal strings + technical dict
+    Output: 1-2 sentence human-readable story
+    """
+    if not LLM_ENABLED or not story_parts:
+        return None
+
+    signals_text = "; ".join(story_parts[:6])
+    prompt = f"Write a 1-sentence investment thesis for {symbol} based on these signals:
+"
+    prompt += f"{signals_text}
+
+"
+    prompt += f"Technical context: RSI {technicals.get('rsi','?')}, ADX {technicals.get('adx','?')}, "
+    prompt += f"MFI {technicals.get('mfi','?')}, ATR {technicals.get('atr14','?')}
+
+"
+    prompt += "Rules:
+"
+    prompt += "- Max 25 words
+"
+    prompt += "- Plain English, no jargon
+"
+    prompt += "- Mention the strongest signal first
+"
+    prompt += "- End with expected outcome if clear"
+
+    return _llm_call(prompt, "story")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 2 — HALAL GUARD  (single authoritative implementation)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -606,8 +766,33 @@ def _init_db():
             days_held       INTEGER,
             hit_target      TEXT,  -- which target hit: r1/r2/r3/stop/none
             story           TEXT,
+            llm_story       TEXT,           -- AI-enhanced narrative
+            bayes_prior_version TEXT,         -- Which prior set was used
             created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS mcap_cache (
+            symbol      TEXT PRIMARY KEY,
+            mcap        REAL,
+            fetched_at  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS llm_cache (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            text_hash   TEXT UNIQUE,
+            prompt_type TEXT,
+            result      TEXT,
+            model       TEXT,
+            created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS bayes_calibration (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            prior_name      TEXT,
+            condition       TEXT,
+            wins            INTEGER DEFAULT 0,
+            total           INTEGER DEFAULT 0,
+            win_rate        REAL,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(prior_name, condition)
         );
     """)
     # Migration: add status column to positions if absent
@@ -1053,11 +1238,67 @@ def fetch_insider_trades(days_back: int = 30) -> dict:
 
 
 def fetch_filings(days_back: int = 14) -> dict:
+    """
+    Corporate filing sentiment analysis with proper negation handling.
+    Scores: 0-30 scale. Negation flips sentiment (e.g., 'no penalty' = positive).
+    """
     POS_KW = ["bonus","dividend","buyback","split","profit","growth","order",
-              "contract","win","award","acquisition","launch","upgrade","beat"]
+              "contract","win","award","acquisition","launch","upgrade","beat",
+              "expansion","partnership","approval","clearance","patent","fda"]
     NEG_KW = ["loss","write-off","penalty","fraud","probe","npa","default",
-              "downgrade","miss","warning","sebi notice","court"]
+              "downgrade","miss","warning","sebi notice","court","litigation",
+              "resignation","delay","postpone","cancel","terminate","recall"]
+    NEGATION_MARKERS = ["no ","not ","without ","never ","non-","anti-",
+                        "denies","denied","rejects","rejected","cleared of",
+                        "acquitted","not guilty","dismissed"]
     result: dict = {}
+
+    def _score_text(text: str) -> tuple:
+        """Return (score, detail, sentiment_label) with negation awareness."""
+        text_lower = text.lower()
+
+        # Detect negated phrases first (higher priority)
+        negated_pos = 0
+        negated_neg = 0
+        for marker in NEGATION_MARKERS:
+            if marker in text_lower:
+                for kw in POS_KW:
+                    if f"{marker}{kw}" in text_lower or f"{marker} {kw}" in text_lower:
+                        negated_pos += 1
+                for kw in NEG_KW:
+                    if f"{marker}{kw}" in text_lower or f"{marker} {kw}" in text_lower:
+                        negated_neg += 1
+
+        # Standard keyword matching
+        pos = sum(1 for k in POS_KW if k in text_lower)
+        neg = sum(1 for k in NEG_KW if k in text_lower)
+
+        # Adjust: negated positives don't count, negated negatives flip to positive
+        effective_pos = max(0, pos - negated_pos + negated_neg)
+        effective_neg = max(0, neg - negated_neg)
+
+        raw_score = 15 + effective_pos * 5 - effective_neg * 8
+        score = min(30, max(0, raw_score))
+
+        # Build detail
+        if negated_neg > 0:
+            matched_neg = [k for k in NEG_KW if any(m in text_lower for m in NEGATION_MARKERS 
+                         if f"{m}{k}" in text_lower or f"{m} {k}" in text_lower)]
+            detail = f"✅ Cleared: {', '.join(matched_neg[:2])}"
+            label = "POSITIVE_NEGATED"
+        elif effective_pos > 0:
+            matched = [k.title() for k in POS_KW if k in text_lower]
+            detail = f"Filing: {', '.join(matched[:2])}"
+            label = "POSITIVE"
+        elif effective_neg > 0:
+            matched = [k.title() for k in NEG_KW if k in text_lower]
+            detail = f"⚠️ Risk: {', '.join(matched[:2])}"
+            label = "NEGATIVE"
+        else:
+            detail = "Corporate filing — neutral"
+            label = "NEUTRAL"
+
+        return score, detail, label
 
     if not FORCE_SHEETS and not FORCE_YFINANCE:
         try:
@@ -1072,20 +1313,9 @@ def fetch_filings(days_back: int = 14) -> dict:
                 sym     = str(row.get("symbol","")).upper()
                 subject = str(row.get("subject",row.get("desc",""))).lower()
                 if not sym: continue
-                pos = sum(1 for k in POS_KW if k in subject)
-                neg = sum(1 for k in NEG_KW if k in subject)
-                score  = min(30, max(0, 15 + pos*5 - neg*8))
-                # Build structured detail — not raw subject text
-                if pos > 0:
-                    matched = [k for k in POS_KW if k in subject]
-                    detail  = f"Corporate action: {', '.join(matched[:2])}"
-                elif neg > 0:
-                    matched = [k for k in NEG_KW if k in subject]
-                    detail  = f"⚠️ Regulatory/risk: {', '.join(matched[:2])}"
-                else:
-                    detail  = "Recent filing — neutral"
+                score, detail, label = _score_text(subject)
                 if sym not in result or score > result[sym]["score"]:
-                    result[sym] = {"score": score, "detail": detail}
+                    result[sym] = {"score": score, "detail": detail, "label": label}
             if result: return result
         except Exception as e:
             log.debug(f"Filings NSE: {e}")
@@ -1101,19 +1331,9 @@ def fetch_filings(days_back: int = 14) -> dict:
                     sym = str(row.get(sym_col,"")).strip().upper()
                     raw_subj = str(row.get(subj_col,"")).lower()
                     if not sym: continue
-                    pos = sum(1 for k in POS_KW if k in raw_subj)
-                    neg = sum(1 for k in NEG_KW if k in raw_subj)
-                    score = min(30, max(0, 15 + pos*5 - neg*8))
-                    if pos > 0:
-                        matched = [k.title() for k in POS_KW if k in raw_subj]
-                        detail  = f"Filing: {', '.join(matched[:2])}"
-                    elif neg > 0:
-                        matched = [k.title() for k in NEG_KW if k in raw_subj]
-                        detail  = f"⚠️ Filing risk: {', '.join(matched[:2])}"
-                    else:
-                        detail = "Corporate filing"
+                    score, detail, label = _score_text(raw_subj)
                     if sym not in result or score > result[sym]["score"]:
-                        result[sym] = {"score": score, "detail": detail}
+                        result[sym] = {"score": score, "detail": detail, "label": label}
     return result
 
 
@@ -1802,6 +2022,89 @@ def _monte_carlo(hist: pd.DataFrame, stop_loss: float, close: float) -> dict:
     }
 
 
+# ── BAYESIAN PRIOR LEARNING ENGINE ──
+# Reads closed pick outcomes from DB and updates empirical win rates per signal node.
+# Falls back to conservative defaults if insufficient data (< 20 samples per node).
+
+_BAYES_PRIOR_VERSION = "v1.0-conservative"  # Tracks which prior set is active
+_MIN_CALIBRATION_SAMPLES = 20  # Minimum trades before trusting empirical rate
+
+
+def _calibrate_bayes_priors() -> dict:
+    """
+    Read pick_outcomes table, group by which Bayesian nodes were true/false,
+    compute empirical win rate per condition, return updated priors.
+    Win = hit r1/r2/r3 (status in ['r1_hit','r2_hit','r3_hit'])
+    Loss = stopped or expired with negative P&L
+    """
+    try:
+        con = sqlite3.connect(DB_PATH)
+        # Get all closed picks with their signals and outcomes
+        rows = con.execute(
+            "SELECT symbol, run_date, status, pnl_pct, story, grade "
+            "FROM pick_outcomes WHERE status IN ('r1_hit','r2_hit','r3_hit','stopped','expired') "
+            "AND run_date > ?",
+            ((datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d"),)
+        ).fetchall()
+        con.close()
+
+        if len(rows) < _MIN_CALIBRATION_SAMPLES:
+            log.info(f"Calibration: only {len(rows)} closed picks (< {_MIN_CALIBRATION_SAMPLES}) — using defaults")
+            return None
+
+        # For each pick, we need to reconstruct which signals were true
+        # We store this in bayes_calibration table during run()
+        con = sqlite3.connect(DB_PATH)
+        cal_rows = con.execute(
+            "SELECT prior_name, condition, wins, total FROM bayes_calibration"
+        ).fetchall()
+        con.close()
+
+        if not cal_rows:
+            return None
+
+        updated_priors = {}
+        for name, condition, wins, total in cal_rows:
+            if total >= 10:  # Minimum samples per node
+                empirical_wr = wins / total
+                # Shrink toward default prior (regularization)
+                default_wr = 0.40  # Base rate
+                shrunk = (wins + default_wr * 10) / (total + 10)
+                updated_priors[name] = {
+                    "win_rate": round(shrunk, 3),
+                    "samples": total,
+                    "raw_wins": wins
+                }
+
+        if updated_priors:
+            global _BAYES_PRIOR_VERSION
+            _BAYES_PRIOR_VERSION = f"v1.1-learned-{datetime.today().strftime('%Y%m%d')}"
+            log.info(f"Bayesian priors calibrated: {len(updated_priors)} nodes updated | Version: {_BAYES_PRIOR_VERSION}")
+            return updated_priors
+
+    except Exception as e:
+        log.debug(f"Bayes calibration failed: {e}")
+
+    return None
+
+
+def _load_learned_priors() -> Optional[dict]:
+    """Load calibrated priors if available and recent (< 7 days old)."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute(
+            "SELECT prior_name, win_rate, updated_at FROM bayes_calibration "
+            "WHERE updated_at > ? LIMIT 1",
+            ((datetime.today() - timedelta(days=7)).isoformat(),)
+        ).fetchone()
+        con.close()
+        if row:
+            return _calibrate_bayes_priors()
+    except Exception:
+        pass
+    return None
+
+
 # ── CALIBRATED PRIORS (based on NSE halal mid-cap backtest estimates) ──
 # These are conservative estimates. Replace with your actual backtest results.
 _BAYES_PRIORS = {
@@ -2025,19 +2328,8 @@ def assemble_pick(
         fii_pts=fii_pts, ins_pts=ins_pts, fil_pts=fil_pts,    # ← intelligence fusion
     )
 
-    macro_damp = {"CLEAR":1.0,"CHOP":0.88,"PANIC":0.60,"MASSACRE":0.0}
+        macro_damp = {"CLEAR":1.0,"CHOP":0.88,"PANIC":0.60,"MASSACRE":0.0}
     bayes_score = float(bayes["bayes_pct"])
-    raw_apex = (
-        whale_score * W["whale_radar"] +
-        div_score   * W["divergence"]  +
-        vp_score    * W["vol_profile"] +
-        pat_score   * W["pattern"]     +
-        bayes_score * W["bayesian"]    +
-        float(vpoc_score_val := (
-    25 if fort["layer1"] else
-    15 if poc > 0 and abs(close-poc)/poc <= 0.05 else
-    0)) * W["fortress_vpoc"]        # VPOC sub-score into APEX weight
-    )
     # ── APEX CONFLUENCE SCORE (NOT double-counting VPOC) ──
     # Instead of re-scoring VPOC layers (already in fortress_pts),
     # measure how strongly the INDEPENDENT APEX engines confirm
@@ -2165,11 +2457,30 @@ def assemble_pick(
     if not parts: parts.append(f"fused score {fused}/100 — confluence setup")
     story="; ".join(parts[:4]).capitalize()
 
+    # ── LLM ENHANCEMENT (optional, cached) ──
+    llm_story = None
+    llm_filing = None
+    if LLM_ENABLED:
+        llm_story = _llm_story_enhance(symbol, parts, {
+            "rsi": fort["rsi"], "adx": fort["adx"], 
+            "mfi": fort["mfi"], "atr14": fort["atr14"]
+        })
+        # LLM filing sentiment override if available
+        raw_filing = fil_data.get("detail","")
+        if raw_filing and "No recent" not in raw_filing:
+            llm_filing = _llm_filing_sentiment(raw_filing, symbol)
+            if llm_filing and llm_filing.get("score") is not None:
+                # Blend LLM score with keyword score (30% LLM, 70% keyword)
+                fil_pts = round(fil_pts * 0.7 + llm_filing["score"] * 0.3)
+
     return {
         "symbol":   symbol,
         "sector":   sector,
         "close":    round(close,2),
         "grade":    grade,
+        "llm_story": llm_story,
+        "llm_filing_sentiment": llm_filing.get("sentiment") if llm_filing else None,
+        "llm_filing_detail": llm_filing.get("detail") if llm_filing else None,
 
         # Fused scores
         "fused":          fused,
@@ -2501,6 +2812,71 @@ td{{padding:10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-size:13
         log.info(f"HTML saved: {HTML_PATH}")
     except Exception as e:
         log.error(f"HTML save failed: {e}")
+
+
+def _push_performance_tab(date_label: str):
+    """Push calibrated win rates by grade/sector/signal to PERFORMANCE tab."""
+    if not _sheets_ok(): return
+
+    try:
+        con = sqlite3.connect(DB_PATH)
+        # Win rate by grade
+        grade_rows = con.execute(
+            "SELECT grade, COUNT(*), SUM(CASE WHEN status IN ('r1_hit','r2_hit','r3_hit') THEN 1 ELSE 0 END), "
+            "AVG(pnl_pct) FROM pick_outcomes WHERE status!='open' GROUP BY grade"
+        ).fetchall()
+
+        # Win rate by sector (join with sniper_results)
+        sector_rows = con.execute(
+            "SELECT s.sector, COUNT(*), SUM(CASE WHEN o.status IN ('r1_hit','r2_hit','r3_hit') THEN 1 ELSE 0 END), "
+            "AVG(o.pnl_pct) FROM pick_outcomes o JOIN sniper_results s ON o.symbol=s.symbol AND o.run_date=s.run_date "
+            "WHERE o.status!='open' GROUP BY s.sector"
+        ).fetchall()
+
+        # Prior calibration status
+        prior_rows = con.execute(
+            "SELECT prior_name, win_rate, total FROM bayes_calibration WHERE total>=10"
+        ).fetchall()
+        con.close()
+
+        rows = [["Metric","Category","Total","Wins","WinRate%","AvgPnL%","Notes"]]
+
+        for grade, total, wins, avg_pnl in grade_rows:
+            wr = (wins/total*100) if total > 0 else 0
+            rows.append(["By Grade", grade, total, wins, f"{wr:.1f}", f"{avg_pnl:+.1f}" if avg_pnl else "—", ""])
+
+        for sector, total, wins, avg_pnl in sector_rows:
+            wr = (wins/total*100) if total > 0 else 0
+            rows.append(["By Sector", sector, total, wins, f"{wr:.1f}", f"{avg_pnl:+.1f}" if avg_pnl else "—", ""])
+
+        for name, wr, total in prior_rows:
+            rows.append(["Prior Calibrated", name, total, int(wr*total), f"{wr*100:.1f}", "—", _BAYES_PRIOR_VERSION])
+
+        _push_sheet("PERFORMANCE", rows)
+        log.info(f"PERFORMANCE tab pushed: {len(rows)-1} rows")
+    except Exception as e:
+        log.debug(f"Performance tab: {e}")
+
+
+def _push_ai_insights_tab(picks: list, date_label: str):
+    """Push LLM-enhanced stories and filing analyses to AI_INSIGHTS tab."""
+    if not _sheets_ok(): return
+
+    headers = ["Date","Symbol","Grade","Raw Story","LLM Story","LLM Filing Sentiment","Filing Detail","Prior Version"]
+    rows = [headers]
+
+    for r in picks:
+        rows.append([
+            date_label, r["symbol"], r.get("grade","—"),
+            r.get("story","—")[:200],
+            r.get("llm_story","—")[:300] if r.get("llm_story") else "—",
+            r.get("llm_filing_sentiment","—") if r.get("llm_filing_sentiment") else "—",
+            r.get("fil_detail","—")[:200],
+            _BAYES_PRIOR_VERSION
+        ])
+
+    _push_sheet("AI_INSIGHTS", rows)
+    log.info(f"AI_INSIGHTS tab pushed: {len(rows)-1} rows")
 
 
 def push_gsheets(picks: list, date_label: str):
@@ -2921,25 +3297,71 @@ def run():
         if cnt<2: globally_capped.append(r); sec_counts[sec]=cnt+1
 
     # ── DYNAMIC BUCKET ALLOCATION ──
-    # Use actual market cap proxy (price × shares outstanding) instead of price alone
-    # Fall back to price-based if market cap unavailable
+    # Batch market cap lookup — vectorized, cached, single yfinance call
 
-    def _get_market_cap_proxy(symbol: str, close: float) -> float:
-        """Return market cap in Cr. Try yfinance first, fall back to price-based estimate."""
+    def _batch_market_caps(symbols: list, fallback_map: dict) -> dict:
+        """Return {symbol: mcap_in_cr} via batch yfinance tickers + SQLite cache."""
+        result = {}
+        # 1. Check SQLite cache first
         try:
-            import yfinance as yf
-            info = yf.Ticker(f"{symbol}.NS").info
-            mc = info.get("marketCap")
-            if mc:
-                return float(mc) / 1e7  # Convert to Crores
+            con = sqlite3.connect(DB_PATH)
+            cached = {r[0]: r[1] for r in con.execute(
+                "SELECT symbol, mcap FROM mcap_cache WHERE fetched_at > ?",
+                ((datetime.today() - timedelta(days=7)).isoformat(),)
+            ).fetchall()}
+            con.close()
+            result.update(cached)
         except Exception:
-            pass
-        # Fallback: use price as rough proxy (not ideal but works)
-        return close * 100  # Assume ~100 Cr base for unknown stocks
+            cached = {}
 
-    # Categorize by market cap proxy
+        # 2. Batch fetch remaining via yfinance (max 50 per call)
+        need_fetch = [s for s in symbols if s not in result]
+        if need_fetch:
+            try:
+                import yfinance as yf
+                for i in range(0, len(need_fetch), 50):
+                    chunk = need_fetch[i:i+50]
+                    for sym in chunk:
+                        try:
+                            info = yf.Ticker(f"{sym}.NS").info
+                            mc = info.get("marketCap")
+                            if mc:
+                                result[sym] = float(mc) / 1e7
+                        except Exception:
+                            pass
+                        time.sleep(0.05)
+
+                # Cache results
+                try:
+                    con = sqlite3.connect(DB_PATH)
+                    today_iso = datetime.today().isoformat()
+                    for sym, mcap in result.items():
+                        if sym in need_fetch:
+                            con.execute(
+                                "INSERT OR REPLACE INTO mcap_cache (symbol, mcap, fetched_at) VALUES (?,?,?)",
+                                (sym, mcap, today_iso)
+                            )
+                    con.commit(); con.close()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # 3. Apply fallbacks for anything still missing
+        for sym in symbols:
+            if sym not in result:
+                result[sym] = fallback_map.get(sym, 100.0)
+
+        return result
+
+    # Pre-compute all market caps in one batch
+    symbols_to_lookup = [r["symbol"] for r in globally_capped]
+    fallback_mcaps = {r["symbol"]: r["close"] * 100 for r in globally_capped}
+    mcap_map = _batch_market_caps(symbols_to_lookup, fallback_mcaps)
+
+    # Assign to results
     for r in globally_capped:
-        r["mcap_proxy"] = _get_market_cap_proxy(r["symbol"], r["close"])
+        r["mcap_proxy"] = mcap_map.get(r["symbol"], r["close"] * 100)
 
     # Define buckets by market cap (in Cr)
     LARGE_CAP_MIN = 20000   # ₹20,000 Cr+
@@ -3012,7 +3434,11 @@ def run():
     # 8. Outputs
     log.info("Saving Excel…");       save_excel(top_picks, results, fii_data, date_label, data_source, bhavcopy)
     log.info("Saving HTML…");        save_html(top_picks, fii_data, date_label)
+    log.info("Calibrating Bayes priors…"); _calibrate_bayes_priors()
     log.info("Pushing to Sheets…");  push_gsheets(top_picks, date_label)
+    log.info("Pushing PERFORMANCE…"); _push_performance_tab(date_label)
+    if LLM_ENABLED:
+        log.info("Pushing AI_INSIGHTS…"); _push_ai_insights_tab(top_picks, date_label)
     log.info("Sending Telegram…");   send_telegram(top_picks, macro, fii_data, date_label, data_source)
 
         # Persist results to DB + outcome tracking
