@@ -839,8 +839,16 @@ def load_bhavcopy() -> Tuple[pd.DataFrame, str]:
         return df, "SHEETS"
 
     log.warning("⚠️ DEGRADED MODE — yfinance fallback")
-    return _bhavcopy_from_yfinance(), "YFINANCE"
-
+    df = _bhavcopy_from_yfinance()
+    
+    # ── NEW: UNIVERSE SHRINK CHECK ──
+    if not df.empty and len(df) <= 100:
+        log.warning(f"🚨 UNIVERSE SHRUNK: yfinance fallback = {len(df)} hardcoded stocks only")
+        halal_uni = get_halal_universe()
+        missing = len(halal_uni - set(df["symbol"]))
+        log.warning(f"   Missing {missing} halal symbols from screening")
+    
+    return df, "YFINANCE"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 7 — HISTORICAL OHLCV
