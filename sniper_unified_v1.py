@@ -3055,12 +3055,26 @@ def _push_performance_tab(date_label: str):
             "AVG(pnl_pct) FROM pick_outcomes WHERE status!='open' GROUP BY grade"
         ).fetchall()
 
-        # Win rate by sector (join with sniper_results)
+        # Win rate by sector (from pick_outcomes symbol lookup)
         sector_rows = con.execute(
-            "SELECT s.sector, COUNT(*), SUM(CASE WHEN o.status IN ('r1_hit','r2_hit','r3_hit') THEN 1 ELSE 0 END), "
-            "AVG(o.pnl_pct) FROM pick_outcomes o JOIN sniper_results s ON o.symbol=s.symbol AND o.run_date=s.run_date "
-            "WHERE o.status!='open' GROUP BY s.sector"
+            "SELECT o.symbol, COUNT(*), SUM(CASE WHEN o.status IN ('r1_hit','r2_hit','r3_hit') THEN 1 ELSE 0 END), "
+            "AVG(o.pnl_pct) FROM pick_outcomes o WHERE o.status!='open' GROUP BY o.symbol"
         ).fetchall()
+        # Map symbols to sectors using get_sector()
+        sector_map = {}
+        for sym, total, wins, avg_pnl in sector_rows:
+            sec = get_sector(str(sym))
+            if sec not in sector_map:
+                sector_map[sec] = {"total": 0, "wins": 0, "pnl_sum": 0.0}
+            sector_map[sec]["total"] += total
+            sector_map[sec]["wins"] += wins
+            sector_map[sec]["pnl_sum"] += (avg_pnl or 0) * total
+
+        # Convert back to list format
+        sector_rows = []
+        for sec, data in sector_map.items():
+            avg_pnl = data["pnl_sum"] / data["total"] if data["total"] > 0 else 0
+            sector_rows.append((sec, data["total"], data["wins"], avg_pnl))
 
         # Prior calibration status
         prior_rows = con.execute(
