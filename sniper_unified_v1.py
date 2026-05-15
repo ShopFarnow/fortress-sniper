@@ -588,6 +588,27 @@ def _init_db():
             alert               TEXT,
             created_at          TEXT DEFAULT CURRENT_TIMESTAMP
         );
+                CREATE TABLE IF NOT EXISTS pick_outcomes (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date        TEXT,
+            symbol          TEXT,
+            entry_price     REAL,
+            stop_loss       REAL,
+            r1              REAL,
+            r2              REAL,
+            r3              REAL,
+            grade           TEXT,
+            fused_score     REAL,
+            status          TEXT DEFAULT 'open',  -- open/closed/stopped/r1_hit/r2_hit/r3_hit/expired
+            exit_price      REAL,
+            exit_date       TEXT,
+            pnl_pct         REAL,
+            days_held       INTEGER,
+            hit_target      TEXT,  -- which target hit: r1/r2/r3/stop/none
+            story           TEXT,
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     # Migration: add status column to positions if absent
     try:
