@@ -2853,6 +2853,10 @@ def assemble_pick(
     if fort is None:
         return None
 
+    # DEBUG: Log symbols that pass fortress (to see pipeline flow)
+    log.debug(f"  PIPELINE {symbol}: fortress_pts={fort['fortress_pts']:.0f} | "
+             f"macro={macro_state} | vix={vix:.1f} | sector={get_sector(symbol)}")
+
     close    = float(today_row["close"])
     dq       = str(today_row.get("data_quality",""))
     if dq in ("SNAPSHOT_FALLBACK","STALE") and fort["fortress_pts"] > 55:
@@ -2989,26 +2993,20 @@ def assemble_pick(
         apex_composite = min(100, apex_composite + 5)  # High conviction + high survival
     apex_composite=max(0,min(100,apex_composite))
 
+    # ── CHOP REGIME ADJUSTMENT: +8 pts to compensate for macro dampener ──
+    if macro_state == 'CHOP':
+        apex_composite = min(100, apex_composite + 8)
+
+    # ── DEBUG: Log rejections for tuning ──
     if apex_composite < APEX_MIN_SCORE:
+        log.info(f"  DEBUG {symbol}: REJECTED | apex={apex_composite} | bayes={bayes['bayes_pct']}% | "
+                 f"whale={whale_score:.0f} | div={div_score:.0f} | vp={vp_score:.0f} | pat={pat_score:.0f} | "
+                 f"mc={mc_survival} | confluence={confluence_bonus} | damp={macro_damp.get(macro_state,0.88)}")
         return None
 
-    # ── CVD / VSA adjustments to fortress total ───────────────────────
-    adj       = cvd["cvd_bonus"]+vsa.get("vsa_bonus",0)
-    fort_total= min(FORT_TOTAL_MAX, max(0, fort_total+adj))
+    # ── META-LABELING: Store signal vector + optional veto ──
 
-    # ── FUSED COMPOSITE ───────────────────────────────────────────────
-    fort_norm  = fort_total / FORT_TOTAL_MAX * 100   # normalise to 0-100
-    fused      = round(fort_norm*0.45 + apex_composite*0.55)
-    fused      = max(0, min(100, fused))
-
-    # ── Grade ─────────────────────────────────────────────────────────
-    if fused>=GRADE_APEX:      grade="⚔️ APEX"
-    elif fused>=GRADE_PRISTINE: grade="💎 PRISTINE"
-    elif fused>=GRADE_GOOD:    grade="🟢 GOOD"
-    elif fused>=GRADE_PROBE:   grade="🔵 PROBE"
-    else:                       return None
-
-    # ── Exit plan (APEX ATR-based) ─────────────────────────────────────
+    # (veto moved to debug block above)
     atr_m  = SECTOR_ATR_MULT.get(sector,1.0)
     risk   = atr14*2.0*atr_m if atr14>0 else close*0.03
     r1     = round(close+risk*2.5,2)
