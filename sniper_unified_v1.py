@@ -180,6 +180,7 @@ SECTOR_ATR_MULT = {
 _YF_DOWNLOAD_TIMEOUT = 15          # seconds for yf.download
 _YF_INFO_TIMEOUT     = 10          # seconds for yf.Ticker().info
 _YF_FAIL_COUNT       = 0
+_YF_FAIL_LOCK        = threading.Lock()   # Bug fix: guards concurrent increments from worker threads
 _YF_FAIL_THRESHOLD   = 3           # skip all yf calls after 3 consecutive failures
 _NSE_HISTORY_OK      = None        # None=unknown, True=working, False=broken (speeds up loop when NSE is down)
 
@@ -522,6 +523,9 @@ _HALAL_FALLBACK = {
 
 _HALAL_UNIVERSE_CACHE: Optional[set]  = None
 _HALAL_UNIVERSE_LOCK  = threading.Lock()
+# Serialise all SQLite write transactions (WAL mode reduces contention but does
+# not eliminate "database is locked" errors when multiple threads write at the same time)
+_SQLITE_WRITE_LOCK    = threading.Lock()
 _HALAL_CUSTOM_LIST:    set             = set()
 
 SYMBOL_SECTOR: Dict[str, str] = {
@@ -564,7 +568,9 @@ def _live_sector_momentum(sector: str, days: int = 20) -> dict:
         return NEUTRAL
 
     global _YF_FAIL_COUNT
-    if _YF_FAIL_COUNT >= _YF_FAIL_THRESHOLD:
+    with _YF_FAIL_LOCK:
+        fail_count = _YF_FAIL_COUNT
+    if fail_count >= _YF_FAIL_THRESHOLD:
         return NEUTRAL
 
     cache_key = f"{sector}_{days}"
@@ -630,8 +636,10 @@ def _live_sector_momentum(sector: str, days: int = 20) -> dict:
         return result
 
     except Exception as e:
-        _YF_FAIL_COUNT += 1
-        log.warning(f"YF fail #{_YF_FAIL_COUNT}: sector momentum {sector} — {e}")
+        with _YF_FAIL_LOCK:
+            _YF_FAIL_COUNT += 1
+            current = _YF_FAIL_COUNT
+        log.warning(f"YF fail #{current}: sector momentum {sector} — {e}")
         return NEUTRAL
 
 def _lookup_sector_nse(sym: str) -> str:
@@ -1366,14 +1374,19 @@ def _validate_no_lookahead(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "date" not in df.columns:
         return df
     df    = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
-    # Make today tz-aware if the dataframe's date column is tz-aware (yfinance returns UTC)
-    today = pd.Timestamp(datetime.today().date())
-    if not df.empty and hasattr(df["date"].dtype, "tz") and df["date"].dt.tz is not None:
-        today = today.tz_localize(df["date"].dt.tz)
+    # Bug fix: build today with the same tz-awareness as the column.
+    # pd.Timestamp(date()) is tz-naive; comparing it to tz-aware yfinance UTC
+    # dates silently raises TypeError in newer pandas, or returns wrong results.
+    today_date = datetime.today().date()
+    col_tz = df["date"].dt.tz if (not df.empty and hasattr(df["date"].dt, "tz")) else None
+    if col_tz is not None:
+        today = pd.Timestamp(today_date).tz_localize(col_tz)
+    else:
+        today = pd.Timestamp(today_date)
     # Layer 1: remove future rows
     df = df[df["date"] <= today].copy()
     # Layer 2: remove today's unclosed bar (score on confirmed, closed candles only)
-    if not df.empty and df["date"].iloc[-1].date() == datetime.today().date():
+    if not df.empty and df["date"].iloc[-1].date() == today_date:
         df = df.iloc[:-1].copy()
     return df
 
@@ -2777,7 +2790,7 @@ def _bayesian_apex(macro_state: str, breadth_ok: bool, layer1: bool, layer2: boo
         "whale_detected": whale_detected,
         "bullish_hidden_div": div_type == "BULLISH_HIDDEN",
         "vp_score_high": vp_score >= 40,
-        "mc_survival_ok": mc_survival is not None and mc_survival >= 65 and mc_survival <= 90,
+        "mc_survival_ok": mc_survival is not None and mc_survival >= 65,
         "fii_buying": fii_pts >= 22,
         "insider_buying": ins_pts >= 15,
         "positive_filing": fil_pts >= 20,
@@ -2786,19 +2799,29 @@ def _bayesian_apex(macro_state: str, breadth_ok: bool, layer1: bool, layer2: boo
     posterior = prior
     total_weight = 0
 
+    # Log-space sequential Bayesian update (avoids underflow from lk**weight → 0.0
+    # across 15 iterations; equivalent to standard odds-form Bayes but numerically stable).
+    log_odds = math.log(prior / max(1 - prior, 1e-9))  # start in log-odds space
+
     for name, pt, pf, weight in _BAYES_PRIORS:
         cond = conditions.get(name, False)
         lk = pt if cond else pf
-
-        # Weighted Bayesian update
-        weighted_lk = lk ** weight
-        weighted_prior = posterior ** weight
-        posterior = (weighted_lk * weighted_prior) / max(1e-9, 
-            weighted_lk * weighted_prior + (1 - weighted_lk) * (1 - weighted_prior))
+        # Clamp likelihood to avoid log(0)
+        lk = max(1e-6, min(1 - 1e-6, lk))
+        # Weighted log-likelihood ratio update
+        log_odds += weight * math.log(lk / (1 - lk))
         total_weight += weight
 
-    # Normalize by total weight
-    posterior = posterior ** (1 / max(total_weight, 1))
+    # Convert back from log-odds to probability
+    posterior = 1 / (1 + math.exp(-log_odds))
+    posterior = max(1e-6, min(1 - 1e-6, posterior))
+
+    # Bug fix: removed posterior ** (1 / total_weight) normalization.
+    # That exponentiation is mathematically wrong — raising a probability
+    # in [0,1] to a small power (1/11.7 ≈ 0.085) drives ANY value toward 1.0
+    # (e.g. 0.01^0.085 ≈ 0.89), making the Bayesian network a no-op.
+    # Sequential Bayes updates already produce a correctly normalized posterior;
+    # no post-loop rescaling is needed or correct.
 
     # Strong shrinkage to base rate — prevents overconfidence
     posterior = alpha * prior + (1 - alpha) * posterior
@@ -3227,14 +3250,7 @@ def assemble_pick(
                 # Blend LLM score with keyword score (30% LLM, 70% keyword)
                 fil_pts = round(fil_pts * 0.7 + llm_filing["score"] * 0.3)
 
-    # ── META-LABELING: Store signal vector + optional veto ──────────────
-    # BUG FIX: meta_features previously captured `fused` BEFORE the sector
-    # momentum adjustment (lines below update fused), so the stored training
-    # label was subtly stale.  We now build the feature dict AFTER all score
-    # adjustments are complete so that what gets stored matches what the model
-    # was actually acting on.  The _store_meta_features call is moved below
-    # the sector-momentum block; a forward-reference sentinel is set here.
-    _meta_features_pending = True   # will be resolved after momentum block
+    # (meta_features already stored above, after sector momentum is applied)
 
     return {
         "symbol":   symbol,
@@ -3594,7 +3610,8 @@ td{{padding:10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-size:13
 
 
 def _push_performance_tab(date_label: str):
-    """Push calibrated win rates by grade/sector/signal to PERFORMANCE tab."""
+    """Push calibrated win rates by grade/sector/signal to PERFORMANCE tab.
+    Appends a dated snapshot each run so history accumulates across sessions."""
     log.info("PERFORMANCE: Starting push…")
     if not _sheets_ok():
         log.warning("PERFORMANCE: Sheets not configured — skipping")
@@ -3602,54 +3619,82 @@ def _push_performance_tab(date_label: str):
     log.info("PERFORMANCE: Sheets OK, connecting to DB…")
 
     try:
-        con = sqlite3.connect(DB_PATH)
-        # Win rate by grade
+        con = sqlite3.connect(DB_PATH, timeout=10)
+
+        # Win rate by grade — COALESCE guards against NULL from SUM on empty set
         grade_rows = con.execute(
-            "SELECT grade, COUNT(*), SUM(CASE WHEN status IN ('r1_hit','r2_hit','r3_hit') THEN 1 ELSE 0 END), "
+            "SELECT grade, COUNT(*) as total, "
+            "COALESCE(SUM(CASE WHEN status IN ('r1_hit','r2_hit','r3_hit') THEN 1 ELSE 0 END), 0) as wins, "
             "AVG(pnl_pct) FROM pick_outcomes WHERE status!='open' GROUP BY grade"
         ).fetchall()
 
-        # Win rate by sector (from pick_outcomes symbol lookup)
+        # Win rate by sector — join sniper_results which stores the sector column
         sector_rows = con.execute(
-            "SELECT o.symbol, COUNT(*), SUM(CASE WHEN o.status IN ('r1_hit','r2_hit','r3_hit') THEN 1 ELSE 0 END), "
-            "AVG(o.pnl_pct) FROM pick_outcomes o WHERE o.status!='open' GROUP BY o.symbol"
+            "SELECT s.sector, COUNT(*) as total, "
+            "COALESCE(SUM(CASE WHEN o.status IN ('r1_hit','r2_hit','r3_hit') THEN 1 ELSE 0 END), 0) as wins, "
+            "AVG(o.pnl_pct) as avg_pnl "
+            "FROM pick_outcomes o "
+            "JOIN sniper_results s ON o.symbol=s.symbol AND o.run_date=s.run_date "
+            "WHERE o.status!='open' GROUP BY s.sector"
         ).fetchall()
-        # Map symbols to sectors using get_sector()
-        sector_map = {}
-        for sym, total, wins, avg_pnl in sector_rows:
-            sec = get_sector(str(sym))
-            if sec not in sector_map:
-                sector_map[sec] = {"total": 0, "wins": 0, "pnl_sum": 0.0}
-            sector_map[sec]["total"] += total
-            sector_map[sec]["wins"] += wins
-            sector_map[sec]["pnl_sum"] += (avg_pnl or 0) * total
-
-        # Convert back to list format
-        sector_rows = []
-        for sec, data in sector_map.items():
-            avg_pnl = data["pnl_sum"] / data["total"] if data["total"] > 0 else 0
-            sector_rows.append((sec, data["total"], data["wins"], avg_pnl))
 
         # Prior calibration status
         prior_rows = con.execute(
             "SELECT prior_name, win_rate, total FROM bayes_calibration WHERE total>=10"
         ).fetchall()
+
+        # Overall summary stats
+        summary_row = con.execute(
+            "SELECT COUNT(*), "
+            "COALESCE(SUM(CASE WHEN status IN ('r1_hit','r2_hit','r3_hit') THEN 1 ELSE 0 END), 0), "
+            "AVG(pnl_pct) FROM pick_outcomes WHERE status!='open'"
+        ).fetchone()
         con.close()
 
-        rows = [["Metric","Category","Total","Wins","WinRate%","AvgPnL%","Notes"]]
+        rows = [["Date", "Metric", "Category", "Total", "Wins", "WinRate%", "AvgPnL%", "Notes"]]
+
+        # Overall row
+        if summary_row and summary_row[0]:
+            total, wins, avg_pnl = summary_row
+            wr = (wins / total * 100) if total > 0 else 0
+            rows.append([date_label, "Overall", "All Picks", total, wins,
+                          f"{wr:.1f}", f"{avg_pnl:+.1f}" if avg_pnl else "—", ""])
 
         for grade, total, wins, avg_pnl in grade_rows:
-            wr = (wins/total*100) if total > 0 else 0
-            rows.append(["By Grade", grade, total, wins, f"{wr:.1f}", f"{avg_pnl:+.1f}" if avg_pnl else "—", ""])
+            wins = wins or 0  # guard None
+            wr = (wins / total * 100) if total > 0 else 0
+            rows.append([date_label, "By Grade", grade or "—", total, wins,
+                          f"{wr:.1f}", f"{avg_pnl:+.1f}" if avg_pnl else "—", ""])
 
         for sector, total, wins, avg_pnl in sector_rows:
-            wr = (wins/total*100) if total > 0 else 0
-            rows.append(["By Sector", sector, total, wins, f"{wr:.1f}", f"{avg_pnl:+.1f}" if avg_pnl else "—", ""])
+            wins = wins or 0
+            wr = (wins / total * 100) if total > 0 else 0
+            rows.append([date_label, "By Sector", sector or "—", total, wins,
+                          f"{wr:.1f}", f"{avg_pnl:+.1f}" if avg_pnl else "—", ""])
 
         for name, wr, total in prior_rows:
-            rows.append(["Prior Calibrated", name, total, int(wr*total), f"{wr*100:.1f}", "—", _BAYES_PRIOR_VERSION])
+            rows.append([date_label, "Prior Calibrated", name, total,
+                          int((wr or 0) * total), f"{(wr or 0)*100:.1f}", "—", _BAYES_PRIOR_VERSION])
 
-        # Always push, even if empty (shows headers at minimum)
+        if len(rows) == 1:
+            # No closed picks yet — still push headers + placeholder
+            rows.append([date_label, "—", "No closed picks yet", 0, 0, "—", "—", ""])
+
+        # Append to existing tab (preserves history) — read existing rows first
+        ws = _get_ws("PERFORMANCE")
+        if ws is not None:
+            try:
+                existing = ws.get_all_values()
+                if existing and existing[0] == rows[0]:
+                    # Headers match — append data rows below existing
+                    data_rows = rows[1:]
+                    ws.append_rows(data_rows, value_input_option="USER_ENTERED")
+                    log.info(f"PERFORMANCE tab appended: {len(data_rows)} new rows ✅")
+                    return
+            except Exception as ae:
+                log.debug(f"PERFORMANCE append fallback to overwrite: {ae}")
+
+        # Fallback: overwrite (first run or header mismatch)
         _push_sheet("PERFORMANCE", rows)
         log.info(f"PERFORMANCE tab pushed: {len(rows)-1} rows ✅")
 
@@ -3658,33 +3703,51 @@ def _push_performance_tab(date_label: str):
 
 
 def _push_ai_insights_tab(picks: list, date_label: str):
-    """Push LLM-enhanced stories and filing analyses to AI_INSIGHTS tab."""
+    """Push LLM-enhanced stories and filing analyses to AI_INSIGHTS tab.
+    Appends rows each run so history accumulates. Called regardless of LLM_ENABLED;
+    the LLM columns simply show '—' when LLM is off."""
     log.info("AI_INSIGHTS: Starting push…")
     if not _sheets_ok():
         log.warning("AI_INSIGHTS: Sheets not configured — skipping")
         return
     log.info(f"AI_INSIGHTS: Sheets OK, processing {len(picks)} picks…")
 
-    headers = ["Date","Symbol","Grade","Raw Story","LLM Story","LLM Filing Sentiment","Filing Detail","Prior Version"]
-    rows = [headers]
+    headers = ["Date", "Symbol", "Grade", "Fused", "Raw Story", "LLM Story",
+               "LLM Conviction", "Filing Sentiment", "Filing Detail", "Prior Version"]
 
-    # If no picks, still push headers so tab isn't empty
+    data_rows = []
     if not picks:
-        rows.append([date_label, "—", "—", "No picks today", "—", "—", "—", _BAYES_PRIOR_VERSION])
-
-    for r in picks:
-        rows.append([
-            date_label, r["symbol"], r.get("grade","—"),
-            r.get("story","—")[:200],
-            r.get("llm_story","—")[:300] if r.get("llm_story") else "—",
-            r.get("llm_filing_sentiment","—") if r.get("llm_filing_sentiment") else "—",
-            r.get("fil_detail","—")[:200],
-            _BAYES_PRIOR_VERSION
-        ])
+        data_rows.append([date_label, "—", "—", "—", "No picks today", "—", "—", "—", "—", _BAYES_PRIOR_VERSION])
+    else:
+        for r in picks:
+            llm_story = r.get("llm_story") or "—"
+            if llm_story != "—":
+                llm_story = str(llm_story)[:300]
+            data_rows.append([
+                date_label,
+                r["symbol"],
+                r.get("grade", "—"),
+                r.get("fused", "—"),
+                (r.get("story") or "—")[:200],
+                llm_story,
+                r.get("bayes_pct", "—"),  # AI conviction proxy
+                r.get("llm_filing_sentiment") or "—",
+                (r.get("fil_detail") or "—")[:200],
+                _BAYES_PRIOR_VERSION,
+            ])
 
     try:
-        _push_sheet("AI_INSIGHTS", rows)
-        log.info(f"AI_INSIGHTS tab pushed: {len(rows)-1} rows ✅")
+        ws = _get_ws("AI_INSIGHTS")
+        if ws is not None:
+            existing = ws.get_all_values()
+            if existing and existing[0] == headers:
+                # Headers already present — append only data rows
+                ws.append_rows(data_rows, value_input_option="USER_ENTERED")
+                log.info(f"AI_INSIGHTS tab appended: {len(data_rows)} row(s) ✅")
+                return
+        # First run or header mismatch — full overwrite
+        _push_sheet("AI_INSIGHTS", [headers] + data_rows)
+        log.info(f"AI_INSIGHTS tab pushed: {len(data_rows)} row(s) ✅")
     except Exception as e:
         log.error(f"AI_INSIGHTS tab FAILED: {e}")
 
@@ -4274,12 +4337,14 @@ def run():
         def _batch_market_caps(symbols: list, fallback_map: dict) -> dict:
             """Return {symbol: mcap_in_cr} via batch yfinance tickers + SQLite cache.
             Uses ThreadPoolExecutor with per-symbol timeout so one slow call
-            cannot block the entire batch."""
+            cannot block the entire batch.
+            Bug fix: SQLite writes from worker threads are serialised through
+            _SQLITE_WRITE_LOCK to prevent 'database is locked' under WAL mode."""
             result = {}
 
-            # 1. SQLite cache
+            # 1. SQLite cache (read — safe without lock)
             try:
-                con = sqlite3.connect(DB_PATH)
+                con = sqlite3.connect(DB_PATH, timeout=10)
                 cached = {r[0]: r[1] for r in con.execute(
                     "SELECT symbol, mcap FROM mcap_cache WHERE fetched_at > ?",
                     ((datetime.today() - timedelta(days=7)).isoformat(),)
@@ -4324,20 +4389,21 @@ def run():
                     if sym not in result:
                         result[sym] = fallback_map.get(sym, 100.0)
 
-            # 3. Cache to SQLite
-            try:
-                con = sqlite3.connect(DB_PATH)
-                today_iso = datetime.today().isoformat()
-                for sym, mcap in result.items():
-                    if sym in need_fetch:
-                        con.execute(
-                            "INSERT OR REPLACE INTO mcap_cache (symbol, mcap, fetched_at) VALUES (?,?,?)",
-                            (sym, mcap, today_iso)
-                        )
-                con.commit()
-                con.close()
-            except Exception:
-                pass
+            # 3. Cache to SQLite — serialised write to avoid "database is locked"
+            with _SQLITE_WRITE_LOCK:
+                try:
+                    con = sqlite3.connect(DB_PATH, timeout=10)
+                    today_iso = datetime.today().isoformat()
+                    for sym, mcap in result.items():
+                        if sym in need_fetch:
+                            con.execute(
+                                "INSERT OR REPLACE INTO mcap_cache (symbol, mcap, fetched_at) VALUES (?,?,?)",
+                                (sym, mcap, today_iso)
+                            )
+                    con.commit()
+                    con.close()
+                except Exception:
+                    pass
 
             return result
 
@@ -4408,8 +4474,8 @@ def run():
     log.info("Calibrating Bayes priors…"); _calibrate_bayes_priors()
     log.info("Pushing to Sheets…");  push_gsheets(top_picks, date_label)
     log.info("Pushing PERFORMANCE…"); _push_performance_tab(date_label)
-    if LLM_ENABLED:
-        log.info("Pushing AI_INSIGHTS…"); _push_ai_insights_tab(top_picks, date_label)
+    # AI_INSIGHTS pushed unconditionally — shows story+conviction even without LLM API key
+    log.info("Pushing AI_INSIGHTS…"); _push_ai_insights_tab(top_picks, date_label)
     log.info("Sending Telegram…");   send_telegram(top_picks, macro, fii_data, date_label, data_source)
 
     # Persist results to DB + outcome tracking
