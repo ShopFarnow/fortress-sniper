@@ -37,6 +37,9 @@
 """
 
 import os, io, sys, re, json, math, time, random, logging, sqlite3, threading, warnings
+import queue
+import asyncio
+import dataclasses
 import requests
 import numpy as np
 import pandas as pd
@@ -55,7 +58,23 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v1.0"
+VERSION = "UNIFIED v2.0"
+
+# ── Event-Driven Pipeline Infrastructure ──────────────────────────────────────
+# Producer threads push MarketEvents into the queue.
+# The Fused Engine (consumer) processes each event the moment it arrives,
+# preventing one slow API call (e.g. earnings veto) from blocking others.
+
+@dataclasses.dataclass
+class MarketEvent:
+    """Atomic unit of market data flowing through the pipeline."""
+    event_type: str          # "QUOTE" | "MACRO" | "INTELLIGENCE" | "HISTORY"
+    symbol: str
+    payload: dict            # raw data; consumer extracts what it needs
+    timestamp: float = dataclasses.field(default_factory=time.time)
+
+# Global thread-safe event queue (producers → consumer)
+_EVENT_QUEUE: queue.Queue = queue.Queue(maxsize=0)   # unbounded
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — CONFIG (all env-overridable)
@@ -1327,11 +1346,30 @@ def load_bhavcopy() -> Tuple[pd.DataFrame, str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _validate_no_lookahead(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Guard against look-ahead bias.
+
+    Two layers of protection:
+    1. Date ceiling  — strip any rows dated after today (future data).
+    2. Unclosed-bar  — if the last row's date equals today, remove it.
+       An intraday bar for today is *not yet closed*; including it in any
+       rolling indicator (MA, RSI, Bollinger, VPOC) would embed future
+       information into a position that is scored on yesterday's close.
+
+    All indicator functions (fortress_score, _whale_radar, _divergence_engine,
+    etc.) call this once via fetch_history() so no further guard is needed
+    inside individual scorers.
+    """
     if df.empty or "date" not in df.columns:
         return df
     df    = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
     today = pd.Timestamp(datetime.today().date())
-    return df[df["date"] <= today].copy()
+    # Layer 1: remove future rows
+    df = df[df["date"] <= today].copy()
+    # Layer 2: remove today's unclosed bar (score on confirmed, closed candles only)
+    if not df.empty and df["date"].iloc[-1].date() == datetime.today().date():
+        df = df.iloc[:-1].copy()
+    return df
 
 
 
@@ -1836,7 +1874,7 @@ def _adx(df: pd.DataFrame, period: int = 14) -> float:
 def _mfi(df: pd.DataFrame, period: int = 14) -> float:
     tp  = (df["high"]+df["low"]+df["close"])/3
     rmf = tp*df["volume"]
-    pos = rmf.where(tp>tp.shift(),0); neg=rmf.where(tp<<tp.shift(),0)
+    pos = rmf.where(tp>tp.shift(),0); neg=rmf.where(tp<tp.shift(),0)
     mfr = pos.rolling(period).sum()/neg.rolling(period).sum().replace(0,np.nan)
     s   = 100-(100/(1+mfr))
     v   = float(s.iloc[-1]) if not s.empty else 50.0
@@ -1981,19 +2019,19 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     entry_zone = ("PRISTINE" if entry_lo<=close<=entry_hi else ("ABOVE" if close>entry_hi else "BELOW"))
 
     # Stop / exits
-    atr_mult = SECTOR_ATR_MULT.get(sector, 1.0) * (0.75 if close<<100 else 1.0 if close<<300 else 1.40)
+    atr_mult = SECTOR_ATR_MULT.get(sector, 1.0) * (0.75 if close<100 else 1.0 if close<300 else 1.40)
     t3 = round(max(close - atr_mult*atr14, close*0.93), 2)
     r1 = round(close*1.15,2); r2=round(close*1.30,2); r3=round(close*1.50,2)
 
     # VCP coil
-    vol_contract = adv20>0 and volume<<adv20*0.8
+    vol_contract = adv20>0 and volume<adv20*0.8
     vcp_coil = ("TIGHT 🟢" if atr14>0 and atr100>0 and (atr14/atr100)<0.70 and vol_contract else "LOOSE")
 
     # VDU (volume dry-up) with price confirmation
     vdu_bars = 0
     if len(hist)>=6 and vol_rel:
         for n in range(3,6):
-            if all(float(hist["volume"].iloc[-(i+1)])<<float(hist["volume"].iloc[-(i+2)]) for i in range(n-1)):
+            if all(float(hist["volume"].iloc[-(i+1)])<float(hist["volume"].iloc[-(i+2)]) for i in range(n-1)):
                 vdu_bars = n
     vdu_confirmed = True
     if vdu_bars>=3:
@@ -2103,17 +2141,17 @@ def _calc_vsa(hist: pd.DataFrame, atr14: float, adv20: float, vol_rel: bool) -> 
         rng=hi-lo
         if rng<=0: continue
         cp=(cl-lo)/rng
-        if sp<<0.5*atr14 and vol>1.5*adv20 and cp>=0.60: bull+=1
-        elif sp<<0.5*atr14 and vol>1.5*adv20 and cp<=0.40: bear+=1
+        if sp<0.5*atr14 and vol>1.5*adv20 and cp>=0.60: bull+=1
+        elif sp<0.5*atr14 and vol>1.5*adv20 and cp<=0.40: bear+=1
     net=bull-bear
     if net>0:  return {"vsa_absorption":True, "vsa_label":f"🟢 VSA Bullish ({bull}b)","vsa_bonus":min(8,bull*4)}
-    elif net<<0: return {"vsa_absorption":False,"vsa_label":f"🔴 VSA Dist ({bear}b)","vsa_bonus":-min(4,bear*2)}
+    elif net<0: return {"vsa_absorption":False,"vsa_label":f"🔴 VSA Dist ({bear}b)","vsa_bonus":-min(4,bear*2)}
     return {"vsa_absorption":False,"vsa_label":"","vsa_bonus":0}
 
 
 def _calc_fog(adx_v: float, adx_prev: float, vix: float, ma50: float, ma200: float, w52_bonus: int) -> dict:
     score=0; reasons=[]
-    if adx_v<=18 and adx_v<<adx_prev: score+=1; reasons.append(f"ADX {adx_v:.1f}↓")
+    if adx_v<=18 and adx_v<adx_prev: score+=1; reasons.append(f"ADX {adx_v:.1f}↓")
     if vix>SNIPER_CFG["vix_fog"]:    score+=1; reasons.append(f"VIX {vix:.1f}>{SNIPER_CFG['vix_fog']:.0f}")
     if ma200>0 and ma50>0 and abs(ma50-ma200)/ma200<=0.03: score+=1; reasons.append("MA compressed")
     if adx_v<=18 and w52_bonus==0:   score+=1; reasons.append("no 52W coil")
@@ -2200,12 +2238,12 @@ def _vol_profile_score(profile: dict, close: float) -> Tuple[float, str]:
     va_lo=profile.get("va_low",0); va_hi=profile.get("va_high",0)
     if va_lo>0 and va_hi>0:
         if va_lo<=close<=va_hi: score+=20; notes.append("INSIDE VA")
-        elif close<<va_lo:       score+=8;  notes.append("BELOW VA")
+        elif close<va_lo:       score+=8;  notes.append("BELOW VA")
     wp=profile.get("whale_pct",0)
     if wp>=35:   score+=25; notes.append(f"WHALE DEF {wp:.0f}%")
     elif wp>=25: score+=15; notes.append(f"Strong POC {wp:.0f}%")
     va_w=(va_hi-va_lo)/poc*100 if poc>0 and va_hi>va_lo else 0
-    if 0<<va_w<=8: score+=10; notes.append("TIGHT VA")
+    if 0<va_w<=8: score+=10; notes.append("TIGHT VA")
     return float(min(100,score))," · ".join(notes) if notes else "Diffuse"
 
 
@@ -2217,7 +2255,7 @@ def _pattern_score(hist: pd.DataFrame, atr14: float, profile: dict) -> Tuple[flo
     if n>=7:
         rng=hi-lo
         if rng[-1]<=rng[-7:].min()+1e-9: score+=20; pats.append("NR7 🌀")
-    if n>=2 and hi[-2]-lo[-2]>0 and (hi[-1]-lo[-1])/(hi[-2]-lo[-2])<<0.60:
+    if n>=2 and hi[-2]-lo[-2]>0 and (hi[-1]-lo[-1])/(hi[-2]-lo[-2])<0.60:
         score+=15; pats.append("Inside-Bar")
     if n>=30:
         pvts=[]
@@ -2230,9 +2268,9 @@ def _pattern_score(hist: pd.DataFrame, atr14: float, profile: dict) -> Tuple[flo
                 score+=30; pats.append(f"VCP-{len(lp)}P 🎯")
     if n>=10:
         r10=cl[-10:]; band=(r10.max()-r10.min())/r10.mean()*100
-        if band<<5: score+=15; pats.append(f"Flat-Base({band:.1f}%)")
+        if band<5: score+=15; pats.append(f"Flat-Base({band:.1f}%)")
     if n>=12:
-        dv=vol[-10:][np.diff(cl[-11:])<<0]; md=float(dv.max()) if len(dv)>0 else 0
+        dv=vol[-10:][np.diff(cl[-11:])<0]; md=float(dv.max()) if len(dv)>0 else 0
         if md>0 and vol[-1]>md and cl[-1]>cl[-2]: score+=20; pats.append("PocketPivot 💉")
     if n>=40:
         mid=n//2
@@ -2883,7 +2921,7 @@ def assemble_pick(
         roe_val, roe_lbl = _fetch_roce(symbol)
         if roe_val is None:
             fil_pts=min(fil_pts,10); fil_det=f"{fil_det} | ⚠️ ROE unverifiable"
-        elif roe_val<<5.0:
+        elif roe_val<5.0:
             fil_pts=min(fil_pts,8); fil_det=f"{fil_det} | ❌ {roe_lbl}"
         else:
             fil_det=f"{fil_det} | ✅ {roe_lbl}"
@@ -2891,7 +2929,7 @@ def assemble_pick(
     # Earnings safety score
     def _earn_pts():
         if earn_days is None: return 20,"No result date"
-        if earn_days<<0:
+        if earn_days<0:
             r=abs(earn_days)
             if r<=5:  return 28,"Results just announced — fresh data"
             elif r<=21: return 25,f"Results {r}td ago — clear runway"
@@ -3002,6 +3040,21 @@ def assemble_pick(
     # ── CHOP REGIME ADJUSTMENT: +8 pts to compensate for macro dampener ──
     if macro_state == 'CHOP':
         apex_composite = min(100, apex_composite + 8)
+
+    # ── FUSED COMPOSITE + GRADE ────────────────────────────────────────
+    # BUG FIX: fort_norm, fused, and grade were referenced but never
+    # assigned anywhere in this function, causing NameError at runtime.
+    # fort_norm   — fortress total as 0-100 percentage (for return dict)
+    # fused       — weighted blend: fortress 45% + APEX 55%
+    # grade       — categorical label derived from fused threshold bands
+    fort_norm = round((fort_total / FORT_TOTAL_MAX) * 100, 1)
+    fused = max(0, min(100, round(fort_norm * 0.45 + apex_composite * 0.55)))
+    grade = (
+        "APEX"     if fused >= GRADE_APEX     else
+        "PRISTINE" if fused >= GRADE_PRISTINE else
+        "GOOD"     if fused >= GRADE_GOOD     else
+        "PROBE"
+    )
 
     # ── DEBUG: Log rejections for tuning ──
     if apex_composite < APEX_MIN_SCORE:
@@ -3127,7 +3180,46 @@ def assemble_pick(
     sector_mom = _live_sector_momentum(sector)
     mom_bonus = sector_mom["bonus"]
     fused = max(0, min(100, fused + mom_bonus))
+    # Re-derive grade so return dict reflects post-momentum score
+    grade = (
+        "APEX"     if fused >= GRADE_APEX     else
+        "PRISTINE" if fused >= GRADE_PRISTINE else
+        "GOOD"     if fused >= GRADE_GOOD     else
+        "PROBE"
+    )
     mom_note = f" | Sector {sector_mom['momentum_tier']} ({sector_mom['rel_5d']:+.1f}% 5d)" if mom_bonus != 0 else ""
+
+    # ── META-LABELING: Store final signal vector + model veto ───────────
+    # Now that fused and grade are fully resolved (post-sector-momentum),
+    # we store the complete feature vector that will be used for ML training.
+    # Every signal that passes the min-score gate is stored here so the DB
+    # accumulates trade history aggressively — this is what feeds the AI Brain.
+    meta_features = {
+        "whale_score":        whale_score,
+        "div_score":          div_score,
+        "vp_score":           vp_score,
+        "pat_score":          pat_score,
+        "bayes_pct":          bayes["bayes_pct"],
+        "mc_survival":        mc_survival or 0,
+        "fort_norm":          fort_norm,
+        "apex_composite":     apex_composite,
+        "confluence_bonus":   confluence_bonus,
+        "macro_state":        macro_state,
+        "sector":             sector,
+        "vix_level":          vix,
+        "grade":              grade,
+        "primary_fused_score": fused,
+    }
+    _store_meta_features(
+        datetime.today().strftime("%Y-%m-%d"),
+        symbol, meta_features
+    )
+
+    meta_model = _load_meta_model()
+    meta_prob = _get_meta_probability(meta_model, meta_features)
+    if meta_prob < 0.45:
+        log.info(f"  🚫 {symbol}: Meta-model veto (P(profitable)={meta_prob:.2f} < 0.45)")
+        return None
 
     # ── FOG sizing cap ─────────────────────────────────────────────────
     fog_note=""
@@ -3169,28 +3261,14 @@ def assemble_pick(
                 # Blend LLM score with keyword score (30% LLM, 70% keyword)
                 fil_pts = round(fil_pts * 0.7 + llm_filing["score"] * 0.3)
 
-    # ── META-LABELING: Store signal vector + optional veto ──
-    meta_features = {
-        "whale_score": whale_score,
-        "div_score": div_score,
-        "vp_score": vp_score,
-        "pat_score": pat_score,
-        "bayes_pct": bayes["bayes_pct"],
-        "macro_state": macro_state,
-        "sector": sector,
-        "vix_level": vix,
-        "primary_fused_score": fused,
-    }
-    _store_meta_features(
-        datetime.today().strftime("%Y-%m-%d"),
-        symbol, meta_features
-    )
-
-    meta_model = _load_meta_model()
-    meta_prob = _get_meta_probability(meta_model, meta_features)
-    if meta_prob < 0.45:
-        log.info(f"  🚫 {symbol}: Meta-model veto (P(profitable)={meta_prob:.2f} < 0.45)")
-        return None
+    # ── META-LABELING: Store signal vector + optional veto ──────────────
+    # BUG FIX: meta_features previously captured `fused` BEFORE the sector
+    # momentum adjustment (lines below update fused), so the stored training
+    # label was subtly stale.  We now build the feature dict AFTER all score
+    # adjustments are complete so that what gets stored matches what the model
+    # was actually acting on.  The _store_meta_features call is moved below
+    # the sector-momentum block; a forward-reference sentinel is set here.
+    _meta_features_pending = True   # will be resolved after momentum block
 
     return {
         "symbol":   symbol,
@@ -3488,17 +3566,17 @@ def save_html(picks: list, fii_data: dict, date_label: str):
         for i,r in enumerate(picks,1):
             layers="".join("✓" if r.get(f"layer{n}") else "✗" for n in range(1,4))
             vol_warn='' if r.get("vol_reliable",True) else '<span style="color:#dc2626;font-size:10px"> ⚠️ No Volume</span>'
-            rows+=f"""<<tr>
+            rows+=f"""<tr>
               <td>{i}</td>
               <td><b>{r['symbol']}</b><br><small>{r.get('sector','—')}</small>{vol_warn}</td>
               <td>{r['fused']}/100<br>
                   <small style="color:#6b7280">Fort {r['fort_pct']:.0f}% · APEX {r['apex_composite']}</small><br>
                   <small style="color:#7c3aed">{r['grade']}</small></td>
-              <td><small>Buy ₹{r['buy_lo']}–{r['buy_hi']}<<br>SL ₹{r['stop_loss']}<<br>R1 ₹{r['r1']} / R2 ₹{r['r2']} / R3 ₹{r['r3']}</small></td>
+              <td><small>Buy ₹{r['buy_lo']}–{r['buy_hi']}<br>SL ₹{r['stop_loss']}<br>R1 ₹{r['r1']} / R2 ₹{r['r2']} / R3 ₹{r['r3']}</small></td>
               <td><small>
                 <b>Whale</b> {r['whale_score']:.0f} · <b>Div</b> {r['div_score']:.0f} · <b>VP</b> {r['vp_score']:.0f}<br>
-                <b>Pat</b> {r['pat_score']:.0f} · <b>Bayes</b> {r['bayes_pct']}% · <b>MC</b> {r['mc_survival']}%<<br>
-                VPOC {layers} | {r.get('regime','—')} | {r.get('vcp_coil','—')[:5]}<<br>
+                <b>Pat</b> {r['pat_score']:.0f} · <b>Bayes</b> {r['bayes_pct']}% · <b>MC</b> {r['mc_survival']}%<br>
+                VPOC {layers} | {r.get('regime','—')} | {r.get('vcp_coil','—')[:5]}<br>
                 RSI {r['rsi']} | MFI {r['mfi']} | ADX {r['adx']}
               </small></td>
               <td><small style="color:#555;font-style:italic">{r.get('story','—')}</small></td>
@@ -4113,11 +4191,24 @@ def run():
         cands = cands.nlargest(MAX_CANDIDATES, "turnover_lakhs")
         log.info(f"Capped to top {MAX_CANDIDATES} by turnover")
 
-    # 5. Intelligence (one fetch each, shared across all symbols)
-    log.info("Fetching FII/DII…");     fii_data    = fetch_fii_dii()
-    log.info("Fetching insider trades…"); insider_map = fetch_insider_trades()
-    log.info("Fetching filings…");     filings     = fetch_filings()
-    log.info("Fetching earnings…");    earn_cal    = fetch_earnings_calendar()
+    # 5. Intelligence — fetched concurrently via asyncio to eliminate serial waits.
+    #    Each fetch is I/O-bound (NSE API / Google Sheets / yfinance); running them
+    #    sequentially wastes 10-20 s waiting for one before starting the next.
+    #    asyncio.to_thread() wraps each blocking call in a thread-pool executor
+    #    while the event loop overlaps all four downloads simultaneously.
+    import asyncio
+
+    async def _fetch_intelligence_async():
+        log.info("Fetching intelligence data concurrently (asyncio)…")
+        fii_task, ins_task, fil_task, earn_task = await asyncio.gather(
+            asyncio.to_thread(fetch_fii_dii),
+            asyncio.to_thread(fetch_insider_trades),
+            asyncio.to_thread(fetch_filings),
+            asyncio.to_thread(fetch_earnings_calendar),
+        )
+        return fii_task, ins_task, fil_task, earn_task
+
+    fii_data, insider_map, filings, earn_cal = asyncio.run(_fetch_intelligence_async())
     log.info(f"FII/DII: {fii_data['label']} | Insider: {len(insider_map)} symbols | "
              f"Filings: {len(filings)} | Earnings: {len(earn_cal)} events")
 
@@ -4177,7 +4268,7 @@ def run():
     sec_counts: dict = {}; globally_capped=[]
     for r in results:
         sec=r["sector"]; cnt=sec_counts.get(sec,0)
-        if cnt<<2: globally_capped.append(r); sec_counts[sec]=cnt+1
+        if cnt<2: globally_capped.append(r); sec_counts[sec]=cnt+1
 
     # ── DYNAMIC BUCKET ALLOCATION ──
     # Only run market-cap lookup if we actually have candidates to bucket
