@@ -2223,7 +2223,7 @@ def send_telegram(picks: list, macro: dict, fii_data: dict,
 # SECTION 15 — OUTPUT: EXCEL, HTML, GOOGLE SHEETS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_excel(picks: list, all_results: list, fii_data: dict, date_label: str):
+def save_excel(picks: list, all_results: list, fii_data: dict, date_label: str, data_source: str, bhavcopy: pd.DataFrame):
     if not picks and not all_results: return
     try:
         EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2231,10 +2231,24 @@ def save_excel(picks: list, all_results: list, fii_data: dict, date_label: str):
             pd.DataFrame(picks).to_excel(w, sheet_name="Top Picks",   index=False)
             pd.DataFrame(all_results).to_excel(w, sheet_name="All Results", index=False)
             pd.DataFrame([fii_data]).to_excel(w, sheet_name="FII_DII", index=False)
+            
+            # NEW: Data Quality sheet
+            halal_uni = get_halal_universe()
+            quality = pd.DataFrame([{
+                "Date": date_label,
+                "Source": data_source,
+                "Bhavcopy_Records": len(bhavcopy),
+                "Halal_Universe": len(halal_uni),
+                "Halal_in_Bhavcopy": len(bhavcopy[bhavcopy["symbol"].isin(halal_uni)]),
+                "YFinance_Shrink": "YES" if (data_source == "YFINANCE" and len(bhavcopy) <= 100) else "NO",
+                "Missing_Halal": len(halal_uni - set(bhavcopy["symbol"])),
+                "Alert": "SHRUNK" if (data_source == "YFINANCE" and len(bhavcopy) <= 100) else "OK"
+            }])
+            quality.to_excel(w, sheet_name="Data Quality", index=False)
+            
         log.info(f"Excel saved: {EXCEL_PATH}")
     except Exception as e:
         log.error(f"Excel save failed: {e}")
-
 
 def save_html(picks: list, fii_data: dict, date_label: str):
     try:
