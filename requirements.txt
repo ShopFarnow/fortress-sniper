@@ -27,3 +27,25 @@ packaging>=23.0
 
 # ── Optional: faster Monte Carlo path (falls back to numpy if absent) ─
 # scipy>=1.11.0
+
+# ══════════════════════════════════════════════════════════════════════
+# APEX SNIPER v1.1 — Requirements
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Core (required) ──
+yfinance>=0.2.0
+pandas>=1.5.0
+numpy>=1.24.0
+requests>=2.28.0
+
+# ── Google Sheets Integration (required if using Sheets data source) ──
+gspread>=5.0.0
+google-auth>=2.0.0
+
+# ── Optional: NSE India Native API (HIGHLY RECOMMENDED over Google Finance scraper)
+# Install: pip install nsepython
+# Enable: set env NSEPYTHON_ENABLED=true
+# nsepython
+
+# ── NOTE: openpyxl NOT needed (APEX has no Excel/HTML output)
+# ── NOTE: pandas-market-calendars NOT needed (APEX uses fixed SWING_HORIZON_DAYS)
