@@ -254,16 +254,10 @@ def _llm_filing_sentiment(subject: str, symbol: str = "") -> dict:
     if not LLM_ENABLED:
         return {"score": None, "detail": None, "sentiment": "LLM_DISABLED"}
 
-    prompt = "Analyze this Indian stock corporate filing for sentiment:
-"
-    prompt += f"Symbol: {symbol}
-Subject: {subject}
-
-"
-    prompt += "Rate sentiment (POSITIVE/NEGATIVE/NEUTRAL) and explain in 1 sentence.
-"
-    prompt += "Also give a score 0-30 where 20+ is clearly positive, <10 is negative.
-"
+    prompt = "Analyze this Indian stock corporate filing for sentiment:\n"
+    prompt += f"Symbol: {symbol}\nSubject: {subject}\n\n"
+    prompt += "Rate sentiment (POSITIVE/NEGATIVE/NEUTRAL) and explain in 1 sentence.\n"
+    prompt += "Also give a score 0-30 where 20+ is clearly positive, <10 is negative.\n"
     prompt += "Format: SCORE|X|SENTIMENT|Y|REASON|Z"
 
     result = _llm_call(prompt, "sentiment")
@@ -291,23 +285,14 @@ def _llm_story_enhance(symbol: str, story_parts: list, technicals: dict) -> Opti
         return None
 
     signals_text = "; ".join(story_parts[:6])
-    prompt = f"Write a 1-sentence investment thesis for {symbol} based on these signals:
-"
-    prompt += f"{signals_text}
-
-"
+    prompt = f"Write a 1-sentence investment thesis for {symbol} based on these signals:\n"
+    prompt += f"{signals_text}\n\n"
     prompt += f"Technical context: RSI {technicals.get('rsi','?')}, ADX {technicals.get('adx','?')}, "
-    prompt += f"MFI {technicals.get('mfi','?')}, ATR {technicals.get('atr14','?')}
-
-"
-    prompt += "Rules:
-"
-    prompt += "- Max 25 words
-"
-    prompt += "- Plain English, no jargon
-"
-    prompt += "- Mention the strongest signal first
-"
+    prompt += f"MFI {technicals.get('mfi','?')}, ATR {technicals.get('atr14','?')}\n\n"
+    prompt += "Rules:\n"
+    prompt += "- Max 25 words\n"
+    prompt += "- Plain English, no jargon\n"
+    prompt += "- Mention the strongest signal first\n"
     prompt += "- End with expected outcome if clear"
 
     return _llm_call(prompt, "story")
@@ -2328,7 +2313,7 @@ def assemble_pick(
         fii_pts=fii_pts, ins_pts=ins_pts, fil_pts=fil_pts,    # ← intelligence fusion
     )
 
-        macro_damp = {"CLEAR":1.0,"CHOP":0.88,"PANIC":0.60,"MASSACRE":0.0}
+    macro_damp = {"CLEAR":1.0,"CHOP":0.88,"PANIC":0.60,"MASSACRE":0.0}
     bayes_score = float(bayes["bayes_pct"])
     # ── APEX CONFLUENCE SCORE (NOT double-counting VPOC) ──
     # Instead of re-scoring VPOC layers (already in fortress_pts),
