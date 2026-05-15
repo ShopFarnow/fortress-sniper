@@ -162,6 +162,7 @@ _YF_DOWNLOAD_TIMEOUT = 15          # seconds for yf.download
 _YF_INFO_TIMEOUT     = 10          # seconds for yf.Ticker().info
 _YF_FAIL_COUNT       = 0
 _YF_FAIL_THRESHOLD   = 3           # skip all yf calls after 3 consecutive failures
+_NSE_HISTORY_OK      = None        # None=unknown, True=working, False=broken (speeds up loop when NSE is down)
 
 _CNX500_CACHE        = None
 _CNX500_CACHE_TIME   = 0
@@ -1226,52 +1227,124 @@ def _validate_no_lookahead(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["date"] <= today].copy()
 
 
-def fetch_history(symbol: str, days: int = 300,
-                  sess: Optional[requests.Session] = None) -> pd.DataFrame:
-    """NSE historical API → yfinance fallback."""
-    # NSE API
-    try:
-        if sess is None:
-            sess = _get_nse_session()
-        end = datetime.today(); start = end - timedelta(days=days + 50)
-        data = _nse_json(sess, "https://www.nseindia.com/api/historical/cm/equity",
-                         params={"symbol": symbol, "series": '["EQ"]',
-                                 "from": start.strftime("%d-%m-%Y"), "to": end.strftime("%d-%m-%Y")},
-                         timeout=20)
-        records = data.get("data", []) if isinstance(data, dict) else []
-        if records:
-            df = pd.DataFrame(records).rename(columns={
-                "CH_TIMESTAMP":"date","CH_OPENING_PRICE":"open",
-                "CH_TRADE_HIGH_PRICE":"high","CH_TRADE_LOW_PRICE":"low",
-                "CH_CLOSING_PRICE":"close","CH_TOT_TRADED_QTY":"volume",
-            })
-            df["date"] = pd.to_datetime(df["date"])
-            for c in ["open","high","low","close","volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            df = df[["date","open","high","low","close","volume"]].dropna()
-            if len(df) >= MIN_HIST_BARS:
-                return _validate_no_lookahead(df)
-    except Exception as e:
-        log.debug(f"NSE history {symbol}: {e}")
 
-    # yfinance fallback
+
+def _preload_histories_yf(symbols: List[str], days: int = 300) -> Dict[str, pd.DataFrame]:
+    """Batch-download historical OHLCV for all symbols via yfinance in chunks of 50.
+    Returns {symbol_upper: DataFrame} to eliminate per-symbol network calls."""
+    cache: Dict[str, pd.DataFrame] = {}
+    if not symbols:
+        return cache
     try:
         import yfinance as yf
-        end = datetime.today(); start = end - timedelta(days=days + 50)
-        raw = yf.download(f"{symbol}.NS", start=start, end=end,
-                          progress=False, auto_adjust=False,
-                          timeout=_YF_DOWNLOAD_TIMEOUT)
-        if not raw.empty:
-            raw = raw.reset_index()
-            raw.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in raw.columns]
-            if "close" not in raw.columns and "adj close" in raw.columns:
-                raw = raw.rename(columns={"adj close": "close"})
-            raw["date"] = pd.to_datetime(raw["date"])
-            df = raw[["date","open","high","low","close","volume"]].dropna()
-            return _validate_no_lookahead(df)
-    except Exception as e:
-        log.debug(f"yfinance history {symbol}: {e}")
+    except ImportError:
+        return cache
 
+    end = datetime.today()
+    start = end - timedelta(days=days + 50)
+    for i in range(0, len(symbols), 50):
+        chunk = symbols[i:i + 50]
+        tickers = " ".join(f"{s}.NS" for s in chunk)
+        for attempt in range(2):
+            try:
+                raw = yf.download(tickers, start=start, end=end,
+                                  progress=False, auto_adjust=False,
+                                  group_by="ticker",
+                                  timeout=_YF_DOWNLOAD_TIMEOUT)
+                if raw.empty:
+                    break
+                for sym in chunk:
+                    tk = f"{sym}.NS"
+                    try:
+                        if hasattr(raw.columns, "levels"):
+                            lvl1 = list(raw.columns.get_level_values(1))
+                            lvl0 = list(raw.columns.get_level_values(0))
+                            sub = (raw.xs(tk, axis=1, level=1) if tk in lvl1
+                                   else (raw[tk] if tk in lvl0 else None))
+                        else:
+                            sub = raw.copy() if len(chunk) == 1 else None
+                        if sub is None or sub.empty:
+                            continue
+                        sub = sub.reset_index()
+                        sub.columns = [c[0].lower() if isinstance(c, tuple) else c.lower()
+                                       for c in sub.columns]
+                        if "close" not in sub.columns and "adj close" in sub.columns:
+                            sub = sub.rename(columns={"adj close": "close"})
+                        sub["date"] = pd.to_datetime(sub["date"])
+                        df = sub[["date", "open", "high", "low", "close", "volume"]].dropna()
+                        cache[sym.upper()] = _validate_no_lookahead(df)
+                    except Exception:
+                        continue
+                break
+            except Exception as e:
+                log.debug(f"Batch yfinance chunk {i}-{i + 50} attempt {attempt + 1}: {e}")
+                time.sleep(2 * (attempt + 1))
+    log.info(f"Preloaded {len(cache)} histories via batch yfinance")
+    return cache
+
+def fetch_history(symbol: str, days: int = 300,
+                  sess: Optional[requests.Session] = None,
+                  yf_cache: Optional[Dict[str, pd.DataFrame]] = None) -> pd.DataFrame:
+    """NSE historical API → batch yfinance cache → individual yfinance fallback."""
+    global _NSE_HISTORY_OK
+    sym = symbol.upper().strip()
+
+    # Fast path: preloaded batch yfinance cache (zero network call)
+    if yf_cache is not None and sym in yf_cache:
+        df = yf_cache[sym]
+        if len(df) >= MIN_HIST_BARS:
+            return df
+
+    # NSE API (skip entirely if we already know it is down)
+    if _NSE_HISTORY_OK is not False:
+        try:
+            if sess is None:
+                sess = _get_nse_session()
+            end = datetime.today(); start = end - timedelta(days=days + 50)
+            data = _nse_json(sess, "https://www.nseindia.com/api/historical/cm/equity",
+                             params={"symbol": sym, "series": '["EQ"]',
+                                     "from": start.strftime("%d-%m-%Y"), "to": end.strftime("%d-%m-%Y")},
+                             timeout=12)
+            records = data.get("data", []) if isinstance(data, dict) else []
+            if records:
+                df = pd.DataFrame(records).rename(columns={
+                    "CH_TIMESTAMP":"date","CH_OPENING_PRICE":"open",
+                    "CH_TRADE_HIGH_PRICE":"high","CH_TRADE_LOW_PRICE":"low",
+                    "CH_CLOSING_PRICE":"close","CH_TOT_TRADED_QTY":"volume",
+                })
+                df["date"] = pd.to_datetime(df["date"])
+                for c in ["open","high","low","close","volume"]:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                df = df[["date","open","high","low","close","volume"]].dropna()
+                if len(df) >= MIN_HIST_BARS:
+                    _NSE_HISTORY_OK = True
+                    return _validate_no_lookahead(df)
+        except Exception as e:
+            log.debug(f"NSE history {sym}: {e}")
+            _NSE_HISTORY_OK = False
+
+    # Individual yfinance fallback (only if no cache entry)
+    if yf_cache is None or sym not in yf_cache:
+        try:
+            import yfinance as yf
+            end = datetime.today(); start = end - timedelta(days=days + 50)
+            raw = yf.download(f"{sym}.NS", start=start, end=end,
+                              progress=False, auto_adjust=False,
+                              timeout=_YF_DOWNLOAD_TIMEOUT)
+            if not raw.empty:
+                raw = raw.reset_index()
+                raw.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in raw.columns]
+                if "close" not in raw.columns and "adj close" in raw.columns:
+                    raw = raw.rename(columns={"adj close": "close"})
+                raw["date"] = pd.to_datetime(raw["date"])
+                df = raw[["date","open","high","low","close","volume"]].dropna()
+                return _validate_no_lookahead(df)
+        except Exception as e:
+            log.debug(f"yfinance history {sym}: {e}")
+
+    # Return cached frame even if short, or empty
+    if yf_cache is not None and sym in yf_cache:
+        return yf_cache[sym]
     return pd.DataFrame()
 
 
@@ -3517,32 +3590,6 @@ def _data_quality_gate(bhavcopy: pd.DataFrame, data_source: str) -> dict:
 
 
 
-def _data_quality_gate(bhavcopy: pd.DataFrame, data_source: str) -> dict:
-    """
-    Auto-adjust thresholds if data quality degrades.
-    Returns: {apex_min_score: int, apex_top_n: int, alert: str}
-    """
-    halal_uni = get_halal_universe()
-    halal_in_bhav = len(bhavcopy[bhavcopy["symbol"].isin(halal_uni)])
-
-    min_score = APEX_MIN_SCORE
-    top_n = APEX_TOP_N
-    alert = ""
-
-    if data_source == "YFINANCE" and len(bhavcopy) <= 100:
-        min_score = 65
-        top_n = 3
-        alert = "🚨 DEGRADED: YFinance fallback, universe shrunk. Raising bar."
-        log.warning(alert)
-    elif halal_in_bhav < 50:
-        min_score = min(65, APEX_MIN_SCORE + 5)
-        top_n = max(3, APEX_TOP_N - 1)
-        alert = f"⚠️ Only {halal_in_bhav} halal symbols in bhavcopy. Tightening filters."
-        log.warning(alert)
-
-    return {"apex_min_score": min_score, "apex_top_n": top_n, "alert": alert}
-
-
 
 def _intraday_watchdog(symbol: str, trailing_stop: float, db_path: str = DB_PATH) -> dict:
     """
@@ -3703,7 +3750,11 @@ def run():
     log.info(f"FII/DII: {fii_data['label']} | Insider: {len(insider_map)} symbols | "
              f"Filings: {len(filings)} | Earnings: {len(earn_cal)} events")
 
-    # 6. Scoring loop (one loop, both engines fused)
+    # 6. Pre-load all histories via batch yfinance (eliminates per-symbol network calls)
+    log.info("Pre-loading historical data (batch yfinance)…")
+    hist_cache = _preload_histories_yf(cands["symbol"].tolist(), days=300)
+
+    # 7. Scoring loop (one loop, both engines fused) — ZERO per-symbol network calls
     sess    = _get_nse_session()
     results = []
     for i,(_, row) in enumerate(cands.iterrows()):
@@ -3711,14 +3762,13 @@ def run():
         if i % 25 == 0:
             log.info(f"Progress: {i}/{len(cands)} | picks: {len(results)}")
         try:
-            hist = fetch_history(sym, days=300, sess=sess)
+            hist = fetch_history(sym, days=300, sess=sess, yf_cache=hist_cache)
             if len(hist) < MIN_HIST_BARS:
                 log.debug(f"{sym}: only {len(hist)} bars — skip"); continue
             r = assemble_pick(sym, row, hist, fii_data, insider_map, filings, earn_cal, macro)
             if r:
                 results.append(r)
                 log.info(f"  ✅ {sym:12s} | fused={r['fused']}/100 | {r['grade'][:10]} | {r['story'][:60]}")
-            time.sleep(0.15)
         except Exception as e:
             log.debug(f"{sym}: {e}")
 
@@ -3759,82 +3809,83 @@ def run():
         if cnt<<2: globally_capped.append(r); sec_counts[sec]=cnt+1
 
     # ── DYNAMIC BUCKET ALLOCATION ──
-    # Batch market cap lookup — vectorized, cached, single yfinance call
+    # Only run market-cap lookup if we actually have candidates to bucket
+    mcap_map: dict = {}
+    if globally_capped:
+        def _batch_market_caps(symbols: list, fallback_map: dict) -> dict:
+            """Return {symbol: mcap_in_cr} via batch yfinance tickers + SQLite cache.
+            Uses ThreadPoolExecutor with per-symbol timeout so one slow call
+            cannot block the entire batch."""
+            result = {}
 
-    def _batch_market_caps(symbols: list, fallback_map: dict) -> dict:
-        """Return {symbol: mcap_in_cr} via batch yfinance tickers + SQLite cache.
-        Uses ThreadPoolExecutor with per-symbol timeout so one slow call
-        cannot block the entire batch."""
-        result = {}
-
-        # 1. SQLite cache
-        try:
-            con = sqlite3.connect(DB_PATH)
-            cached = {r[0]: r[1] for r in con.execute(
-                "SELECT symbol, mcap FROM mcap_cache WHERE fetched_at > ?",
-                ((datetime.today() - timedelta(days=7)).isoformat(),)
-            ).fetchall()}
-            con.close()
-            result.update(cached)
-        except Exception:
-            cached = {}
-
-        need_fetch = [s for s in symbols if s not in result]
-        if not need_fetch:
-            return result
-
-        # 2. Parallel fetch with hard timeout per symbol
-        def _fetch_one(sym):
+            # 1. SQLite cache
             try:
-                import yfinance as yf
-                info = yf.Ticker(f"{sym}.NS").info
-                mc = info.get("marketCap")
-                if mc:
-                    return sym, float(mc) / 1e7
+                con = sqlite3.connect(DB_PATH)
+                cached = {r[0]: r[1] for r in con.execute(
+                    "SELECT symbol, mcap FROM mcap_cache WHERE fetched_at > ?",
+                    ((datetime.today() - timedelta(days=7)).isoformat(),)
+                ).fetchall()}
+                con.close()
+                result.update(cached)
+            except Exception:
+                cached = {}
+
+            need_fetch = [s for s in symbols if s not in result]
+            if not need_fetch:
+                return result
+
+            # 2. Parallel fetch with hard timeout per symbol
+            def _fetch_one(sym):
+                try:
+                    import yfinance as yf
+                    info = yf.Ticker(f"{sym}.NS").info
+                    mc = info.get("marketCap")
+                    if mc:
+                        return sym, float(mc) / 1e7
+                except Exception:
+                    pass
+                return sym, fallback_map.get(sym, 100.0)
+
+            try:
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    futures = {executor.submit(_fetch_one, sym): sym for sym in need_fetch}
+                    for future in futures:
+                        sym = futures[future]
+                        try:
+                            sym_out, mcap = future.result(timeout=_YF_INFO_TIMEOUT)
+                            result[sym_out] = mcap
+                        except FutureTimeoutError:
+                            log.warning(f"Market cap timeout: {sym}")
+                            result[sym] = fallback_map.get(sym, 100.0)
+                        except Exception:
+                            result[sym] = fallback_map.get(sym, 100.0)
+            except Exception as e:
+                log.error(f"Batch market cap executor failed: {e}")
+                for sym in need_fetch:
+                    if sym not in result:
+                        result[sym] = fallback_map.get(sym, 100.0)
+
+            # 3. Cache to SQLite
+            try:
+                con = sqlite3.connect(DB_PATH)
+                today_iso = datetime.today().isoformat()
+                for sym, mcap in result.items():
+                    if sym in need_fetch:
+                        con.execute(
+                            "INSERT OR REPLACE INTO mcap_cache (symbol, mcap, fetched_at) VALUES (?,?,?)",
+                            (sym, mcap, today_iso)
+                        )
+                con.commit()
+                con.close()
             except Exception:
                 pass
-            return sym, fallback_map.get(sym, 100.0)
 
-        try:
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                futures = {executor.submit(_fetch_one, sym): sym for sym in need_fetch}
-                for future in futures:
-                    sym = futures[future]
-                    try:
-                        sym_out, mcap = future.result(timeout=_YF_INFO_TIMEOUT)
-                        result[sym_out] = mcap
-                    except FutureTimeoutError:
-                        log.warning(f"Market cap timeout: {sym}")
-                        result[sym] = fallback_map.get(sym, 100.0)
-                    except Exception:
-                        result[sym] = fallback_map.get(sym, 100.0)
-        except Exception as e:
-            log.error(f"Batch market cap executor failed: {e}")
-            for sym in need_fetch:
-                if sym not in result:
-                    result[sym] = fallback_map.get(sym, 100.0)
+            return result
 
-        # 3. Cache to SQLite
-        try:
-            con = sqlite3.connect(DB_PATH)
-            today_iso = datetime.today().isoformat()
-            for sym, mcap in result.items():
-                if sym in need_fetch:
-                    con.execute(
-                        "INSERT OR REPLACE INTO mcap_cache (symbol, mcap, fetched_at) VALUES (?,?,?)",
-                        (sym, mcap, today_iso)
-                    )
-            con.commit()
-            con.close()
-        except Exception:
-            pass
-
-        return result
-
-    # Pre-compute all market caps in one batch
-    symbols_to_lookup = [r["symbol"] for r in globally_capped]
-    fallback_mcaps = {r["symbol"]: r["close"] * 100 for r in globally_capped}
-    mcap_map = _batch_market_caps(symbols_to_lookup, fallback_mcaps)
+        # Pre-compute all market caps in one batch
+        symbols_to_lookup = [r["symbol"] for r in globally_capped]
+        fallback_mcaps = {r["symbol"]: r["close"] * 100 for r in globally_capped}
+        mcap_map = _batch_market_caps(symbols_to_lookup, fallback_mcaps)
 
     # Assign to results
     for r in globally_capped:
@@ -3918,7 +3969,7 @@ def run():
         log.info("Pushing AI_INSIGHTS…"); _push_ai_insights_tab(top_picks, date_label)
     log.info("Sending Telegram…");   send_telegram(top_picks, macro, fii_data, date_label, data_source)
 
-        # Persist results to DB + outcome tracking
+    # Persist results to DB + outcome tracking
     try:
         con = sqlite3.connect(DB_PATH)
         for r in top_picks:
