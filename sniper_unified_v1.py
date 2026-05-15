@@ -2769,20 +2769,28 @@ def run():
     log.info("Pushing to Sheets…");  push_gsheets(top_picks, date_label)
     log.info("Sending Telegram…");   send_telegram(top_picks, macro, fii_data, date_label, data_source)
 
-    # Persist results to DB
+        # Persist results to DB + outcome tracking
     try:
         con = sqlite3.connect(DB_PATH)
         for r in top_picks:
+            # Existing sniper_results
             con.execute(
                 "INSERT INTO sniper_results (run_date,symbol,grade,fused_score,close,stop_loss,r1,r2,r3,story) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (date_label,r["symbol"],r["grade"],r["fused"],r["close"],
                  r["stop_loss"],r["r1"],r["r2"],r["r3"],r["story"])
             )
+            # NEW: outcome tracking (initial state)
+            con.execute(
+                "INSERT OR IGNORE INTO pick_outcomes (run_date,symbol,entry_price,stop_loss,r1,r2,r3,grade,fused_score,story,status) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (date_label,r["symbol"],r["close"],r["stop_loss"],r["r1"],r["r2"],r["r3"],
+                 r["grade"],r["fused"],r["story"],"open")
+            )
         con.commit(); con.close()
+        log.info(f"DB: {len(top_picks)} picks saved for outcome tracking")
     except Exception as e:
         log.debug(f"DB persist: {e}")
-
     log.info(f"\n✅ Done | {len(top_picks)} picks | Macro: {macro['macro_state']} | "
              f"VIX: {macro['vix_val']:.1f} | Source: {data_source} | "
              f"Bismillah 🤲")
