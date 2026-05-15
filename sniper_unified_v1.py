@@ -2038,26 +2038,60 @@ def assemble_pick(
     15 if poc > 0 and abs(close-poc)/poc <= 0.05 else
     0)) * W["fortress_vpoc"]        # VPOC sub-score into APEX weight
     )
-    # score variable reuse fix
-    vpoc_for_apex = (
-        25*(fort["layer1"]) +
-        20*(fort["layer2"]) +
-        25*(fort["layer3"]) +
-        10*(fort["sector_mult"]>=1.0) +
-        5*(fort["alt_pct"]<SNIPER_CFG["alt_warn_pct"])
-    )
+    # ── APEX CONFLUENCE SCORE (NOT double-counting VPOC) ──
+    # Instead of re-scoring VPOC layers (already in fortress_pts),
+    # measure how strongly the INDEPENDENT APEX engines confirm
+    # the same trade idea. This is pure confluence, not duplication.
+
+    # Confluence bonuses: when multiple engines agree on direction
+    confluence_bonus = 0
+    confluence_notes = []
+
+    # Whale + Divergence agreement (strong)
+    if whale_det["whale_detected"] and div_det["div_type"] == "BULLISH_HIDDEN":
+        confluence_bonus += 15
+        confluence_notes.append("Whale+Div agree")
+
+    # Pattern + Volume Profile agreement (moderate)
+    if vp_score >= 40 and ("VCP" in pat_label or "Cup" in pat_label):
+        confluence_bonus += 12
+        confluence_notes.append("VP+Pattern agree")
+
+    # Bayesian + MC agreement (moderate)
+    if bayes["bayes_pct"] >= 60 and mc_survival is not None and mc_survival >= 70:
+        confluence_bonus += 10
+        confluence_notes.append("Bayes+MC agree")
+
+    # All four engines aligned (rare, powerful)
+    engines_aligned = sum([
+        whale_det["whale_detected"],
+        div_det["div_type"] == "BULLISH_HIDDEN",
+        vp_score >= 35,
+        bayes["bayes_pct"] >= 55
+    ])
+    if engines_aligned >= 4:
+        confluence_bonus += 8
+        confluence_notes.append("All engines aligned")
+    elif engines_aligned == 3:
+        confluence_bonus += 4
+        confluence_notes.append("3/4 engines aligned")
+
+    # Cap confluence to prevent runaway scores
+    confluence_bonus = min(35, confluence_bonus)
+
+    # ── APEX RAW COMPOSITE (independent of fortress VPOC) ──
     raw_apex = (
-        float(vpoc_for_apex) * W["fortress_vpoc"] +
         whale_score          * W["whale_radar"]   +
         div_score            * W["divergence"]    +
         vp_score             * W["vol_profile"]   +
         pat_score            * W["pattern"]       +
-        bayes_score          * W["bayesian"]
+        bayes_score          * W["bayesian"]      +
+        confluence_bonus     * W["fortress_vpoc"]  # Reuse weight slot for confluence
     )
     apex_composite = round(raw_apex * macro_damp.get(macro_state,0.88))
-    if whale_det["signal_type"]=="STEALTH" and fort["layer1"] and fort["layer2"] and fort["layer3"]:
-        apex_composite=min(100,apex_composite+8)
-    if bayes["bayes_pct"]>=70: apex_composite=min(100,apex_composite+5)
+    # Independent bonuses (not double-counting)
+    if bayes["bayes_pct"] >= 75 and mc_survival is not None and mc_survival >= 75:
+        apex_composite = min(100, apex_composite + 5)  # High conviction + high survival
     apex_composite=max(0,min(100,apex_composite))
 
     if apex_composite < APEX_MIN_SCORE:
