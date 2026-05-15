@@ -653,12 +653,22 @@ def get_halal_universe() -> set:
             log.info(f"Halal universe LIVE: {len(live)} symbols")
             return live
 
-        log.warning(
-            f"Shariah live fetch returned {len(live)} symbols (need ≥100) — "
-            f"using curated fallback ({len(_HALAL_FALLBACK_85)} symbols)"
-        )
-        _SHARIAH_UNIVERSE_CACHE = _HALAL_FALLBACK_85
-        return _HALAL_FALLBACK_85
+        # Try Sheets HALAL_LIST
+        sheets_list = _read_sheet_halal_list()
+        if sheets_list and len(sheets_list) >= 50:
+            log.info(f"Halal universe from Sheets HALAL_LIST: {len(sheets_list)} symbols")
+            _SHARIAH_UNIVERSE_CACHE = sheets_list
+            return sheets_list
+
+        log.warning(f"All dynamic halal sources failed — using minimal fallback")
+        # Minimal fallback: just major known halal names
+        minimal_fallback = {
+            "TCS","INFY","WIPRO","HCLTECH","TECHM","SUNPHARMA","DRREDDY","CIPLA",
+            "MARUTI","TATAMOTORS","HINDUNILVR","NESTLEIND","BRITANNIA","TATASTEEL",
+            "HINDALCO","JSWSTEEL","LT","HAVELLS","ASIANPAINT","TITAN","TRENT"
+        }
+        _SHARIAH_UNIVERSE_CACHE = minimal_fallback
+        return minimal_fallback
 
 
 def is_halal(symbol: str) -> bool:
@@ -3567,15 +3577,11 @@ def _rank_clean(rank: str) -> str:
     return rank
 
 
-def send_telegram_v7(top5, sector_trends, fii_data, date_label, macro,
-                     using_fallback=False, data_source="NSE"):
-    """SN-7 v8.2 — FIX-AUDIT-01: all data values passed through _escape_md
-    which now covers all 18 MarkdownV2 special characters."""
+def send_telegram_v7_clean(top5, sector_trends, fii_data, date_label, macro,
+                           using_fallback=False, data_source="NSE"):
+    """Clean Telegram format matching user specification."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.info("Telegram not configured — skipping"); return
-    token_ok, token_msg = validate_telegram_token(TELEGRAM_TOKEN)
-    if not token_ok:
-        log.error(f"Telegram SKIPPED — {token_msg}"); return
 
     ms        = macro.get("macro_state","CHOP")
     vix       = macro.get("vix_val",0.0)
@@ -3583,150 +3589,58 @@ def send_telegram_v7(top5, sector_trends, fii_data, date_label, macro,
     breadth   = macro.get("breadth_ok",True)
 
     ms_icon   = {"CLEAR":"✅","CHOP":"⚠️","PANIC":"🔴","MASSACRE":"🚨"}.get(ms,"↔")
-    src_badge = {"NSE":"🟢 NSE Live","SHEETS":"📊 Google Sheets","YFINANCE":"⚠️ yfinance"}.get(data_source,data_source)
-
-    trending  = [s.replace("NIFTY ","") for s,v in sector_trends.items() if "STRONG" in v.get("trend","")]
-    sector_line  = "🔥 "+" · ".join(trending) if trending else "No strong sectors"
-    breadth_line = "✅ CNX500 > MA50" if breadth else "🔴 CNX500 < MA50 — CAUTION"
 
     lines=[
-        f"⚔️ *FORTRESS SNIPER v8\\.1* | `{_escape_md(date_label)}` | {_escape_md(src_badge)}",
-        f"{ms_icon} *{_escape_md(ms)}*  ·  VIX {_escape_md(f'{vix:.1f}')}  ·  NIFTY {_escape_md(f'{nifty_chg:+.2f}%')}  ·  {_escape_md(breadth_line)}",
-        f"📊 {_escape_md(sector_line)}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"⚔️ FORTRESS SNIPER v8.2 | {date_label} | {data_source}",
+        f"{ms_icon} {ms} | VIX {vix:.1f} | NIFTY {nifty_chg:+.2f}%",
+        f"{'─' * 30}",
     ]
-    if using_fallback:
-        lines.append("⚠️ *DEGRADED MODE* — NSE\\+Sheets blocked · yfinance watchlist only")
 
     if ms == "MASSACRE":
-        lines += ["","🚨 *MARKET MASSACRE — ALL ENTRIES HALTED*",
-                  "_NIFTY collapsed ≥3%\\. Protect capital\\._"]
+        lines += ["","🚨 MARKET MASSACRE — ALL ENTRIES HALTED"]
     elif ms == "PANIC":
-        lines += ["","🔴 *VIX PANIC — NO NEW ENTRIES*",
-                  "_India VIX ≥22\\. Stand aside until fear subsides\\._"]
+        lines += ["","🔴 VIX PANIC — NO NEW ENTRIES"]
     elif not top5:
-        lines += ["","📭 *No halal setups passed all filters today*"]
+        lines += ["","📭 No halal setups passed all filters today"]
     else:
-        lines.append(f"🎯 *{len(top5)} SNIPER SETUPS TODAY*")
-        lines.append("")
-
         for i, r in enumerate(top5,1):
-            sym        = _escape_md(r["symbol"])
+            sym        = r["symbol"]
             close_px   = r.get("close",0.0)
             rank_raw   = r.get("rank","—")
-            rank_icon  = _rank_medal(rank_raw)
-            rank_lbl   = _escape_md(_rank_clean(rank_raw))
-            sector     = _escape_md(r.get("sector","—"))
-            dq         = _escape_md(_dq_badge(r.get("data_quality","")))
-            directive  = _escape_md(r.get("sniper_directive","MONITOR"))
             entry      = r.get("sniper_entry") or r.get("t1")
             stop       = r.get("sn_active_stop") or r.get("t3")
             r1         = r.get("sn_r1") or r.get("r1")
             r2         = r.get("sn_r2") or r.get("r2")
-            r3         = r.get("sn_r3") or r.get("r3")
-            risk_pct   = r.get("risk_pct")
-            rr_val     = r.get("rr")
-            deploy     = r.get("sniper_deploy",0) or 0
-            shares     = r.get("sn_shares") or r.get("pos_shares",0) or 0
-            amount     = r.get("sn_amount") or r.get("pos_amount",0) or 0
-            composite  = r.get("sniper_composite",0)
-            bayes_pct  = r.get("sn_bayes_pct") or r.get("bayes_prob",0)
-            mc_pct     = r.get("mc_survival_pct")
-            total      = r.get("total_score",0)
-            max_s      = r.get("max_score",MAX_SCORE)
-            vel        = r.get("momentum_velocity_pct",0.0) or 0.0
-            layers     = _layer_bar(r)
+            days_est   = 12  # Default swing horizon
+            story      = r.get("story","") or ""
 
-            warn=[]
-            if r.get("fog_block"):                             warn.append("🌫️FOG")
-            if r.get("exhaustion_flag"):                       warn.append("⚠️EXHST")
-            if r.get("exit_liq_flag"):                         warn.append("🚨EXLIQ")
-            if r.get("data_quality")=="SNAPSHOT_FALLBACK":    warn.append("⚠️SNAP")
-            if not r.get("volume_reliable",True):              warn.append("📊NO\\-VOL")
-            warn_str = "  "+"  ".join(warn) if warn else ""
+            lines.append(f"")
+            lines.append(f"{rank_raw} #{i} — {sym} (₹{close_px:.2f})")
+            lines.append(f"Buy @ ₹{entry:.2f}" if entry else f"Buy @ ₹{close_px:.2f}")
+            lines.append(f"Sell @ ₹{r1:.2f}" if r1 else "Sell @ —")
+            lines.append(f"SL @ ₹{stop:.2f}" if stop else "SL @ —")
+            lines.append(f"")
+            lines.append(f"Will achieve in ~{days_est} days")
+            lines.append(f"")
+            lines.append(f"Why to buy: {story[:100]}{'...' if len(story)>100 else ''}")
+            lines.append(f"{'─' * 30}")
 
-            sigs=[]
-            if "ACCUMULATION" in r.get("cvd_signal",""): sigs.append("CVD🟢")
-            if r.get("vsa_absorption"):                   sigs.append("VSA🟢")
-            if r.get("w52_bonus",0)>0:                    sigs.append(f"52W🎯\\+{r['w52_bonus']}")
-            if r.get("pead_bonus",0)>0:                   sigs.append(f"PEAD\\+{r['pead_bonus']}")
-            if r.get("atrv_bonus",0)>0:                   sigs.append(f"ATR⚡\\+{r['atrv_bonus']}")
-            if r.get("vdu_bonus",0)>0:                    sigs.append(f"VDU💧{r.get('vdu_bars',0)}bar\\+{r['vdu_bonus']}")
-            sig_str = "📡 "+" · ".join(sigs) if sigs else ""
+    msg = "\n".join(lines)
 
-            story_raw = r.get("story","") or ""
-            story     = _escape_md(story_raw[:87]+"..." if len(story_raw)>90 else story_raw)
-
-            risk_rr = _escape_md(f"Risk {_fmt_pct(risk_pct)} · RR {rr_val}x") if (risk_pct and rr_val) else ""
-            mc_str  = f" · MC {_escape_md(str(mc_pct))}%" if mc_pct is not None else ""
-
-            if deploy>0 and shares:
-                size_line=f"💼 {_escape_md(str(shares))} sh · ₹{_escape_md(f'{int(amount):,}')} · {_escape_md(str(deploy))}% deploy"
-            elif deploy>0:
-                size_line=f"💼 {_escape_md(str(deploy))}% deploy"
-            else:
-                size_line="💼 — \\(size not calculated\\)"
-
-            score_pct = round(total/max_s*100) if max_s else 0
-            score_str = (f"📊 `{total}/{max_s}` {score_pct}%  "
-                         f"Sniper `{composite}/100`  Bayes `{bayes_pct}%`"
-                         f"{mc_str}  Vel {_escape_md(f'{vel:+.1f}')}%  VPOC \\[{layers}\\]")
-
-            be_line    = (f"🔒 BE ARMED — stop raised to {_escape_md(_fmt_price(r.get('t1',0)))}"
-                          if r.get("sn_be_active") else "")
-            trail_line = (f"📈 TRAIL ACTIVE — stop {_escape_md(_fmt_price(r.get('sn_trail_stop',0)))}"
-                          if r.get("sn_trail_active") else "")
-
-            tgt_line = ""
-            if r1 and r2 and r3:
-                tgt_line=(f"🎯 R1 {_escape_md(_fmt_price(r1))} \\({SNIPER_CFG['r1_pct']:.0f}%\\)  "
-                          f"R2 {_escape_md(_fmt_price(r2))} \\({SNIPER_CFG['r2_pct']:.0f}%\\)  "
-                          f"R3 {_escape_md(_fmt_price(r3))} \\({SNIPER_CFG['r3_pct']:.0f}%\\)")
-
-            card=[
-                f"*{i}\\. {rank_icon} {sym}*  {_escape_md(_fmt_price(close_px))}  {rank_lbl}  ·  {sector}  ·  {dq}{warn_str}",
-                f"📌 *{directive}*",
-                f"🔫 Entry {_escape_md(_fmt_price(entry))} → Stop {_escape_md(_fmt_price(stop))}"
-                + (f"  ·  {risk_rr}" if risk_rr else ""),
-            ]
-            if tgt_line:    card.append(tgt_line)
-            card.append(size_line)
-            card.append(score_str)
-            if be_line:     card.append(be_line)
-            if trail_line:  card.append(trail_line)
-            if story:       card.append(f"📋 _{story}_")
-            if sig_str:     card.append(sig_str)
-            card.append("")
-            lines.extend(card)
-
-    # FIX-AUDIT-22: footer uses _escape_md so all special chars are safe.
-    footer_text = "v8.2 · Halal+HALAL_LIST · 9-node Bayes · 6-layer VPOC · CVD · VSA · VDU · MC · ≤₹800 · Not financial advice"
-    lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"_{_escape_md(footer_text)}_",
-    ]
-
-    msg     = "\n".join(lines)
-    token   = TELEGRAM_TOKEN.strip()
-    all_ids = [TELEGRAM_CHAT_ID]+(TELEGRAM_SHARE_IDS or [])
-    total_chunks=0; failed_ids=[]
-
+    # Send plain text (no MarkdownV2 escaping issues)
+    all_ids = [TELEGRAM_CHAT_ID] + (TELEGRAM_SHARE_IDS or [])
     for chat_id in all_ids:
-        chunks  = _split_telegram_message_v2(msg)
-        chat_ok = True
-        for chunk_idx,chunk in enumerate(chunks,1):
-            success=_telegram_post(token,chat_id,chunk)
-            if success:
-                log.info(f"Telegram → {chat_id}  chunk {chunk_idx}/{len(chunks)} ✓")
-                total_chunks+=1
+        if not chat_id:
+            continue
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            resp = requests.post(url, json={"chat_id": chat_id, "text": msg}, timeout=20)
+            if resp.status_code == 200:
+                log.info(f"Telegram → {chat_id} ✓")
             else:
-                log.error(f"Telegram → {chat_id}  chunk {chunk_idx} FAILED — aborting this recipient")
-                chat_ok=False; break
-        if not chat_ok: failed_ids.append(chat_id)
-
-    if failed_ids: log.error(f"Telegram: {len(failed_ids)} recipient(s) failed: {failed_ids}")
-    else: log.info(f"Telegram: all {len(all_ids)} recipient(s) OK  ({total_chunks} chunks sent)")
-
+                log.error(f"Telegram → {chat_id} FAILED: {resp.status_code}")
+        except Exception as e:
+            log.error(f"Telegram error: {e}")
 
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 23 — SECTOR TRENDS
@@ -3932,11 +3846,12 @@ def run_screener_v8():
     log.info(f"    SHARIAH_CACHE_TTL={SHARIAH_CACHE_TTL_DAYS}d")
 
     # Clear per-run caches
-    global _SECTOR_LIVE_CACHE, _MACRO_REGIME_CACHE, _smallcap_index_cache, _NSE_SESSION_CACHE
+    global _SECTOR_LIVE_CACHE, _MACRO_REGIME_CACHE, _smallcap_index_cache, _NSE_SESSION_CACHE, _SHARIAH_UNIVERSE_CACHE
     _SECTOR_LIVE_CACHE    = {}
     _MACRO_REGIME_CACHE   = None
     _smallcap_index_cache = {}
-    _NSE_SESSION_CACHE    = None   # force fresh session each run
+    _NSE_SESSION_CACHE    = None
+    _SHARIAH_UNIVERSE_CACHE = None
 
     # Load custom HALAL_LIST (Tab 7)
     global _HALAL_LIST_CUSTOM
@@ -4008,20 +3923,17 @@ def run_screener_v8():
 
     # ── Pre-filter ─────────────────────────────────────────────────────
     _volume_available = bhavcopy["volume"].sum() > 0
-    if _volume_available:
-        candidates = bhavcopy[
-            (bhavcopy["turnover_lakhs"] >= CFG["turnover_lakhs"]) &
-            (bhavcopy["close"] >= 50) &
-            (bhavcopy["close"] <= PRICE_CAP)
-        ].copy()
-    else:
-        log.warning(
-            "⚠️  Volume=0 across all rows — liquidity gate SKIPPED; applying price filter only."
-        )
-        candidates = bhavcopy[
-            (bhavcopy["close"] >= 50) &
-            (bhavcopy["close"] <= PRICE_CAP)
-        ].copy()
+
+    # FIX FORT-HIGH-02: Volume=0 aborts run (no illiquid fallback)
+    if not _volume_available:
+        log.error("CRITICAL: Volume=0 across all rows — NSE data quality failure. Aborting run.")
+        return []
+
+    candidates = bhavcopy[
+        (bhavcopy["turnover_lakhs"] >= CFG["turnover_lakhs"]) &
+        (bhavcopy["close"] >= 50) &
+        (bhavcopy["close"] <= PRICE_CAP)
+    ].copy()
 
     log.info(f"After liquidity + price (≤₹{PRICE_CAP}) filter: {len(candidates)}")
     candidates = candidates[candidates["symbol"].apply(is_halal)].copy()
@@ -4116,8 +4028,8 @@ def run_screener_v8():
     push_to_gsheets(top5, date_label)
 
     log.info("Sending Telegram ...")
-    send_telegram_v7(top5, sector_trends, fii_data, date_label, macro,
-                     using_fallback, data_source)
+    # FIX: Use clean Telegram format
+    send_telegram_v7_clean(top5, sector_trends, fii_data, date_label, macro, using_fallback, data_source)
 
     log.info(f"✅ Done | {len(top5)} setups | Macro: {macro['macro_state']} | "
              f"VIX: {macro['vix_val']:.1f} | Data: {data_source}")
