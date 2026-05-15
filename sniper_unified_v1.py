@@ -2035,139 +2035,181 @@ def assemble_pick(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 14 — TELEGRAM (single send, plain-text safe, MarkdownV2 clean)
+# SECTION 14 — TELEGRAM (ultra-compact, plain English)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _escape(s) -> str:
-    """Escape Telegram MarkdownV2 special chars (FIX-AUDIT-01)."""
     text = str(s) if s is not None else ""
     special = r'\_*[]()~`>#+-=|{}.!'
     return "".join(("\\" + ch if ch in special else ch) for ch in text)
 
 
 def _split_msg(msg: str, limit: int = 4000) -> list:
-    """Split at card boundaries, escape-safe hard-split fallback."""
     if len(msg) <= limit:
         return [msg]
-    cards  = msg.split("\n\n"); chunks=[]; cur=""
+    cards = msg.split("\n\n"); chunks = []; cur = ""
     for card in cards:
-        blk = card+"\n\n"
-        if len(cur)+len(blk)>limit:
+        blk = card + "\n\n"
+        if len(cur) + len(blk) > limit:
             if cur.strip(): chunks.append(cur.rstrip())
             cur = blk
         else:
             cur += blk
     if cur.strip(): chunks.append(cur.rstrip())
-    result=[]
-    for chunk in chunks:
-        while len(chunk)>limit:
-            at=limit
-            for off in range(0,min(20,at)):
-                pos=at-off
-                if pos>0 and chunk[pos-1]=="\\": continue
-                chunk_head,chunk=chunk[:pos],chunk[pos:]
-                if chunk_head.strip(): result.append(chunk_head)
-                break
-            else:
-                result.append(chunk[:limit]); chunk=chunk[limit:]
-        if chunk.strip(): result.append(chunk)
-    return result
+    return chunks
 
 
 def _tg_post(token: str, chat_id: str, text: str) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    for attempt,delay in enumerate([0,2,5],1):
+    for attempt, delay in enumerate([0, 2, 5], 1):
         if delay: time.sleep(delay)
         try:
-            r=requests.post(url, json={"chat_id":chat_id,"text":text}, timeout=20)
-            if r.status_code==200: return True
-            if r.status_code==429:
-                ra=int(r.headers.get("Retry-After",5)); time.sleep(ra); continue
-            log.error(f"Telegram {r.status_code} → {chat_id}: {r.text[:100]}")
+            r = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=20)
+            if r.status_code == 200: return True
+            if r.status_code == 429:
+                time.sleep(int(r.headers.get("Retry-After", 5))); continue
         except Exception as e:
             log.error(f"Telegram attempt {attempt}: {e}")
     return False
 
 
+def _grade_plain(grade: str) -> str:
+    return {
+        "⚔️ APEX": "STRONG",
+        "💎 PRISTINE": "STRONG",
+        "🟢 GOOD": "DECENT",
+        "🔵 PROBE": "WEAK",
+    }.get(grade, grade)
+
+
+def _verdict_plain(r: dict) -> str:
+    """Only SKIP or GO. No 'SMALL' verdict."""
+    problems = []
+    
+    if r.get("fog_block"):
+        return "⛔ SKIP — Market too foggy. Stay out."
+    
+    if not r.get("vol_reliable", True):
+        problems.append("volume data missing")
+    if r.get("vcp_coil", "").startswith("LOOSE"):
+        problems.append("price too volatile")
+    if r["risk_pct"] > 10:
+        problems.append(f"stop too far at {r['risk_pct']:.0f}%")
+    if r.get("earn_days") is not None and 0 <= r["earn_days"] <= 5:
+        problems.append(f"earnings in {r['earn_days']}d")
+    if r.get("alloc_note", "").startswith(" ⚠️ CB"):
+        problems.append("small-cap safety lock ON")
+    
+    if problems:
+        return "⛔ SKIP — " + "; ".join(problems[:2]) + ". Not safe."
+    
+    # No problems = GO
+    if r["fused"] >= 72:
+        return "✅ GO — Full position."
+    if r["fused"] >= 60:
+        return "✅ GO — Normal position."
+    return "✅ GO — Small test only."
+
+
+def _why_plain(r: dict) -> str:
+    """Ultra-short why."""
+    parts = []
+    
+    fii = r.get("fii_label", "")
+    if "FII+DII" in fii and "BUYING" in fii:
+        parts.append("institutions buying")
+    elif "FII" in fii and "BUYING" in fii:
+        parts.append("foreign investors buying")
+    elif "DII" in fii and "BUYING" in fii:
+        parts.append("domestic investors buying")
+    
+    ins = r.get("ins_detail", "")
+    if ins and "buy" in ins.lower() and r.get("score_insider", 0) >= 10:
+        parts.append("insiders buying")
+    
+    fil = r.get("fil_detail", "")
+    if fil and "No recent" not in fil and r.get("score_filing", 0) >= 20:
+        if "dividend" in fil.lower(): parts.append("dividend coming")
+        elif "bonus" in fil.lower(): parts.append("bonus shares")
+        elif "buyback" in fil.lower(): parts.append("buyback")
+        else: parts.append("good news")
+    
+    if r.get("layer1"): parts.append("at support")
+    if r.get("layer2"): parts.append("heavy volume")
+    if r.get("layer3"): parts.append("support holding")
+    
+    pat = r.get("pat_label", "")
+    if "VCP" in pat: parts.append("coil forming")
+    if "Cup" in pat: parts.append("cup pattern")
+    
+    div = r.get("div_label", "")
+    if "BULLISH" in div: parts.append("hidden buy signal")
+    
+    whale = r.get("whale_label", "")
+    if "Stealth" in whale: parts.append("smart money sneaking")
+    elif "Accumulation" in whale: parts.append("big buyers accumulating")
+    
+    bayes = r.get("bayes_pct", 0)
+    if bayes >= 75: parts.append(f"AI {bayes}% sure")
+    elif bayes >= 60: parts.append(f"AI {bayes}% confident")
+    
+    if not parts:
+        return "Some confluence"
+    
+    return " + ".join(parts[:3])
+
+
 def send_telegram(picks: list, macro: dict, fii_data: dict,
                    date_label: str, data_source: str):
-    """One clean message per pick — plain text, no MarkdownV2 parse failures."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.info("Telegram not configured — skipping"); return
 
-    ms      = macro.get("macro_state","CHOP")
-    vix     = macro.get("vix_val",0.0)
-    nchg    = macro.get("nifty_chg",0.0)
-    ms_icon = {"CLEAR":"✅","CHOP":"⚠️","PANIC":"🔴","MASSACRE":"🚨"}.get(ms,"↔")
+    ms = macro.get("macro_state", "CHOP")
 
-    header_lines = [
-        f"⚔️ UNIFIED SNIPER {VERSION} | {date_label} | {data_source}",
-        f"{ms_icon} {ms} | VIX {vix:.1f} | NIFTY {nchg:+.2f}%",
-        f"{fii_data.get('label','—')} | {fii_data.get('detail','—')[:50]}",
-        "─" * 34,
+    lines = [
+        f"Bismillah ⚔️ SNIPER {VERSION} | {date_label}",
+        "────────────────────────────",
     ]
 
     if ms == "MASSACRE":
-        header_lines.append("\n🚨 MARKET MASSACRE — ALL ENTRIES HALTED. Capital preservation mode.")
+        lines.extend(["", "🚨 MARKET CRASH — NO TRADES TODAY."])
     elif ms == "PANIC":
-        header_lines.append("\n🔴 VIX PANIC — NO NEW ENTRIES.")
+        lines.extend(["", "🔴 MARKET PANIC — NO NEW TRADES."])
     elif not picks:
-        header_lines.append("\n📭 No halal setups cleared all filters today.\nThis is the system working correctly.")
+        lines.extend(["", "📭 No setups today. Patience is profit."])
     else:
-        for i,r in enumerate(picks,1):
-            sym    = r["symbol"]
-            grade  = r["grade"]
-            fused  = r["fused"]
-            close  = r["close"]
-            stop   = r["stop_loss"]
-            r1_p   = r["r1"]
-            r2_p   = r["r2"]
-            r1_pct = r["r1_pct"]
-            days   = r["days_to_r1_est"]
-            story  = r["story"]
-            mc_s   = r["mc_survival"]
-            layers = "".join("✓" if r.get(f"layer{n}") else "✗" for n in range(1,4))
-
+        for i, r in enumerate(picks, 1):
+            sym = r["symbol"]
+            grade_plain = _grade_plain(r["grade"])
+            verdict = _verdict_plain(r)
+            why = _why_plain(r)
+            
+            dot = "🟢" if verdict.startswith("✅") else "🔴"
+            
             block = [
                 "",
-                f"{grade} #{i} — {sym} (₹{close:.2f})",
-                f"Fused {fused}/100 | Fort {r['fort_pct']:.0f}% | APEX {r['apex_composite']}/100",
-                f"Buy  ₹{r['buy_lo']:.2f} – ₹{r['buy_hi']:.2f}",
-                f"SL   ₹{stop:.2f}  (risk {r['risk_pct']}%)",
-                f"R1   ₹{r1_p:.2f} (+{r1_pct}%)  → sell 30%",
-                f"R2   ₹{r2_p:.2f} (+{r['r2_pct']}%)  → sell 30%",
-                f"R3   ₹{r['r3']:.2f} (+{r['r3_pct']}%)  → sell 40%",
-                f"Trail ₹{r['trail_stop']:.2f}  (arms at R2)",
-                f"",
-                f"Est. ~{days}d to R1 | MC survive {mc_s}%",
-                f"VPOC layers {layers} | {r.get('regime','—')} | VCP {r.get('vcp_coil','—')[:5]}",
-                f"RSI {r['rsi']} | MFI {r['mfi']} | ADX {r['adx']} | ATR ₹{r['atr14']}",
-                f"Bayes {r['bayes_pct']}% | Whale {r['whale_score']:.0f}/100 | Div {r['div_score']:.0f}/100",
-                f"",
-                f"Why: {story[:120]}{'...' if len(story)>120 else ''}",
+                f"{dot} {sym}  ₹{r['close']:.0f}  |  {grade_plain}  |  Score {r['fused']}/100",
+                f"Buy: ₹{r['buy_lo']:.0f}–₹{r['buy_hi']:.0f}  |  Stop: ₹{r['stop_loss']:.0f} ({r['risk_pct']:.0f}%)  |  Re-Buy ₹{r['trail_stop']:.0f}",
+                f"Sell: ₹{r['r1']:.0f}→30%  |  ₹{r['r2']:.0f}→30%  |  ₹{r['r3']:.0f}→40%",
+                f"Why: {why}",
+                f"Verdict: {verdict}",
+                "────────────────────────────",
             ]
-            if r.get("alloc_note"): block.append(r["alloc_note"][:80])
-            if r.get("fog_label"):  block.append(f"⚠️ {r['fog_label'][:60]}")
-            if not r.get("vol_reliable",True): block.append("⚠️ Volume data unreliable — VPOC layers L1/L2 suppressed")
-            block.append("─" * 34)
-            header_lines.extend(block)
+            lines.extend(block)
 
-    footer_lines = [
+    lines.extend([
         "",
-        f"🔎 Screened halal candidates → {len(picks)} setup(s)",
-        f"Shariah compliant | {MC_HORIZON}-day swing | Risk {ACCOUNT_RISK_PCT*100:.1f}% per trade",
-        "🤲 Bismillah — trade with discipline and tawakkul",
-    ]
+        f"🔎 Found {len(picks)} setup(s) | {MC_HORIZON}-day hold | Risk {ACCOUNT_RISK_PCT*100:.1f}%/trade",
+    ])
 
-    full_msg = "\n".join(header_lines + footer_lines)
-    targets  = [TELEGRAM_CHAT_ID] + TELEGRAM_SHARE_IDS
+    full_msg = "\n".join(lines)
+    targets = [TELEGRAM_CHAT_ID] + TELEGRAM_SHARE_IDS
 
     for msg_part in _split_msg(full_msg):
         for chat_id in targets:
             if not chat_id: continue
             _tg_post(TELEGRAM_TOKEN, chat_id, msg_part)
             time.sleep(0.3)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 15 — OUTPUT: EXCEL, HTML, GOOGLE SHEETS
