@@ -196,7 +196,7 @@ _SECTOR_YF_CALLS     = 0
 # ══════════════════════════════════════════════════════════════════════════════
 
 LLM_API_KEY      = os.getenv("ANTHROPIC_API_KEY", "")
-LLM_MODEL        = os.getenv("LLM_MODEL", "claude-sonnet-4.6")  # Default: cheapest capable model
+LLM_MODEL        = os.getenv("LLM_MODEL", "claude-sonnet-4-20250514")  # Default: cheapest capable model
 LLM_MAX_TOKENS   = int(os.getenv("LLM_MAX_TOKENS", "512"))
 LLM_ENABLED      = bool(LLM_API_KEY)  # Auto-disable if no key
 
@@ -937,7 +937,10 @@ def _nse_json(sess: requests.Session, url: str, params: dict = None, timeout: in
     body = resp.text.strip()
     if not body or body.startswith("<"):
         raise ValueError(f"NSE empty/HTML body ({resp.status_code}) for {url}")
-    return resp.json()
+    try:
+        return resp.json()
+    except ValueError as e:
+        raise ValueError(f"NSE JSONDecodeError for {url}: {e}") from e
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1363,7 +1366,10 @@ def _validate_no_lookahead(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "date" not in df.columns:
         return df
     df    = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    # Make today tz-aware if the dataframe's date column is tz-aware (yfinance returns UTC)
     today = pd.Timestamp(datetime.today().date())
+    if not df.empty and hasattr(df["date"].dtype, "tz") and df["date"].dt.tz is not None:
+        today = today.tz_localize(df["date"].dt.tz)
     # Layer 1: remove future rows
     df = df[df["date"] <= today].copy()
     # Layer 2: remove today's unclosed bar (score on confirmed, closed candles only)
@@ -2458,46 +2464,6 @@ def _walkforward_engine_correlation(days: int = 90) -> dict:
 
 
 
-def _walkforward_engine_correlation(days: int = 90) -> dict:
-    """
-    Correlate each sub-engine score with realized P&L from closed picks.
-    Returns: {engine_name: {spearman_r, p_value, edge_status, n}}
-    edge_status: 'GENUINE' | 'NOISE' | 'MARGINAL' | 'INSUFFICIENT'
-    """
-    try:
-        import scipy.stats as stats
-        con = sqlite3.connect(DB_PATH)
-        rows = con.execute(
-            "SELECT whale_score, div_score, vp_score, pat_score, bayes_pct, pnl_pct, status "
-            "FROM pick_outcomes WHERE status IN ('r1_hit','r2_hit','r3_hit','stopped','expired') "
-            "AND run_date > ?",
-            ((datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d"),)
-        ).fetchall()
-        con.close()
-
-        if len(rows) < 15:
-            return {"status": "INSUFFICIENT", "message": f"Only {len(rows)} closed picks (< 15)"}
-
-        results = {}
-        engines = [("whale_radar", 0), ("divergence", 1), ("vol_profile", 2), ("pattern", 3), ("bayesian", 4)]
-
-        for name, idx in engines:
-            scores = [r[idx] for r in rows]
-            pnls = [r[5] for r in rows]
-
-            if len(set(scores)) < 3:
-                results[name] = {"r": 0.0, "p": 1.0, "status": "NOISE", "n": len(rows)}
-                continue
-
-            r, p = stats.spearmanr(scores, pnls)
-            status = "GENUINE" if r > 0.3 and p < 0.10 else "NOISE" if r < 0.1 else "MARGINAL"
-            results[name] = {"r": round(r, 3), "p": round(p, 3), "status": status, "n": len(rows)}
-
-        return results
-    except Exception as e:
-        log.debug(f"Walkforward correlation: {e}")
-        return {"status": "ERROR", "message": str(e)}
-
 def _calibrate_bayes_priors() -> dict:
     """
     Read pick_outcomes table, group by which Bayesian nodes were true/false,
@@ -3554,7 +3520,23 @@ def save_excel(picks: list, all_results: list, fii_data: dict, date_label: str, 
                 "Alert": "SHRUNK" if (data_source == "YFINANCE" and len(bhavcopy) <= 100) else "OK"
             }])
             quality.to_excel(w, sheet_name="Data Quality", index=False)
-            
+
+            # Performance sheet: closed pick outcomes from DB (moved inside ExcelWriter context)
+            try:
+                con = sqlite3.connect(DB_PATH)
+                perf_rows = con.execute(
+                    "SELECT run_date, symbol, grade, fused_score, status, exit_price, pnl_pct, days_held, hit_target "
+                    "FROM pick_outcomes WHERE status!='open' ORDER BY run_date DESC LIMIT 100"
+                ).fetchall()
+                con.close()
+                if perf_rows:
+                    perf_df = pd.DataFrame(perf_rows, columns=[
+                        "Date", "Symbol", "Grade", "Score", "Status", "Exit", "P&L%", "Days", "Hit"
+                    ])
+                    perf_df.to_excel(w, sheet_name="Performance", index=False)
+            except Exception as pe:
+                log.debug(f"Performance sheet: {pe}")
+
         log.info(f"Excel saved: {EXCEL_PATH}")
     except Exception as e:
         log.error(f"Excel save failed: {e}")
@@ -4208,7 +4190,22 @@ def run():
         )
         return fii_task, ins_task, fil_task, earn_task
 
-    fii_data, insider_map, filings, earn_cal = asyncio.run(_fetch_intelligence_async())
+    # Safe asyncio runner: if an event loop is already running (Jupyter, FastAPI,
+    # pytest-asyncio), asyncio.run() raises RuntimeError. In that case, we spin
+    # up a dedicated background thread with its own event loop instead.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is None:
+        fii_data, insider_map, filings, earn_cal = asyncio.run(_fetch_intelligence_async())
+    else:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+            future = _pool.submit(asyncio.run, _fetch_intelligence_async())
+            fii_data, insider_map, filings, earn_cal = future.result()
+
     log.info(f"FII/DII: {fii_data['label']} | Insider: {len(insider_map)} symbols | "
              f"Filings: {len(filings)} | Earnings: {len(earn_cal)} events")
 
@@ -4405,23 +4402,7 @@ def run():
         log.info(f"       Buy ₹{r['buy_lo']}-{r['buy_hi']} | SL ₹{r['stop_loss']} | "
                  f"R1 ₹{r['r1']} | R2 ₹{r['r2']} | MC {r['mc_survival']}%")
         log.info(f"       {r['story'][:80]}")
-    # NEW: Outcome Performance sheet
-    try:
-        con = sqlite3.connect(DB_PATH)
-        perf_rows = con.execute(
-            "SELECT run_date, symbol, grade, fused_score, status, exit_price, pnl_pct, days_held, hit_target "
-            "FROM pick_outcomes WHERE status!='open' ORDER BY run_date DESC LIMIT 100"
-        ).fetchall()
-        con.close()
-        
-        if perf_rows:
-            perf_df = pd.DataFrame(perf_rows, columns=[
-                "Date","Symbol","Grade","Score","Status","Exit","P&L%","Days","Hit"
-            ])
-            perf_df.to_excel(w, sheet_name="Performance", index=False)
-    except Exception as e:
-        log.debug(f"Performance sheet: {e}")
-    # 8. Outputs
+    # 8. Outputs  (Performance sheet is now written inside save_excel)
     log.info("Saving Excel…");       save_excel(top_picks, results, fii_data, date_label, data_source, bhavcopy)
     log.info("Saving HTML…");        save_html(top_picks, fii_data, date_label)
     log.info("Calibrating Bayes priors…"); _calibrate_bayes_priors()
