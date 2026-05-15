@@ -2642,7 +2642,7 @@ def run():
     """
     _init_db()
     _, date_label = _get_last_trading_day()
- ═════════════════════════════════════════════════════════════════
+#  ═════════════════════════════════════════════════════════════════
     # FEEDBACK LOOP (run first — update yesterday before scoring today)
     # ═════════════════════════════════════════════════════════════════
     _run_outcome_engine()      # Check what happened to yesterday's picks
