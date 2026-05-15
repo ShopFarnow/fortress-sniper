@@ -263,35 +263,124 @@ def _llm_call(prompt: str, prompt_type: str, max_tokens: int = None) -> Optional
     return None
 
 
-def _llm_filing_sentiment(subject: str, symbol: str = "") -> dict:
+def _llm_alpha_mine(subject: str, symbol: str = "") -> dict:
     """
-    Use LLM to analyze filing subject line sentiment.
-    Returns: {"score": 0-30, "detail": str, "sentiment": str}
-    Falls back to keyword-based if LLM disabled.
+    Extract continuous numerical factors from filing text.
+    Returns standardized factors for direct mathematical integration.
+    Separated from structured_reasoning (which evaluates internal signal coherence).
     """
     if not LLM_ENABLED:
-        return {"score": None, "detail": None, "sentiment": "LLM_DISABLED"}
+        return {"score": None, "factors": {}, "source": "LLM_DISABLED"}
 
-    prompt = "Analyze this Indian stock corporate filing for sentiment:\n"
-    prompt += f"Symbol: {symbol}\nSubject: {subject}\n\n"
-    prompt += "Rate sentiment (POSITIVE/NEGATIVE/NEUTRAL) and explain in 1 sentence.\n"
-    prompt += "Also give a score 0-30 where 20+ is clearly positive, <10 is negative.\n"
-    prompt += "Format: SCORE|X|SENTIMENT|Y|REASON|Z"
+    cache_key = f"alpha_mine:{symbol}:{_llm_hash(subject)}"
+    cached = _llm_cached(cache_key, "alpha_mine")
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
 
-    result = _llm_call(prompt, "sentiment")
+    prompt = """Analyze this Indian corporate filing. Extract exactly these numerical factors:
+
+
+
+SURPRISE_FACTOR: [-1.0 to 1.0]  # Unexpectedness vs market consensus
+
+CONFIDENCE: [0.0 to 1.0]        # Management certainty in language
+
+URGENCY: [0.0 to 1.0]           # Time-sensitivity implied
+
+SENTIMENT: [-1.0 to 1.0]        # Directional sentiment
+
+MATERIALITY: [0.0 to 1.0]       # Likely price impact magnitude
+
+
+
+Filing: {subject}
+
+Symbol: {symbol}
+
+
+
+Return ONLY as JSON: {{"SURPRISE_FACTOR": X.XX, "CONFIDENCE": X.XX, "URGENCY": X.XX, "SENTIMENT": X.XX, "MATERIALITY": X.XX}}""".format(subject=subject, symbol=symbol)
+
+    result = _llm_call(prompt, "alpha_mine", max_tokens=256)
     if not result:
-        return {"score": None, "detail": None, "sentiment": "LLM_FAILED"}
+        return {"score": None, "factors": {}, "source": "LLM_FAILED"}
 
-    # Parse response
     try:
-        parts = result.split("|")
-        score = int([p for p in parts if p.strip().isdigit()][0])
-        sentiment = [p for p in parts if p in ["POSITIVE","NEGATIVE","NEUTRAL"]][0]
-        reason = parts[-1] if parts else result
-        return {"score": min(30, max(0, score)), "detail": reason.strip(), "sentiment": sentiment}
-    except Exception:
-        return {"score": 15, "detail": result[:80], "sentiment": "PARSE_ERROR"}
+        json_str = result
+        if "```json" in result:
+            json_str = result.split("```json")[1].split("```")[0].strip()
+        elif "```" in result:
+            json_str = result.split("```")[1].split("```")[0].strip()
 
+        factors = json.loads(json_str)
+
+        validated = {}
+        for key, default in [("SURPRISE_FACTOR", 0.0), ("CONFIDENCE", 0.5),
+                              ("URGENCY", 0.5), ("SENTIMENT", 0.0), ("MATERIALITY", 0.5)]:
+            val = factors.get(key, default)
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                val = default
+            if key == "SURPRISE_FACTOR" or key == "SENTIMENT":
+                val = max(-1.0, min(1.0, val))
+            else:
+                val = max(0.0, min(1.0, val))
+            validated[key] = round(val, 2)
+
+        alpha_score = (
+            validated["SURPRISE_FACTOR"] * 0.25 +
+            validated["CONFIDENCE"] * 0.20 +
+            validated["URGENCY"] * 0.15 +
+            validated["SENTIMENT"] * 0.30 +
+            validated["MATERIALITY"] * 0.10
+        ) * 30
+
+        alpha_score = (alpha_score + 15)
+        alpha_score = max(0, min(30, alpha_score))
+
+        result_dict = {
+            "score": round(alpha_score),
+            "factors": validated,
+            "source": "LLM_ALPHA_MINE"
+        }
+
+        _llm_store_cache(cache_key, "alpha_mine", json.dumps(result_dict))
+        return result_dict
+
+    except Exception as e:
+        log.debug(f"LLM alpha mine parse failed for {symbol}: {e}")
+        return {"score": 15, "factors": {}, "source": "PARSE_ERROR"}
+
+
+# Backward compatibility wrapper
+def _llm_filing_sentiment(subject: str, symbol: str = "") -> dict:
+    """
+    DEPRECATED: Use _llm_alpha_mine for new code.
+    Maintains backward compatibility for existing callers.
+    Maps alpha factors to old categorical format.
+    """
+    alpha = _llm_alpha_mine(subject, symbol)
+    score = alpha.get("score", 15)
+    factors = alpha.get("factors", {})
+
+    sentiment = "NEUTRAL"
+    if score >= 20:
+        sentiment = "POSITIVE"
+    elif score <= 10:
+        sentiment = "NEGATIVE"
+
+    detail = f"AlphaMine: SENTIMENT={factors.get('SENTIMENT', 0):.2f}, CONFIDENCE={factors.get('CONFIDENCE', 0):.2f}"
+
+    return {
+        "score": score,
+        "detail": detail,
+        "sentiment": sentiment,
+        "alpha_factors": factors
+    }
 
 def _llm_structured_reasoning(symbol: str, signal_dict: dict) -> Optional[dict]:
     """
@@ -939,6 +1028,24 @@ def _init_db():
             win_rate        REAL,
             updated_at      TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(prior_name, condition)
+        );
+        CREATE TABLE IF NOT EXISTS meta_features (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date        TEXT NOT NULL,
+            symbol          TEXT NOT NULL,
+            whale_score     REAL,
+            div_score       REAL,
+            vp_score       REAL,
+            pat_score      REAL,
+            bayes_pct      REAL,
+            macro_state    TEXT,
+            sector         TEXT,
+            vix_level      REAL,
+            primary_fused_score REAL,
+            outcome_pnl_pct REAL,
+            profitable     INTEGER,
+            created_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(run_date, symbol)
         );
     """)
     # Migration: add status column to positions if absent
@@ -2421,6 +2528,185 @@ def _load_learned_priors() -> Optional[dict]:
         pass
     return None
 
+def _store_meta_features(run_date: str, symbol: str, features: dict):
+    """Store signal vector at entry time for later meta-model training."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """INSERT OR REPLACE INTO meta_features
+            (run_date, symbol, whale_score, div_score, vp_score, pat_score, bayes_pct,
+             macro_state, sector, vix_level, primary_fused_score)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (run_date, symbol.upper(),
+             features.get("whale_score"), features.get("div_score"),
+             features.get("vp_score"), features.get("pat_score"),
+             features.get("bayes_pct"), features.get("macro_state"),
+             features.get("sector"), features.get("vix_level"),
+             features.get("primary_fused_score"))
+        )
+        con.commit(); con.close()
+    except Exception as e:
+        log.debug(f"Meta-features store {symbol}: {e}")
+
+
+def _update_meta_outcomes():
+    """Backfill outcome_pnl_pct and profitable flags from closed pick_outcomes."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute(
+            """SELECT o.run_date, o.symbol, o.pnl_pct,
+                      CASE WHEN o.pnl_pct > 0 THEN 1 ELSE 0 END as profitable
+               FROM pick_outcomes o
+               JOIN meta_features m ON o.run_date = m.run_date AND o.symbol = m.symbol
+               WHERE o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
+               AND m.outcome_pnl_pct IS NULL""").fetchall()
+        for run_date, symbol, pnl, prof in rows:
+            con.execute(
+                "UPDATE meta_features SET outcome_pnl_pct=?, profitable=? WHERE run_date=? AND symbol=?",
+                (pnl, prof, run_date, symbol))
+        con.commit(); con.close()
+        if rows:
+            log.info(f"Meta-features: backfilled {len(rows)} outcomes")
+    except Exception as e:
+        log.debug(f"Meta outcomes update: {e}")
+
+
+def _train_meta_labeler(min_samples: int = 50) -> Optional[object]:
+    """Train RandomForest meta-labeler on historical meta_features."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute(
+            """SELECT whale_score, div_score, vp_score, pat_score, bayes_pct,
+                      macro_state, sector, vix_level, primary_fused_score, profitable
+               FROM meta_features
+               WHERE profitable IS NOT NULL""").fetchall()
+        con.close()
+
+        if len(rows) < min_samples:
+            log.info(f"Meta-labeler: {len(rows)} samples (< {min_samples}) -- skipping training")
+            return None
+
+        import pandas as pd
+        df = pd.DataFrame(rows, columns=[
+            "whale_score","div_score","vp_score","pat_score","bayes_pct",
+            "macro_state","sector","vix_level","primary_fused_score","profitable"])
+
+        df["macro_clear"] = (df["macro_state"] == "CLEAR").astype(int)
+        df["macro_chop"] = (df["macro_state"] == "CHOP").astype(int)
+        df["macro_panic"] = (df["macro_state"].isin(["PANIC","MASSACRE"])).astype(int)
+
+        top_sectors = df['sector'].value_counts().head(6).index.tolist()
+        for sec in top_sectors:
+            col_name = "sec_" + sec.replace(" ", "_")
+            df[col_name] = (df["sector"] == sec).astype(int)
+
+        feature_cols = [c for c in df.columns if c not in ["profitable","macro_state","sector"]]
+        X = df[feature_cols].fillna(0)
+        y = df["profitable"]
+
+        regime_counts = df['macro_state'].value_counts()
+        for regime, count in regime_counts.items():
+            if count < 50:
+                log.warning(f"Meta-labeler: only {count} samples in {regime} regime (< 50)")
+
+        from sklearn.model_selection import train_test_split
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.metrics import brier_score_loss, roc_auc_score
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y)
+
+        base_clf = RandomForestClassifier(
+            n_estimators=200, max_depth=6, min_samples_leaf=5,
+            class_weight="balanced", random_state=42, n_jobs=-1)
+        calibrated_clf = CalibratedClassifierCV(base_clf, method="isotonic", cv=5)
+        calibrated_clf.fit(X_train, y_train)
+
+        y_prob = calibrated_clf.predict_proba(X_test)[:, 1]
+        auc = roc_auc_score(y_test, y_prob)
+        brier = brier_score_loss(y_test, y_prob)
+        log.info(f"Meta-labeler trained: AUC={auc:.3f} | Brier={brier:.3f} | n={len(rows)}")
+
+        return calibrated_clf
+
+    except Exception as e:
+        log.warning(f"Meta-labeler training failed: {e}")
+        return None
+
+
+def _load_meta_model(model_path: str = "meta_model.pkl") -> Optional[object]:
+    """Load cached meta-labeler model if fresh (< 7 days)."""
+    import pickle
+    p = Path(model_path)
+    if not p.exists():
+        return None
+    age_days = (datetime.today() - datetime.fromtimestamp(p.stat().st_mtime)).days
+    if age_days > 7:
+        log.info(f"Meta-model stale ({age_days}d) -- will retrain")
+        return None
+    try:
+        with open(p, "rb") as f:
+            model = pickle.load(f)
+        log.info(f"Meta-model loaded ({age_days}d old)")
+        return model
+    except Exception as e:
+        log.debug(f"Meta-model load failed: {e}")
+        return None
+
+
+def _save_meta_model(model, model_path: str = "meta_model.pkl"):
+    """Persist trained meta-labeler."""
+    import pickle
+    try:
+        with open(model_path, "wb") as f:
+            pickle.dump(model, f)
+        log.info(f"Meta-model saved: {model_path}")
+    except Exception as e:
+        log.debug(f"Meta-model save failed: {e}")
+
+
+def _get_meta_probability(model, features: dict) -> float:
+    """Run meta-model inference on current signal vector. Returns P(profitable)."""
+    if model is None:
+        return 0.55
+    try:
+        import pandas as pd
+        row = {
+            "whale_score": features.get("whale_score", 0),
+            "div_score": features.get("div_score", 0),
+            "vp_score": features.get("vp_score", 0),
+            "pat_score": features.get("pat_score", 0),
+            "bayes_pct": features.get("bayes_pct", 0),
+            "macro_state": features.get("macro_state", "CHOP"),
+            "sector": features.get("sector", "DIVERSIFIED"),
+            "vix_level": features.get("vix_level", 18.0),
+            "primary_fused_score": features.get("primary_fused_score", 0),
+        }
+        df = pd.DataFrame([row])
+        df["macro_clear"] = (df["macro_state"] == "CLEAR").astype(int)
+        df["macro_chop"] = (df["macro_state"] == "CHOP").astype(int)
+        df["macro_panic"] = (df["macro_state"].isin(["PANIC","MASSACRE"])).astype(int)
+
+        top_sectors = ["NIFTY IT", "NIFTY PHARMA", "NIFTY AUTO", "NIFTY FMCG", "NIFTY METAL", "DIVERSIFIED"]
+        for sec in top_sectors:
+            col_name = "sec_" + sec.replace(" ", "_")
+            df[col_name] = (df["sector"] == sec).astype(int)
+
+        expected = model.feature_names_in_ if hasattr(model, "feature_names_in_") else None
+        if expected is not None:
+            for col in expected:
+                if col not in df.columns:
+                    df[col] = 0
+            df = df[expected]
+
+        prob = float(model.predict_proba(df)[0][1])
+        return round(prob, 3)
+    except Exception as e:
+        log.debug(f"Meta-probability inference failed: {e}")
+        return 0.55
+
+
 
 # ── CALIBRATED PRIORS (based on NSE halal mid-cap backtest estimates) ──
 # These are conservative estimates. Replace with your actual backtest results.
@@ -2732,35 +3018,86 @@ def assemble_pick(
     r1_pct=round((r1-close)/close*100,1); r2_pct=round((r2-close)/close*100,1)
     r3_pct=round((r3-close)/close*100,1)
 
-    # ── Kelly-fraction position sizing ─────────────────────────────────
-    def _kelly_fraction(p: float, b: float, max_frac: float = ACCOUNT_RISK_PCT) -> float:
-        """f = (p*b - q) / b, half-Kelly conservative, capped at max_frac."""
-        q = 1.0 - p
-        if b <= 0 or p <= 0 or p >= 1:
-            return max_frac * 0.5
-        raw_kelly = (p * b - q) / b
-        return max(0.0, min(max_frac, raw_kelly * 0.5))
-
-    def _get_avg_win_loss() -> tuple:
-        """Return (avg_win_pct, avg_loss_pct) from closed picks."""
+    # ── Dynamic Position Sizing (Fractional Kelly) ─────────────────────
+    def _get_kelly_inputs(symbol: str, grade: str, sector: str) -> tuple:
+        """Return (empirical_win_rate, avg_win, avg_loss) from matched history."""
         try:
             con = sqlite3.connect(DB_PATH)
-            wins = con.execute(
-                "SELECT AVG(pnl_pct) FROM pick_outcomes WHERE status IN ('r1_hit','r2_hit','r3_hit') AND pnl_pct > 0"
-            ).fetchone()[0]
-            losses = con.execute(
-                "SELECT ABS(AVG(pnl_pct)) FROM pick_outcomes WHERE status IN ('stopped','expired') AND pnl_pct < 0"
-            ).fetchone()[0]
+            rows = con.execute(
+                """SELECT pnl_pct FROM pick_outcomes
+                   WHERE grade=? AND sector=?
+                   AND status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
+                   AND run_date > ?""",
+                (grade, sector, (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d"))
+            ).fetchall()
             con.close()
-            return float(wins or 8.0), float(losses or 4.0)
+
+            if len(rows) < 20:
+                return None, None, None
+
+            pnls = [r[0] for r in rows if r[0] is not None]
+            if not pnls:
+                return None, None, None
+
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p < 0]
+
+            win_rate = len(wins) / len(pnls)
+            avg_win = np.mean(wins) if wins else 0
+            avg_loss = abs(np.mean(losses)) if losses else 0
+
+            return win_rate, avg_win, avg_loss
+        except Exception as e:
+            log.debug(f"Kelly inputs {symbol}: {e}")
+            return None, None, None
+
+    def _kelly_fraction(p: float, b: float, max_frac: float = ACCOUNT_RISK_PCT,
+                        empirical: bool = False, sample_count: int = 0) -> float:
+        """
+        f = (p*b - q) / b, fractional Kelly conservative.
+        If empirical data insufficient (< 100 matched trades), use quarter-Kelly capped at 0.5%.
+        Only scale up to half-Kelly after 100+ matched trades.
+        """
+        q = 1.0 - p
+        if b <= 0 or p <= 0 or p >= 1:
+            return max_frac * 0.25
+
+        raw_kelly = (p * b - q) / b
+        raw_kelly = max(0.0, raw_kelly)
+
+        if not empirical or sample_count < 100:
+            return min(max_frac * 0.25, 0.005)
+        else:
+            return min(max_frac, raw_kelly * 0.5)
+
+    emp_wr, emp_win, emp_loss = _get_kelly_inputs(symbol, grade, sector)
+
+    if emp_wr is not None and emp_loss > 0:
+        b_emp = emp_win / emp_loss if emp_loss > 0 else 2.0
+        p_emp = emp_wr
+        try:
+            con = sqlite3.connect(DB_PATH)
+            count_row = con.execute(
+                """SELECT COUNT(*) FROM pick_outcomes
+                   WHERE grade=? AND sector=?
+                   AND status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
+                   AND run_date > ?""",
+                (grade, sector, (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d"))
+            ).fetchone()
+            con.close()
+            sample_count = count_row[0] if count_row else 0
         except Exception:
-            return 8.0, 4.0
+            sample_count = 0
 
-    avg_win, avg_loss = _get_avg_win_loss()
-    b = avg_win / avg_loss if avg_loss > 0 else 2.0
-    p = bayes["bayes_prob"] if bayes else 0.50
-
-    kelly_frac = _kelly_fraction(p, b, max_frac=ACCOUNT_RISK_PCT)
+        kelly_frac = _kelly_fraction(p_emp, b_emp, max_frac=ACCOUNT_RISK_PCT,
+                                     empirical=True, sample_count=sample_count)
+        kelly_source = f"empirical ({sample_count} samples)"
+    else:
+        b_default = 2.0
+        p_default = 0.45
+        kelly_frac = _kelly_fraction(p_default, b_default, max_frac=ACCOUNT_RISK_PCT,
+                                     empirical=False, sample_count=0)
+        kelly_source = "default (insufficient history)"
 
     rps = max(close - stop_loss, close * 0.02)
     risk_r = ACCOUNT_EQUITY * kelly_frac
@@ -2772,9 +3109,10 @@ def assemble_pick(
     sh_f = min(math.floor(sh_v * deploy),
                math.floor(ACCOUNT_EQUITY * 0.10 / close) if close > 0 else 0)
     pos_v = sh_f * close
-    pos_lb = (f"{sh_f} sh × ₹{close:.2f} = ₹{pos_v:,.0f} | Risk ₹{sh_f*rps:,.0f} | Kelly {kelly_frac*100:.2f}%"
+    pos_lb = (f"{sh_f} sh × ₹{close:.2f} = ₹{pos_v:,.0f} | Risk ₹{sh_f*rps:,.0f} | Kelly {kelly_frac*100:.2f}% [{kelly_source}]"
               if sh_f > 0 else "— (below sizing min)")
 
+    # Circuit breaker for small caps
     # Circuit breaker for small caps
     alloc_note = ""
     if close < MAX_PRICE:
@@ -2822,10 +3160,33 @@ def assemble_pick(
         # LLM filing sentiment override if available
         raw_filing = fil_data.get("detail","")
         if raw_filing and "No recent" not in raw_filing:
-            llm_filing = _llm_filing_sentiment(raw_filing, symbol)
+            llm_filing = _llm_alpha_mine(raw_filing, symbol)
             if llm_filing and llm_filing.get("score") is not None:
                 # Blend LLM score with keyword score (30% LLM, 70% keyword)
                 fil_pts = round(fil_pts * 0.7 + llm_filing["score"] * 0.3)
+
+    # ── META-LABELING: Store signal vector + optional veto ──
+    meta_features = {
+        "whale_score": whale_score,
+        "div_score": div_score,
+        "vp_score": vp_score,
+        "pat_score": pat_score,
+        "bayes_pct": bayes["bayes_pct"],
+        "macro_state": macro_state,
+        "sector": sector,
+        "vix_level": vix,
+        "primary_fused_score": fused,
+    }
+    _store_meta_features(
+        datetime.today().strftime("%Y-%m-%d"),
+        symbol, meta_features
+    )
+
+    meta_model = _load_meta_model()
+    meta_prob = _get_meta_probability(meta_model, meta_features)
+    if meta_prob < 0.45:
+        log.info(f"  🚫 {symbol}: Meta-model veto (P(profitable)={meta_prob:.2f} < 0.45)")
+        return None
 
     return {
         "symbol":   symbol,
@@ -3693,6 +4054,12 @@ def run():
     _run_outcome_engine()      # Check what happened to yesterday's picks
     _adjust_sector_multipliers()  # Adjust sector weights based on results
     _alert_open_positions()    # Warn if any open pick near stop
+
+    # META-LABELER: Backfill outcomes + train/retrain model
+    _update_meta_outcomes()
+    meta_model = _train_meta_labeler(min_samples=50)
+    if meta_model:
+        _save_meta_model(meta_model)
 
     log.info("=" * 70)
     log.info(f"⚔️  UNIFIED SNIPER {VERSION} | {date_label}")
