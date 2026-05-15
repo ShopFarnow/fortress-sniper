@@ -689,20 +689,35 @@ def _read_sheet(tab: str) -> pd.DataFrame:
 def _push_sheet(tab: str, rows: list):
     """Write list-of-lists to a sheet tab."""
     if not _init_sheets():
+        log.warning(f"Sheets push '{tab}': init failed")
         return
     try:
         ws = _get_ws(tab)
         if ws is None:
-            ws = _GS_WORKBOOK.add_worksheet(title=tab, rows=300, cols=40)
+            log.info(f"Sheets tab '{tab}' not found — creating…")
+            ws = _GS_WORKBOOK.add_worksheet(title=tab, rows=max(300, len(rows)+10), cols=max(40, len(rows[0]) if rows else 40))
             _GS_WS_CACHE[tab] = ws
+            log.info(f"Sheets tab '{tab}' created ✅")
+
+        # Ensure enough rows/cols
+        needed_rows = len(rows)
+        needed_cols = max(len(r) for r in rows) if rows else 1
+
+        # Resize if needed (gspread doesn't auto-resize on update)
+        if needed_rows > ws.row_count or needed_cols > ws.col_count:
+            ws.resize(rows=max(needed_rows + 10, ws.row_count), cols=max(needed_cols + 5, ws.col_count))
+
         ws.clear()
+
+        # Use batch update for reliability
         try:
-            ws.update("A1", rows)
+            ws.update("A1", rows, value_input_option="USER_ENTERED")
         except TypeError:
-            ws.update(rows)
-        log.info(f"Sheets tab '{tab}' updated: {len(rows)-1} rows ✅")
+            ws.update(rows, value_input_option="USER_ENTERED")
+
+        log.info(f"Sheets tab '{tab}' updated: {len(rows)-1} data rows ✅")
     except Exception as e:
-        log.error(f"push_sheet '{tab}': {e}")
+        log.error(f"push_sheet '{tab}' FAILED: {e}")
 
 
 def _read_sheets_halal_list() -> set:
@@ -3026,7 +3041,11 @@ td{{padding:10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-size:13
 
 def _push_performance_tab(date_label: str):
     """Push calibrated win rates by grade/sector/signal to PERFORMANCE tab."""
-    if not _sheets_ok(): return
+    log.info("PERFORMANCE: Starting push…")
+    if not _sheets_ok():
+        log.warning("PERFORMANCE: Sheets not configured — skipping")
+        return
+    log.info("PERFORMANCE: Sheets OK, connecting to DB…")
 
     try:
         con = sqlite3.connect(DB_PATH)
@@ -3062,18 +3081,28 @@ def _push_performance_tab(date_label: str):
         for name, wr, total in prior_rows:
             rows.append(["Prior Calibrated", name, total, int(wr*total), f"{wr*100:.1f}", "—", _BAYES_PRIOR_VERSION])
 
+        # Always push, even if empty (shows headers at minimum)
         _push_sheet("PERFORMANCE", rows)
-        log.info(f"PERFORMANCE tab pushed: {len(rows)-1} rows")
+        log.info(f"PERFORMANCE tab pushed: {len(rows)-1} rows ✅")
+
     except Exception as e:
-        log.debug(f"Performance tab: {e}")
+        log.error(f"PERFORMANCE tab FAILED: {e}")
 
 
 def _push_ai_insights_tab(picks: list, date_label: str):
     """Push LLM-enhanced stories and filing analyses to AI_INSIGHTS tab."""
-    if not _sheets_ok(): return
+    log.info("AI_INSIGHTS: Starting push…")
+    if not _sheets_ok():
+        log.warning("AI_INSIGHTS: Sheets not configured — skipping")
+        return
+    log.info(f"AI_INSIGHTS: Sheets OK, processing {len(picks)} picks…")
 
     headers = ["Date","Symbol","Grade","Raw Story","LLM Story","LLM Filing Sentiment","Filing Detail","Prior Version"]
     rows = [headers]
+
+    # If no picks, still push headers so tab isn't empty
+    if not picks:
+        rows.append([date_label, "—", "—", "No picks today", "—", "—", "—", _BAYES_PRIOR_VERSION])
 
     for r in picks:
         rows.append([
@@ -3085,8 +3114,11 @@ def _push_ai_insights_tab(picks: list, date_label: str):
             _BAYES_PRIOR_VERSION
         ])
 
-    _push_sheet("AI_INSIGHTS", rows)
-    log.info(f"AI_INSIGHTS tab pushed: {len(rows)-1} rows")
+    try:
+        _push_sheet("AI_INSIGHTS", rows)
+        log.info(f"AI_INSIGHTS tab pushed: {len(rows)-1} rows ✅")
+    except Exception as e:
+        log.error(f"AI_INSIGHTS tab FAILED: {e}")
 
 
 def push_gsheets(picks: list, date_label: str):
