@@ -2260,13 +2260,13 @@ def push_gsheets(picks: list, date_label: str):
             r["bayes_pct"], r.get("mc_survival","—"),
             r["buy_lo"], r["buy_hi"], r["stop_loss"],
             r["r1"], r["r2"], r["r3"], r["trail_stop"],
-            r["layer1"], r["layer2"], r["layer3"],
+            int(r["layer1"]), int(r["layer2"]), int(r["layer3"]),  # ← FIXED: bool → int (1/0)
             r.get("vcp_coil","—"), r.get("regime","—"),
             r["rsi"], r["mfi"], r["adx"], r["atr14"], r["poc"], r["ma200"],
-            r.get("data_quality","—"), r.get("vol_reliable",True), r.get("story","—"),
+            r.get("data_quality","—"), int(r.get("vol_reliable",True)),  # ← FIXED: bool → int
+            r.get("story","—"),
         ])
     _push_sheet("SCREENER", rows)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 16 — MAIN PIPELINE
