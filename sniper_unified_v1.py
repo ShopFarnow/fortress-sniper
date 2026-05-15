@@ -2642,6 +2642,12 @@ def run():
     """
     _init_db()
     _, date_label = _get_last_trading_day()
+ ═════════════════════════════════════════════════════════════════
+    # FEEDBACK LOOP (run first — update yesterday before scoring today)
+    # ═════════════════════════════════════════════════════════════════
+    _run_outcome_engine()      # Check what happened to yesterday's picks
+    _adjust_sector_multipliers()  # Adjust sector weights based on results
+    _alert_open_positions()    # Warn if any open pick near stop
 
     log.info("=" * 70)
     log.info(f"⚔️  UNIFIED SNIPER {VERSION} | {date_label}")
@@ -2762,7 +2768,22 @@ def run():
         log.info(f"       Buy ₹{r['buy_lo']}-{r['buy_hi']} | SL ₹{r['stop_loss']} | "
                  f"R1 ₹{r['r1']} | R2 ₹{r['r2']} | MC {r['mc_survival']}%")
         log.info(f"       {r['story'][:80]}")
-
+            # NEW: Outcome Performance sheet
+            try:
+                con = sqlite3.connect(DB_PATH)
+                perf_rows = con.execute(
+                    "SELECT run_date, symbol, grade, fused_score, status, exit_price, pnl_pct, days_held, hit_target "
+                    "FROM pick_outcomes WHERE status!='open' ORDER BY run_date DESC LIMIT 100"
+                ).fetchall()
+                con.close()
+                
+                if perf_rows:
+                    perf_df = pd.DataFrame(perf_rows, columns=[
+                        "Date","Symbol","Grade","Score","Status","Exit","P&L%","Days","Hit"
+                    ])
+                    perf_df.to_excel(w, sheet_name="Performance", index=False)
+            except Exception as e:
+                log.debug(f"Performance sheet: {e}")
     # 8. Outputs
     log.info("Saving Excel…");       save_excel(top_picks, results, fii_data, date_label, data_source, bhavcopy)
     log.info("Saving HTML…");        save_html(top_picks, fii_data, date_label)
