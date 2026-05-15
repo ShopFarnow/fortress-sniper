@@ -576,6 +576,18 @@ def _init_db():
             story         TEXT,
             created_at    TEXT DEFAULT CURRENT_TIMESTAMP
         );
+                CREATE TABLE IF NOT EXISTS data_quality (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date            TEXT,
+            data_source         TEXT,
+            bhavcopy_records    INTEGER,
+            halal_universe_size INTEGER,
+            halal_in_bhavcopy   INTEGER,
+            yfinance_shrink     TEXT,
+            missing_halal       INTEGER,
+            alert               TEXT,
+            created_at          TEXT DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     # Migration: add status column to positions if absent
     try:
@@ -2428,7 +2440,25 @@ def run():
 
     log.info(f"\n{'='*70}")
     log.info(f"Screened {len(cands)} | Passed: {len(results)}")
-
+    # ── Log data quality to DB ──
+    try:
+        halal_uni = get_halal_universe()
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            INSERT INTO data_quality (run_date, data_source, bhavcopy_records,
+            halal_universe_size, halal_in_bhavcopy, yfinance_shrink, missing_halal, alert)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (
+            date_label, data_source, len(bhavcopy), len(halal_uni),
+            len(bhavcopy[bhavcopy["symbol"].isin(halal_uni)]),
+            "YES" if (data_source == "YFINANCE" and len(bhavcopy) <= 100) else "NO",
+            len(halal_uni - set(bhavcopy["symbol"])),
+            "SHRUNK" if (data_source == "YFINANCE" and len(bhavcopy) <= 100) else "OK"
+        ))
+        con.commit(); con.close()
+        log.info("Data quality logged to DB")
+    except Exception as e:
+        log.debug(f"DB quality log: {e}")
     # 7. Rank + sector cap + bucket
     results.sort(key=lambda x: (x["fused"]*1000 + x["whale_score"]*10 + x["div_score"]), reverse=True)
     sec_counts: dict = {}; globally_capped=[]
@@ -2454,7 +2484,7 @@ def run():
         log.info(f"       {r['story'][:80]}")
 
     # 8. Outputs
-    log.info("Saving Excel…");       save_excel(top_picks, results, fii_data, date_label)
+    log.info("Saving Excel…");       save_excel(top_picks, results, fii_data, date_label, data_source, bhavcopy)
     log.info("Saving HTML…");        save_html(top_picks, fii_data, date_label)
     log.info("Pushing to Sheets…");  push_gsheets(top_picks, date_label)
     log.info("Sending Telegram…");   send_telegram(top_picks, macro, fii_data, date_label, data_source)
