@@ -40,7 +40,6 @@ jobs:
           echo "reply=false"  >> $GITHUB_OUTPUT
           echo "weekly=false" >> $GITHUB_OUTPUT
 
-          # Manual dispatch = run everything
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "sniper=true" >> $GITHUB_OUTPUT
             echo "reply=true"  >> $GITHUB_OUTPUT
@@ -48,12 +47,10 @@ jobs:
             exit 0
           fi
 
-          # Sniper: 13:00 UTC, Mon-Fri
           if [[ "$H" == "13" && "$M" == "00" && "$DOW" -ge 1 && "$DOW" -le 5 ]]; then
             echo "sniper=true" >> $GITHUB_OUTPUT
           fi
 
-          # Reply: every 10 min, 03:00–10:50 UTC, Mon-Fri
           if [[ "$DOW" -ge 1 && "$DOW" -le 5 ]]; then
             h=$((10#$H))
             m=$((10#$M))
@@ -62,7 +59,6 @@ jobs:
             fi
           fi
 
-          # Weekly: 10:30 UTC, Friday
           if [[ "$H" == "10" && "$M" == "30" && "$DOW" == "5" ]]; then
             echo "weekly=true" >> $GITHUB_OUTPUT
           fi
@@ -78,7 +74,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      DB_CACHE_KEY: sniper-db-cache
       TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_SHARE_IDS:  ${{ secrets.TELEGRAM_SHARE_IDS }}
@@ -161,7 +156,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      DB_CACHE_KEY: sniper-db-cache
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       CACHE_PATH:       outputs/sniper_cache.db
@@ -219,7 +213,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      DB_CACHE_KEY: sniper-db-cache
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       CACHE_PATH:       outputs/sniper_cache.db
