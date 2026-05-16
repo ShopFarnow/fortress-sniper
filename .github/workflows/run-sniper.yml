@@ -4,62 +4,45 @@
 #
 # Jobs:
 #   1. sniper-run        — daily EOD scan (Mon-Fri 6:30 PM IST)
-#   2. reply-handler     — Telegram reply poller (every 15 min, market hours)
+#   2. reply-handler     — Telegram reply poller (every 10 min, market hours)
 #   3. weekly-review     — Friday performance summary (4 PM IST)
-#
-# FIXES APPLIED:
-#   FIX-A  Job routing via TIME CHECK, not github.event.schedule
-#          (github.event.schedule is unreliable in multi-cron workflows)
-#   FIX-B  Single cache action: restore-only + explicit save at end
-#          (prevents implicit/explicit save conflict)
-#   FIX-C  Cron interval: */15 (not */10) — GitHub's reliable minimum
-#   FIX-D  reply-handler: DB existence check before run
-#   FIX-E  Indentation: corrected step 3
 # ═══════════════════════════════════════════════════════════════
 
 name: 🕌 Unified Halal Sniper v3.0-M
 
 on:
   schedule:
-    # ── JOB 1: sniper-run ─────────────────────────────────────
-    - cron: '0 13 * * 1-5'       # 18:30 IST Mon-Fri
-
-    # ── JOB 2: reply-handler ──────────────────────────────────
-    # Every 15 min, 03:00–10:45 UTC = 8:30 AM–4:15 PM IST
-    # FIX-C: */15 is GitHub's reliable minimum (was */10, may drop)
-    - cron: '*/15 3-10 * * 1-5'
-
-    # ── JOB 3: weekly-review ──────────────────────────────────
-    - cron: '30 10 * * 5'        # 16:00 IST Friday
-
-  workflow_dispatch:              # manual trigger
+    # 13:00 UTC = 18:30 IST (Mon-Fri after market close)
+    - cron: '0 13 * * 1-5'
+    # 3:00 UTC = 8:30 IST (Mon-Fri pre-market, reply poller start)
+    - cron: '0 3 * * 1-5'
+    # 10:30 UTC = 16:00 IST (Friday weekly review)
+    - cron: '30 10 * * 5'
+  workflow_dispatch:      # manual trigger, no inputs
 
 env:
-  # Suppress Node.js 20 deprecation warnings
+  # Suppress Node.js 20 deprecation warnings — force Node 24 runtime
+  # Remove after GitHub completes migration (expected before Sept 2026)
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  DB_CACHE_KEY: sniper-db-${{ runner.os }}
 
 jobs:
 
-  # ═════════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
   # JOB 1 — Main daily sniper run
-  # ═════════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
   sniper-run:
     name: 🔫 Run Unified Sniper
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # FIX-A: Route by time check, not github.event.schedule
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'schedule' &&
-       github.run_attempt == 1)
 
     env:
+      # ── Secrets ──
       TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_SHARE_IDS:  ${{ secrets.TELEGRAM_SHARE_IDS }}
       GOOGLE_SHEET_ID:     ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_CREDS_JSON:   ${{ secrets.GOOGLE_CREDS_JSON }}
+      # ── Config ──
       PAPER_MODE:           'true'
       FORCE_YFINANCE:       'false'
       FORCE_SHEETS:         'false'
@@ -70,48 +53,45 @@ jobs:
       APEX_TOP_N:           '5'
       APEX_MIN_SCORE:       '48'
       MC_SIMS:              '600'
+      # ── v3.0-M Capacity guard ──
       CAPACITY_MAX_OPEN:    '4'
       CAPACITY_MAX_WEEK:    '6'
 
     steps:
+      # ── 1. Checkout ──────────────────────────────────────────
       - name: 📥 Checkout repo
         uses: actions/checkout@v4
 
+      # ── 2. Python setup ──────────────────────────────────────
       - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # FIX-E: Corrected indentation (8 spaces)
+      # ── 3. Install dependencies ──────────────────────────────
       - name: 📦 Install requirements
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # FIX-B: Restore ONLY (no implicit save)
+      # ── 4. Restore DB cache ──────────────────────────────────
       - name: 🗄️ Restore DB from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
-          # If no cache hit, continue with empty DB (will be created)
-          fail-on-cache-miss: false
+          key: sniper-db-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            sniper-db-${{ runner.os }}-
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
 
+      # ── 5. Run the sniper ────────────────────────────────────
       - name: 🎯 Execute Unified Sniper v3.0-M
         run: python sniper_unified_v2.py
 
-      # FIX-B: Explicit save ONLY at end (no conflict with implicit)
-      - name: 💾 Save DB to cache
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
-
+      # ── 6. Upload artifacts ─────────────────────────────────
       - name: 📤 Upload outputs
         uses: actions/upload-artifact@v4
         if: always()
@@ -123,18 +103,26 @@ jobs:
             outputs/sniper_cache.db
           retention-days: 30
 
+      # ── 7. Upload reply_handler.py ───────────────────────────
+      - name: 📤 Upload reply_handler
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reply-handler-${{ github.run_id }}
+          path: reply_handler.py
+          retention-days: 90
 
-  # ═════════════════════════════════════════════════════════════
-  # JOB 2 — Telegram reply poller
-  # ═════════════════════════════════════════════════════════════
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2 — Telegram reply poller (v3.0-M decision logging)
+  # Polls every 10 min on weekdays during market hours (8:30 AM - 4 PM IST)
+  # ─────────────────────────────────────────────────────────────
   reply-handler:
     name: 💬 Process Telegram Replies
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # FIX-A: Route by time check + DB existence gate
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'schedule'
+    # Separate schedule — run on cron independently
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
 
     env:
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
@@ -156,63 +144,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # FIX-B: Restore only
       - name: 🗄️ Restore DB from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
-          fail-on-cache-miss: false
-
-      # FIX-D: Check DB exists before running
-      - name: 🔍 Verify DB exists
-        id: check-db
-        run: |
-          if [ -f outputs/sniper_cache.db ]; then
-            echo "db_exists=true" >> $GITHUB_OUTPUT
-            echo "DB found: $(ls -lh outputs/sniper_cache.db)"
-          else
-            echo "db_exists=false" >> $GITHUB_OUTPUT
-            echo "⚠️ No DB found — sniper-run may not have completed yet"
-          fi
+          key: sniper-db-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            sniper-db-${{ runner.os }}-
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
 
-      # Only run if DB exists
       - name: 💬 Poll Telegram replies
-        if: steps.check-db.outputs.db_exists == 'true'
         run: python reply_handler.py
 
-      # Save back (only if DB was modified)
-      - name: 💾 Save DB to cache
-        if: steps.check-db.outputs.db_exists == 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
-
-      # Upload for inspection (conditional)
+      # ── FIXED: Conditional DB upload — only if DB exists ─────
       - name: 📤 Upload updated DB
         uses: actions/upload-artifact@v4
-        if: steps.check-db.outputs.db_exists == 'true'
+        if: always() && hashFiles('outputs/sniper_cache.db') != ''
         with:
           name: reply-db-${{ github.run_id }}
           path: outputs/sniper_cache.db
           retention-days: 7
 
 
-  # ═════════════════════════════════════════════════════════════
-  # JOB 3 — Weekly review
-  # ═════════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3 — Weekly review (Fridays 4 PM IST = 10:30 UTC)
+  # ─────────────────────────────────────────────────────────────
   weekly-review:
     name: 📊 Weekly Performance Review
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # FIX-A: Route by time check
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'schedule'
+    # Only run on Friday cron or manual trigger
+    if: (github.event_name == 'schedule' && github.event.schedule == '30 10 * * 5') || github.event_name == 'workflow_dispatch'
 
     env:
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
@@ -235,21 +199,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: 🗄️ Restore DB from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
-          fail-on-cache-miss: false
+          key: sniper-db-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            sniper-db-${{ runner.os }}-
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
 
       - name: 📊 Send weekly review
         run: python sniper_unified_v2.py --weekly-review
-
-      - name: 💾 Save DB to cache
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
