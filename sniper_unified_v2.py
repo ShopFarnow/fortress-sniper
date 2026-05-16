@@ -186,7 +186,12 @@ _YF_INFO_TIMEOUT     = 10          # seconds for yf.Ticker().info
 _YF_FAIL_COUNT       = 0
 _YF_FAIL_LOCK        = threading.Lock()   # Bug fix: guards concurrent increments from worker threads
 _YF_FAIL_THRESHOLD   = 3           # skip all yf calls after 3 consecutive failures
+_YF_CIRCUIT_OPEN_UNTIL: float = 0.0  # C3: epoch-seconds; >0 means circuit open (24 h ban)
 _NSE_HISTORY_OK      = None        # None=unknown, True=working, False=broken (speeds up loop when NSE is down)
+
+_YF_BACKOFF_BASE   = 2.0   # C3: base for exponential back-off (seconds)
+_YF_BACKOFF_MAX    = 60.0  # C3: cap per-attempt sleep
+_YF_MAX_ATTEMPTS   = 4     # C3: per-call retry budget
 
 _CNX500_CACHE        = None
 _CNX500_CACHE_TIME   = 0
@@ -600,6 +605,73 @@ def get_sector(sym: str) -> str:
 
 
 
+def _tg_health_alert(message: str):
+    """Send a health-alert Telegram message (best-effort, no crash on failure)."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"⚠️ SNIPER HEALTH\n{message}"},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _yf_download_with_backoff(ticker: str, **kwargs):
+    """
+    C3 FIX — Exponential back-off + jitter wrapper for yf.download().
+    On _YF_FAIL_THRESHOLD consecutive failures the 24-hour circuit breaker opens.
+    GitHub Actions runners share IP pools; Yahoo bans shared IPs when hammered.
+    This wrapper prevents the silent-failure cascade documented as issue C3.
+    """
+    global _YF_FAIL_COUNT, _YF_CIRCUIT_OPEN_UNTIL
+    import yfinance as yf
+
+    # Circuit-breaker guard
+    with _YF_FAIL_LOCK:
+        if time.time() < _YF_CIRCUIT_OPEN_UNTIL:
+            remaining = int((_YF_CIRCUIT_OPEN_UNTIL - time.time()) / 60)
+            log.warning(f"YF circuit OPEN — skipping {ticker} ({remaining} min remaining)")
+            return pd.DataFrame()
+
+    last_exc: Exception = RuntimeError("unreachable")
+    for attempt in range(_YF_MAX_ATTEMPTS):
+        if attempt:
+            raw   = _YF_BACKOFF_BASE ** attempt            # 2, 4, 8 s
+            jitter = raw * 0.25 * random.random()          # ±25 %
+            delay  = min(raw + jitter, _YF_BACKOFF_MAX)
+            log.warning(f"YF back-off {attempt}/{_YF_MAX_ATTEMPTS}: "
+                        f"sleeping {delay:.1f}s for {ticker}")
+            time.sleep(delay)
+        try:
+            df = yf.download(ticker, **kwargs)
+            with _YF_FAIL_LOCK:
+                _YF_FAIL_COUNT = 0        # reset on any success
+            return df
+        except Exception as e:
+            last_exc = e
+            log.warning(f"YF download attempt {attempt+1}/{_YF_MAX_ATTEMPTS} "
+                        f"failed for {ticker}: {e}")
+
+    # All retries exhausted — increment global counter and maybe open circuit
+    with _YF_FAIL_LOCK:
+        _YF_FAIL_COUNT += 1
+        fc = _YF_FAIL_COUNT
+        if fc >= _YF_FAIL_THRESHOLD:
+            _YF_CIRCUIT_OPEN_UNTIL = time.time() + 86_400  # 24 h
+            log.error(
+                f"YF circuit breaker OPEN — {fc} consecutive failures. "
+                f"yfinance suspended for 24 h. Last error: {last_exc}"
+            )
+            _tg_health_alert(
+                f"🚨 yfinance circuit breaker OPEN after {fc} consecutive failures.\n"
+                f"Pipeline is in NSE-only mode for 24 h.\nLast error: {last_exc}"
+            )
+    return pd.DataFrame()
+
+
 def _live_sector_momentum(sector: str, days: int = 20) -> dict:
     """Compute sector vs CNX500 relative momentum. Returns bonus/penalty."""
     NEUTRAL = {"rel_5d": 0.0, "rel_20d": 0.0, "momentum_tier": "NEUTRAL", "bonus": 0}
@@ -623,14 +695,12 @@ def _live_sector_momentum(sector: str, days: int = 20) -> dict:
         return NEUTRAL
 
     try:
-        import yfinance as yf
-
         # Shared CNX500 cache (TTL 1 hour)
         global _CNX500_CACHE, _CNX500_CACHE_TIME
         now = time.time()
         if _CNX500_CACHE is None or (now - _CNX500_CACHE_TIME) > 3600:
-            cnx_df = yf.download("^CNX500", period="30d", progress=False,
-                                auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
+            cnx_df = _yf_download_with_backoff("^CNX500", period="30d", progress=False,
+                                               auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
             _CNX500_CACHE = cnx_df
             _CNX500_CACHE_TIME = now
         else:
@@ -638,8 +708,9 @@ def _live_sector_momentum(sector: str, days: int = 20) -> dict:
 
         sector_ticker = SECTOR_INDICES[sector]
         if sector_ticker not in _SECTOR_INDEX_CACHE:
-            sector_df = yf.download(f"^{sector_ticker}", period="30d", progress=False,
-                                    auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
+            sector_df = _yf_download_with_backoff(f"^{sector_ticker}", period="30d",
+                                                  progress=False, auto_adjust=True,
+                                                  timeout=_YF_DOWNLOAD_TIMEOUT)
             _SECTOR_INDEX_CACHE[sector_ticker] = sector_df
             _SECTOR_YF_CALLS += 1
         else:
@@ -737,7 +808,16 @@ def _fetch_shariah_csv() -> set:
                 log.info(f"Shariah CSV loaded LIVE: {len(syms)} symbols ✅")
                 return syms
         except Exception as e:
-            log.debug(f"Shariah CSV {url}: {e}")
+            log.warning(f"Shariah CSV {url}: {e}")    # H1: was debug — now visible in prod
+    # All three URLs failed
+    log.error(
+        "Shariah CSV: all 3 URLs failed — falling back to hardcoded list. "
+        "Halal screening is DEGRADED. Check niftyindices.com reachability."
+    )
+    _tg_health_alert(
+        "⚠️ Shariah CSV fetch FAILED (all 3 URLs). "
+        "Running on hardcoded fallback list — halal screening may be stale."
+    )
     return set()
 
 
@@ -984,14 +1064,34 @@ def _get_nse_session() -> requests.Session:
 
 
 def _nse_json(sess: requests.Session, url: str, params: dict = None, timeout: int = 15):
-    resp = sess.get(url, params=params, timeout=timeout)
-    body = resp.text.strip()
-    if not body or body.startswith("<"):
-        raise ValueError(f"NSE empty/HTML body ({resp.status_code}) for {url}")
-    try:
-        return resp.json()
-    except ValueError as e:
-        raise ValueError(f"NSE JSONDecodeError for {url}: {e}") from e
+    """
+    C4 FIX: Retry NSE requests up to 3× with exponential back-off + jitter.
+    NSE API returns 503 under load; a single bare request silently cascades
+    to yfinance, triggering the rate-limit death spiral (C3).
+    Delays: ~2s, ~4s, ~8s (+ ±25 % jitter each time).
+    """
+    last_exc: Exception = RuntimeError("unreachable")
+    for attempt in range(3):
+        if attempt:
+            base_delay = 2 ** attempt          # 2, 4
+            jitter     = base_delay * 0.25 * random.random()
+            time.sleep(base_delay + jitter)
+        try:
+            resp = sess.get(url, params=params, timeout=timeout)
+            body = resp.text.strip()
+            if not body or body.startswith("<"):
+                raise ValueError(f"NSE empty/HTML body ({resp.status_code}) for {url}")
+            if resp.status_code == 503:
+                raise IOError(f"NSE 503 Service Unavailable for {url}")
+            return resp.json()
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                IOError) as e:
+            last_exc = e
+            log.warning(f"NSE request attempt {attempt+1}/3 failed ({type(e).__name__}): {url} — {e}")
+        except ValueError as e:
+            raise ValueError(f"NSE JSONDecodeError for {url}: {e}") from e
+    raise last_exc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1569,27 +1669,31 @@ def fetch_history(symbol: str, days: int = 300,
                     _NSE_HISTORY_OK = True
                     return _validate_no_lookahead(df)
         except Exception as e:
-            log.debug(f"NSE history {sym}: {e}")
+            log.warning(f"NSE history {sym}: {e} — falling back to yfinance")   # H1
             _NSE_HISTORY_OK = False
 
     # Individual yfinance fallback (only if no cache entry)
     if yf_cache is None or sym not in yf_cache:
-        try:
-            import yfinance as yf
-            end = datetime.today(); start = end - timedelta(days=days + 50)
-            raw = yf.download(f"{sym}.NS", start=start, end=end,
-                              progress=False, auto_adjust=False,
-                              timeout=_YF_DOWNLOAD_TIMEOUT)
-            if not raw.empty:
-                raw = raw.reset_index()
-                raw.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in raw.columns]
-                if "close" not in raw.columns and "adj close" in raw.columns:
-                    raw = raw.rename(columns={"adj close": "close"})
-                raw["date"] = pd.to_datetime(raw["date"])
-                df = raw[["date","open","high","low","close","volume"]].dropna()
-                return _validate_no_lookahead(df)
-        except Exception as e:
-            log.debug(f"yfinance history {sym}: {e}")
+        with _YF_FAIL_LOCK:
+            cb_open = time.time() < _YF_CIRCUIT_OPEN_UNTIL
+        if cb_open:
+            log.warning(f"YF circuit open — skipping individual history fetch for {sym}")
+        else:
+            try:
+                end = datetime.today(); start = end - timedelta(days=days + 50)
+                raw = _yf_download_with_backoff(f"{sym}.NS", start=start, end=end,
+                                                progress=False, auto_adjust=False,
+                                                timeout=_YF_DOWNLOAD_TIMEOUT)
+                if not raw.empty:
+                    raw = raw.reset_index()
+                    raw.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in raw.columns]
+                    if "close" not in raw.columns and "adj close" in raw.columns:
+                        raw = raw.rename(columns={"adj close": "close"})
+                    raw["date"] = pd.to_datetime(raw["date"])
+                    df = raw[["date","open","high","low","close","volume"]].dropna()
+                    return _validate_no_lookahead(df)
+            except Exception as e:
+                log.warning(f"yfinance history {sym}: {e}")
 
     # Return cached frame even if short, or empty
     if yf_cache is not None and sym in yf_cache:
@@ -2099,8 +2203,9 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     sect_20: Optional[float] = None
     if sector in SECTOR_INDICES:
         try:
-            import yfinance as yf
-            idf = yf.download(f"^{SECTOR_INDICES[sector]}", period="30d", progress=False, auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
+            idf = _yf_download_with_backoff(f"^{SECTOR_INDICES[sector]}", period="30d",
+                                            progress=False, auto_adjust=True,
+                                            timeout=_YF_DOWNLOAD_TIMEOUT)
             if not idf.empty and len(idf)>=2:
                 ic = idf["Close"].squeeze().values
                 sect_20 = float((ic[-1]-ic[-20])/ic[-20]*100) if len(ic)>=20 else None
@@ -2486,15 +2591,17 @@ def _monte_carlo(hist: pd.DataFrame, stop_loss: float, close: float) -> dict:
     tp = round(hit / MC_SIMS * 100, 1)
     ad = round(days_tot / max(1, hit), 1) if hit > 0 else None
 
-    # ── VALIDATION: Convergence check ──
+    # ── VALIDATION: Consistency check (seeds 42 vs 43) ──
+    # NOTE: this is a consistency/noise test, not true convergence.
+    # The HARD VETO below (sp < 50) is the meaningful safety gate.
     h = MC_SIMS // 2
     r1 = np.random.default_rng(42)
     r2 = np.random.default_rng(43)
-    s1 = sum(1 for _ in range(h) 
-             for p in [close * np.exp(np.cumsum(mu + ts * r1.standard_t(df, size=MC_HORIZON)))] 
+    s1 = sum(1 for _ in range(h)
+             for p in [close * np.exp(np.cumsum(mu + ts * r1.standard_t(df, size=MC_HORIZON)))]
              if float(np.min(p)) > stop_loss)
-    s2 = sum(1 for _ in range(h) 
-             for p in [close * np.exp(np.cumsum(mu + ts * r2.standard_t(df, size=MC_HORIZON)))] 
+    s2 = sum(1 for _ in range(h)
+             for p in [close * np.exp(np.cumsum(mu + ts * r2.standard_t(df, size=MC_HORIZON)))]
              if float(np.min(p)) > stop_loss)
     conv = abs(s1 / max(1, h) * 100 - s2 / max(1, h) * 100) <= 8.0
 
@@ -2506,21 +2613,30 @@ def _monte_carlo(hist: pd.DataFrame, stop_loss: float, close: float) -> dict:
 
     valid = conv and len(lr) >= 30 and not (vol_regime_changed and sp > 90)
 
+    # ── H2 FIX: Hard veto — survival below 50% means stop is likely to be hit ──
+    # Previously MC survival was a cosmetic label; it barely moved the fused score.
+    # A pick surviving fewer than half of 600 simulations should not be presented.
+    MC_HARD_VETO_PCT = 50.0
+    hard_veto = valid and sp < MC_HARD_VETO_PCT
+
     lbl = f"MC {sp}% survive ({MC_HORIZON}d, t-df{df}){regime_note}"
     if not conv:
         lbl += " [NOT CONVERGED]"
     if not valid:
         lbl += " [LOW CONFIDENCE]"
+    if hard_veto:
+        lbl += " [HARD VETO — survival too low]"
 
     return {
-        "survival": sp,
-        "t1_hit_pct": tp,
-        "days_to_t1": ad,
-        "label": lbl,
-        "converged": conv,
-        "valid": valid,
-        "regime_warning": "⚠️ Post-breakout vol unreliable" if just_broke_out else 
-                         "⚠️ Vol regime changed" if vol_regime_changed else ""
+        "survival":      sp,
+        "t1_hit_pct":    tp,
+        "days_to_t1":    ad,
+        "label":         lbl,
+        "converged":     conv,
+        "valid":         valid,
+        "hard_veto":     hard_veto,       # H2: caller must check this
+        "regime_warning": "⚠️ Post-breakout vol unreliable" if just_broke_out else
+                          "⚠️ Vol regime changed" if vol_regime_changed else ""
     }
 
 
@@ -2642,9 +2758,7 @@ def _calibrate_bayes_priors() -> dict:
             return updated_priors
 
     except Exception as e:
-        log.debug(f"Bayes calibration failed: {e}")
-
-    return None
+        log.warning(f"Bayes calibration failed — priors unchanged (stale): {e}")    # H1
 
 
 def _load_learned_priors() -> Optional[dict]:
@@ -2774,16 +2888,52 @@ def _train_meta_labeler_v2(min_samples: int = 20) -> Optional[object]:
       0 (loss) = decision=TAKEN AND outcome in (stopped, expired)
     Skipped trades are excluded from training (counterfactual unknown).
     Falls back to v1 training (all signals) if fewer than min_samples decisions exist.
+
+    H3 FIX: Only retrain when the closed-pick count has grown by >50 since the
+    model was last saved.  RandomForest on 1000+ rows is O(n²) — retraining on
+    every run causes the 45-minute GitHub Actions timeout to trigger once the DB
+    accumulates enough history.  The model file's mtime is used to detect staleness.
     """
     try:
         from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
         from sklearn.preprocessing import StandardScaler
         from sklearn.pipeline import Pipeline
         from sklearn.model_selection import cross_val_score
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.metrics import brier_score_loss, roc_auc_score
         import pickle
     except ImportError:
         log.debug("sklearn not available — meta-labeler v2 skipped")
         return None
+
+    # ── H3: Retrain guard ─────────────────────────────────────────────────────
+    _META_RETRAIN_DELTA = 50      # minimum new closed picks before retraining
+    model_path = Path("meta_model.pkl")
+    try:
+        current_closed = sqlite3.connect(DB_PATH, timeout=5).execute(
+            "SELECT COUNT(*) FROM pick_outcomes "
+            "WHERE status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')"
+        ).fetchone()[0]
+    except Exception:
+        current_closed = 0
+
+    retrain_count_path = Path("meta_model_train_count.txt")
+    last_train_count = 0
+    try:
+        last_train_count = int(retrain_count_path.read_text().strip())
+    except Exception:
+        pass  # first run or missing file
+
+    if (model_path.exists()
+            and current_closed - last_train_count < _META_RETRAIN_DELTA):
+        log.info(
+            f"Meta-labeler v2: skipping retrain "
+            f"(closed picks since last train: "
+            f"{current_closed - last_train_count} < {_META_RETRAIN_DELTA}). "
+            f"Loading existing model."
+        )
+        return _load_meta_model()
+    # ── End retrain guard ─────────────────────────────────────────────────────
 
     try:
         con = sqlite3.connect(DB_PATH, timeout=10)
@@ -2882,15 +3032,42 @@ def _train_meta_labeler_v2(min_samples: int = 20) -> Optional[object]:
                                            class_weight="balanced")
 
         model.fit(X, y)
-        cv_scores = cross_val_score(model, X, y, cv=min(3, len(rows)//5 or 1), scoring="roc_auc")
+
+        # ── Platt Calibration (sigmoid method) ───────────────────────────────
+        # GBM and RF predict_proba() outputs are poorly calibrated — probabilities
+        # are pushed toward 0/1 extremes, making the meta_prob threshold comparisons
+        # (e.g. _META_VETO_THRESHOLD = 0.40) unreliable.
+        # Platt scaling fits a logistic curve on top of the raw scores using
+        # cross-validated held-out folds so we don't overfit the calibration.
+        # cv="prefit" is wrong here because we need held-out data for calibration;
+        # we use cv=min(5, n_folds) to match what we have.
+        # After calibration, predict_proba() returns true probability estimates.
+        n_cal_folds = min(5, max(2, len(X) // 10))   # at least 10 samples per fold
+        try:
+            platt_model = CalibratedClassifierCV(model, method="sigmoid", cv=n_cal_folds)
+            platt_model.fit(X, y)
+            # Brier score on full set (same data — optimistic, but useful for logging)
+            brier = brier_score_loss(y, platt_model.predict_proba(X)[:, 1])
+            log.info(f"Platt calibration applied: cv={n_cal_folds} folds | Brier={brier:.4f} "
+                     f"(lower=better; 0.25=random, 0=perfect)")
+            calibrated_model = platt_model
+        except Exception as cal_err:
+            log.warning(f"Platt calibration failed ({cal_err}) — using uncalibrated model")
+            calibrated_model = model
+
+        # Preserve feature names for inference alignment
+        feat_names = X.columns.tolist()
+        if not hasattr(calibrated_model, "feature_names_in_"):
+            calibrated_model.feature_names_in_ = feat_names
+
+        cv_scores = cross_val_score(calibrated_model, X, y,
+                                    cv=min(3, len(rows) // 5 or 1), scoring="roc_auc")
         log.info(f"Meta-labeler v2 trained: {len(rows)} samples | "
                  f"AUC {cv_scores.mean():.3f}±{cv_scores.std():.3f} | "
-                 f"Mode: {'PERSONALIZED' if decision_count >= min_samples else 'FALLBACK'}")
+                 f"Mode: {'PERSONALIZED' if decision_count >= min_samples else 'FALLBACK'} | "
+                 f"Calibration: Platt (sigmoid)")
 
-        if not hasattr(model, "feature_names_in_"):
-            model.feature_names_in_ = X.columns.tolist()
-
-        return model
+        return calibrated_model
 
     except Exception as e:
         log.debug(f"Meta-labeler v2 training failed: {e}")
@@ -2920,12 +3097,21 @@ def _load_meta_model(model_path: str = "meta_model.pkl") -> Optional[object]:
 
 
 def _save_meta_model(model, model_path: str = "meta_model.pkl"):
-    """Persist trained meta-labeler."""
+    """Persist trained meta-labeler and record the closed-pick count at training time."""
     import pickle
     try:
         with open(model_path, "wb") as f:
             pickle.dump(model, f)
         log.info(f"Meta-model saved: {model_path}")
+        # H3: persist closed-pick count so retrain guard works across restarts
+        try:
+            closed = sqlite3.connect(DB_PATH, timeout=5).execute(
+                "SELECT COUNT(*) FROM pick_outcomes "
+                "WHERE status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')"
+            ).fetchone()[0]
+            Path("meta_model_train_count.txt").write_text(str(closed))
+        except Exception:
+            pass
     except Exception as e:
         log.debug(f"Meta-model save failed: {e}")
 
@@ -3601,6 +3787,11 @@ def assemble_pick(
     pat_score,   pat_label = _pattern_score(hist, atr14, profile)
     mc          = _monte_carlo(hist, stop_loss, close)
     mc_survival = mc.get("survival")
+
+    # H2 FIX: hard veto — if MC says survival < 50% with valid data, reject the pick.
+    if mc.get("hard_veto"):
+        log.info(f"  🚫 {symbol}: MC hard veto (survival={mc_survival}% < 50% on valid data)")
+        return None
 
     vol_rel = fort["vol_reliable"]
     cvd     = _calc_cvd(hist, vol_rel)
@@ -5346,7 +5537,7 @@ def run():
                     pass
         log.info(f"DB: {len(top_picks)} picks saved for outcome tracking")
     except Exception as e:
-        log.debug(f"DB persist: {e}")
+        log.error(f"DB persist for top picks FAILED — outcome tracking broken: {e}")   # H1
 
     # BUG FIX [ML-001]: second backfill + retrain pass at end of run().
     # v3.0-M: use personalized v2 labeler; fall back to v1 if insufficient decisions.
