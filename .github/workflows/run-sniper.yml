@@ -42,6 +42,12 @@ on:
         default: 'false'
         type: choice
         options: ['false', 'true']
+      run_weekly:
+        description: 'Run weekly AI status report manually'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -75,12 +81,17 @@ jobs:
           echo "sandbox=false" >> $GITHUB_OUTPUT
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "sniper=true"  >> $GITHUB_OUTPUT
-            echo "reply=true"   >> $GITHUB_OUTPUT
-            echo "weekly=true"  >> $GITHUB_OUTPUT
+            # Manual trigger: only run the sniper (and sandbox if requested).
+            # reply and weekly are NEVER forced true on manual dispatch —
+            # they fire on their own cron schedules only.
+            echo "sniper=true" >> $GITHUB_OUTPUT
             # FLOW-4: sandbox only runs when explicitly requested
             if [[ "${{ github.event.inputs.run_sandbox }}" == "true" ]]; then
               echo "sandbox=true" >> $GITHUB_OUTPUT
+            fi
+            # Weekly can be manually triggered via input
+            if [[ "${{ github.event.inputs.run_weekly }}" == "true" ]]; then
+              echo "weekly=true" >> $GITHUB_OUTPUT
             fi
             exit 0
           fi
@@ -90,12 +101,14 @@ jobs:
             echo "sniper=true" >> $GITHUB_OUTPUT
           fi
 
-          # Reply poll: 8:30 AM – 4:20 PM IST = 3:00–10:20 UTC, every 10 min
-          # FLOW-3: kept for TAKEN/PARTIAL only (no SKIPPED polling needed)
+          # Reply poll: 8:30 AM – 3:50 PM IST = 3:00–10:20 UTC, every 10 min
+          # FLOW-3: TAKEN/PARTIAL only — reply_handler.py never sends SKIPPED messages.
+          # Silence is auto-logged as SKIPPED by sniper at EOD (_auto_log_skipped_picks).
           if [[ "$DOW" -ge 1 && "$DOW" -le 5 ]]; then
             h=$((10#$H))
             m=$((10#$M))
-            if (( h >= 3 && h <= 10 )) && (( m % 10 == 0 )); then
+            # Stop at h=10, m=20 (10:20 UTC = 15:50 IST) — before EOD auto-log at 13:00 UTC
+            if (( h >= 3 && (h < 10 || (h == 10 && m <= 20)) )) && (( m % 10 == 0 )); then
               echo "reply=true" >> $GITHUB_OUTPUT
             fi
           fi
