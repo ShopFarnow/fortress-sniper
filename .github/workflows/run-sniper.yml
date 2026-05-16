@@ -1,29 +1,24 @@
 # ═══════════════════════════════════════════════════════════════
 # GitHub Actions: UNIFIED HALAL SNIPER v3.0-M
-# Single-file production fix — avoids github.event.schedule bug
+# Single-file production fix
 # ═══════════════════════════════════════════════════════════════
 
 name: 🕌 Unified Halal Sniper v3.0-M
 
 on:
   schedule:
-    # 13:00 UTC = 18:30 IST (Mon-Fri)
-    - cron: '0 13 * * 1-5'
-    # Every 10 min, 03:00–10:50 UTC = 8:30 AM–4:20 PM IST (Mon-Fri)
-    - cron: '*/10 3-10 * * 1-5'
-    # 10:30 UTC = 16:00 IST (Fridays only)
-    - cron: '30 10 * * 5'
+    - cron: '0 13 * * 1-5'          # 18:30 IST Mon-Fri
+    - cron: '*/10 3-10 * * 1-5'     # every 10 min, 8:30 AM–4:20 PM IST
+    - cron: '30 10 * * 5'           # 16:00 IST Friday
   workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  DB_CACHE_KEY: sniper-db-${{ runner.os }}
 
 jobs:
 
   # ─────────────────────────────────────────────────────────────
-  # ROUTER — determines which job(s) should run based on UTC time.
-  # Avoids github.event.schedule which is unreliable with multiple crons.
+  # ROUTER — reads UTC clock to avoid github.event.schedule bug
   # ─────────────────────────────────────────────────────────────
   route:
     name: 🔀 Route Trigger
@@ -42,7 +37,6 @@ jobs:
           M=$(date -u +%M)
           DOW=$(date -u +%u)   # 1=Mon … 5=Fri
 
-          # Defaults
           echo "sniper=false" >> $GITHUB_OUTPUT
           echo "reply=false"  >> $GITHUB_OUTPUT
           echo "weekly=false" >> $GITHUB_OUTPUT
@@ -55,12 +49,12 @@ jobs:
             exit 0
           fi
 
-          # Sniper slot: 13:00 UTC, Mon-Fri
+          # Sniper: 13:00 UTC, Mon-Fri
           if [[ "$H" == "13" && "$M" == "00" && "$DOW" -ge 1 && "$DOW" -le 5 ]]; then
             echo "sniper=true" >> $GITHUB_OUTPUT
           fi
 
-          # Reply slot: every 10 min, 03:00–10:50 UTC, Mon-Fri
+          # Reply: every 10 min, 03:00–10:50 UTC, Mon-Fri
           if [[ "$DOW" -ge 1 && "$DOW" -le 5 ]]; then
             h=$((10#$H))
             m=$((10#$M))
@@ -69,14 +63,14 @@ jobs:
             fi
           fi
 
-          # Weekly slot: 10:30 UTC, Friday
+          # Weekly: 10:30 UTC, Friday
           if [[ "$H" == "10" && "$M" == "30" && "$DOW" == "5" ]]; then
             echo "weekly=true" >> $GITHUB_OUTPUT
           fi
 
 
   # ─────────────────────────────────────────────────────────────
-  # JOB 1 — Main daily sniper run (13:00 UTC)
+  # JOB 1 — Daily sniper run
   # ─────────────────────────────────────────────────────────────
   sniper-run:
     name: 🔫 Run Unified Sniper
@@ -84,8 +78,8 @@ jobs:
     if: needs.route.outputs.sniper == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
     env:
+      DB_CACHE_KEY: sniper-db-${{ runner.os }}
       TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_SHARE_IDS:  ${{ secrets.TELEGRAM_SHARE_IDS }}
@@ -159,7 +153,7 @@ jobs:
 
 
   # ─────────────────────────────────────────────────────────────
-  # JOB 2 — Telegram reply poller (every 10 min, 03:00–10:50 UTC)
+  # JOB 2 — Telegram reply poller
   # ─────────────────────────────────────────────────────────────
   reply-handler:
     name: 💬 Process Telegram Replies
@@ -167,8 +161,8 @@ jobs:
     if: needs.route.outputs.reply == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
-
     env:
+      DB_CACHE_KEY: sniper-db-${{ runner.os }}
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       CACHE_PATH:       outputs/sniper_cache.db
@@ -217,7 +211,7 @@ jobs:
 
 
   # ─────────────────────────────────────────────────────────────
-  # JOB 3 — Weekly review (Friday 10:30 UTC)
+  # JOB 3 — Weekly review
   # ─────────────────────────────────────────────────────────────
   weekly-review:
     name: 📊 Weekly Performance Review
@@ -225,8 +219,8 @@ jobs:
     if: needs.route.outputs.weekly == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     env:
+      DB_CACHE_KEY: sniper-db-${{ runner.os }}
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       CACHE_PATH:       outputs/sniper_cache.db
