@@ -526,6 +526,42 @@ _HALAL_UNIVERSE_LOCK  = threading.Lock()
 # Serialise all SQLite write transactions (WAL mode reduces contention but does
 # not eliminate "database is locked" errors when multiple threads write at the same time)
 _SQLITE_WRITE_LOCK    = threading.Lock()
+
+# ── BUG FIX [SQL-001]: guaranteed-close SQLite context manager ─────────────
+# The previous pattern of `con = sqlite3.connect(...) / con.close()` leaks the
+# connection on any exception path because close() is never in a finally block.
+# Under WAL mode a leaked read connection prevents the writer from checkpointing,
+# causing escalating "database is locked" errors across threads.
+# Usage (read):   `with _db_conn() as con: rows = con.execute(...).fetchall()`
+# Usage (write):  `with _db_conn(write=True) as con: con.execute(...); con.commit()`
+from contextlib import contextmanager as _contextmanager
+
+@_contextmanager
+def _db_conn(timeout: int = 10, write: bool = False):
+    """Thread-safe SQLite connection with guaranteed close in finally."""
+    _lock = _SQLITE_WRITE_LOCK if write else None
+    if _lock:
+        _lock.acquire()
+    con = None
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=timeout)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=5000")
+        yield con
+        if write:
+            con.commit()
+    except Exception:
+        if write and con:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if con:
+            con.close()
+        if _lock:
+            _lock.release()
 _HALAL_CUSTOM_LIST:    set             = set()
 
 SYMBOL_SECTOR: Dict[str, str] = {
@@ -1291,9 +1327,21 @@ def _bhavcopy_from_yfinance() -> pd.DataFrame:
                     tk = f"{sym}.NS"
                     try:
                         if hasattr(raw.columns, "levels"):
-                            lvl1 = list(raw.columns.get_level_values(1))
+                            # BUG FIX [YF-001]: yfinance ≥0.2.x flipped MultiIndex level
+                            # order — ticker symbols are now at level 0, price types at
+                            # level 1.  We detect the real ticker level by checking which
+                            # level contains '.NS' strings instead of hard-coding level=1.
                             lvl0 = list(raw.columns.get_level_values(0))
-                            sub  = raw.xs(tk, axis=1, level=1) if tk in lvl1 else (raw[tk] if tk in lvl0 else None)
+                            lvl1 = list(raw.columns.get_level_values(1))
+                            if any(".NS" in str(v) for v in lvl0):
+                                tk_level = 0
+                            elif any(".NS" in str(v) for v in lvl1):
+                                tk_level = 1
+                            else:
+                                tk_level = 0  # safe fallback
+                            tickers_in_col = list(raw.columns.get_level_values(tk_level))
+                            sub = (raw.xs(tk, axis=1, level=tk_level) if tk in tickers_in_col
+                                   else (raw[tk] if tk in raw.columns else None))
                         else:
                             sub = raw.copy()
                         if sub is None:
@@ -1386,16 +1434,19 @@ def _validate_no_lookahead(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df.empty or "date" not in df.columns:
         return df
-    df    = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
-    # Bug fix: build today with the same tz-awareness as the column.
-    # pd.Timestamp(date()) is tz-naive; comparing it to tz-aware yfinance UTC
-    # dates silently raises TypeError in newer pandas, or returns wrong results.
+    df = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+    # BUG FIX [TZ-001]: yfinance returns tz-aware UTC dates; comparing them to a
+    # tz-naive pd.Timestamp raises TypeError in pandas ≥1.4.  The previous fix used
+    # tz_localize(col_tz) which itself raises TypeError if the timestamp already has
+    # tzinfo set.  The cleanest solution: strip timezone from the date column once,
+    # immediately after loading, so all comparisons are tz-naive throughout the pipeline.
+    # Daily OHLCV bars don't need sub-day timezone precision.
+    if not df.empty and hasattr(df["date"].dt, "tz") and df["date"].dt.tz is not None:
+        df["date"] = df["date"].dt.tz_localize(None)
+
     today_date = datetime.today().date()
-    col_tz = df["date"].dt.tz if (not df.empty and hasattr(df["date"].dt, "tz")) else None
-    if col_tz is not None:
-        today = pd.Timestamp(today_date).tz_localize(col_tz)
-    else:
-        today = pd.Timestamp(today_date)
+    today      = pd.Timestamp(today_date)           # always tz-naive now
     # Layer 1: remove future rows
     df = df[df["date"] <= today].copy()
     # Layer 2: remove today's unclosed bar (score on confirmed, closed candles only)
@@ -1434,10 +1485,18 @@ def _preload_histories_yf(symbols: List[str], days: int = 300) -> Dict[str, pd.D
                     tk = f"{sym}.NS"
                     try:
                         if hasattr(raw.columns, "levels"):
-                            lvl1 = list(raw.columns.get_level_values(1))
+                            # BUG FIX [YF-001]: detect real ticker level dynamically
                             lvl0 = list(raw.columns.get_level_values(0))
-                            sub = (raw.xs(tk, axis=1, level=1) if tk in lvl1
-                                   else (raw[tk] if tk in lvl0 else None))
+                            lvl1 = list(raw.columns.get_level_values(1))
+                            if any(".NS" in str(v) for v in lvl0):
+                                tk_level = 0
+                            elif any(".NS" in str(v) for v in lvl1):
+                                tk_level = 1
+                            else:
+                                tk_level = 0
+                            tickers_in_col = list(raw.columns.get_level_values(tk_level))
+                            sub = (raw.xs(tk, axis=1, level=tk_level) if tk in tickers_in_col
+                                   else (raw[tk] if tk in raw.columns else None))
                         else:
                             sub = raw.copy() if len(chunk) == 1 else None
                         if sub is None or sub.empty:
@@ -2594,20 +2653,19 @@ def _load_learned_priors() -> Optional[dict]:
 def _store_meta_features(run_date: str, symbol: str, features: dict):
     """Store signal vector at entry time for later meta-model training."""
     try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute(
-            """INSERT OR REPLACE INTO meta_features
-            (run_date, symbol, whale_score, div_score, vp_score, pat_score, bayes_pct,
-             macro_state, sector, vix_level, primary_fused_score)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (run_date, symbol.upper(),
-             features.get("whale_score"), features.get("div_score"),
-             features.get("vp_score"), features.get("pat_score"),
-             features.get("bayes_pct"), features.get("macro_state"),
-             features.get("sector"), features.get("vix_level"),
-             features.get("primary_fused_score"))
-        )
-        con.commit(); con.close()
+        with _db_conn(write=True) as con:
+            con.execute(
+                """INSERT OR REPLACE INTO meta_features
+                (run_date, symbol, whale_score, div_score, vp_score, pat_score, bayes_pct,
+                 macro_state, sector, vix_level, primary_fused_score)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (run_date, symbol.upper(),
+                 features.get("whale_score"), features.get("div_score"),
+                 features.get("vp_score"), features.get("pat_score"),
+                 features.get("bayes_pct"), features.get("macro_state"),
+                 features.get("sector"), features.get("vix_level"),
+                 features.get("primary_fused_score"))
+            )
     except Exception as e:
         log.debug(f"Meta-features store {symbol}: {e}")
 
@@ -2615,19 +2673,18 @@ def _store_meta_features(run_date: str, symbol: str, features: dict):
 def _update_meta_outcomes():
     """Backfill outcome_pnl_pct and profitable flags from closed pick_outcomes."""
     try:
-        con = sqlite3.connect(DB_PATH)
-        rows = con.execute(
-            """SELECT o.run_date, o.symbol, o.pnl_pct,
-                      CASE WHEN o.pnl_pct > 0 THEN 1 ELSE 0 END as profitable
-               FROM pick_outcomes o
-               JOIN meta_features m ON o.run_date = m.run_date AND o.symbol = m.symbol
-               WHERE o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
-               AND m.outcome_pnl_pct IS NULL""").fetchall()
-        for run_date, symbol, pnl, prof in rows:
-            con.execute(
-                "UPDATE meta_features SET outcome_pnl_pct=?, profitable=? WHERE run_date=? AND symbol=?",
-                (pnl, prof, run_date, symbol))
-        con.commit(); con.close()
+        with _db_conn(write=True) as con:
+            rows = con.execute(
+                """SELECT o.run_date, o.symbol, o.pnl_pct,
+                          CASE WHEN o.pnl_pct > 0 THEN 1 ELSE 0 END as profitable
+                   FROM pick_outcomes o
+                   JOIN meta_features m ON o.run_date = m.run_date AND o.symbol = m.symbol
+                   WHERE o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
+                   AND m.outcome_pnl_pct IS NULL""").fetchall()
+            for run_date, symbol, pnl, prof in rows:
+                con.execute(
+                    "UPDATE meta_features SET outcome_pnl_pct=?, profitable=? WHERE run_date=? AND symbol=?",
+                    (pnl, prof, run_date, symbol))
         if rows:
             log.info(f"Meta-features: backfilled {len(rows)} outcomes")
     except Exception as e:
@@ -2637,13 +2694,12 @@ def _update_meta_outcomes():
 def _train_meta_labeler(min_samples: int = 50) -> Optional[object]:
     """Train RandomForest meta-labeler on historical meta_features."""
     try:
-        con = sqlite3.connect(DB_PATH)
-        rows = con.execute(
-            """SELECT whale_score, div_score, vp_score, pat_score, bayes_pct,
-                      macro_state, sector, vix_level, primary_fused_score, profitable
-               FROM meta_features
-               WHERE profitable IS NOT NULL""").fetchall()
-        con.close()
+        with _db_conn() as con:
+            rows = con.execute(
+                """SELECT whale_score, div_score, vp_score, pat_score, bayes_pct,
+                          macro_state, sector, vix_level, primary_fused_score, profitable
+                   FROM meta_features
+                   WHERE profitable IS NOT NULL""").fetchall()
 
         if len(rows) < min_samples:
             log.info(f"Meta-labeler: {len(rows)} samples (< {min_samples}) -- skipping training")
@@ -4350,8 +4406,17 @@ def run():
         return fii_task, ins_task, fil_task, earn_task
 
     # Safe asyncio runner: if an event loop is already running (Jupyter, FastAPI,
-    # pytest-asyncio), asyncio.run() raises RuntimeError. In that case, we spin
-    # up a dedicated background thread with its own event loop instead.
+    # pytest-asyncio), asyncio.run() raises RuntimeError. In that case, we spawn
+    # a plain daemon thread with its OWN new event loop.
+    #
+    # BUG FIX [ASYNC-001]: the previous fallback used ThreadPoolExecutor(max_workers=1)
+    # and called asyncio.run() inside the single worker.  asyncio.to_thread() (used
+    # inside _fetch_intelligence_async) submits tasks to the DEFAULT thread pool,
+    # which is the same single-worker TPE — causing a deadlock where the coroutine
+    # waits for a thread that will never become free.
+    # Fix: spin a bare threading.Thread.  It has its own stack and is not subject to
+    # the executor's pool limit, so asyncio.to_thread() dispatches into the default
+    # loop's unrestricted thread pool without contention.
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -4360,10 +4425,33 @@ def run():
     if loop is None:
         fii_data, insider_map, filings, earn_cal = asyncio.run(_fetch_intelligence_async())
     else:
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-            future = _pool.submit(asyncio.run, _fetch_intelligence_async())
-            fii_data, insider_map, filings, earn_cal = future.result()
+        import threading as _threading
+        _result: list = []
+        _exc:    list = []
+
+        def _run_in_own_loop():
+            _new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(_new_loop)
+            try:
+                _result.append(_new_loop.run_until_complete(_fetch_intelligence_async()))
+            except Exception as _e:
+                _exc.append(_e)
+            finally:
+                _new_loop.close()
+
+        _t = _threading.Thread(target=_run_in_own_loop, daemon=True)
+        _t.start()
+        _t.join(timeout=90)          # generous but bounded
+        if not _t.is_alive() and _exc:
+            raise _exc[0]
+        if _t.is_alive():
+            log.warning("Async intelligence fetch timed out after 90 s — using empty defaults")
+            fii_data, insider_map, filings, earn_cal = (
+                {"label": "TIMEOUT", "fii_pts": 0, "dii_pts": 0},
+                {}, [], {}
+            )
+        else:
+            fii_data, insider_map, filings, earn_cal = _result[0]
 
     log.info(f"FII/DII: {fii_data['label']} | Insider: {len(insider_map)} symbols | "
              f"Filings: {len(filings)} | Earnings: {len(earn_cal)} events")
@@ -4576,26 +4664,41 @@ def run():
 
     # Persist results to DB + outcome tracking
     try:
-        con = sqlite3.connect(DB_PATH)
-        for r in top_picks:
-            # Existing sniper_results
-            con.execute(
-                "INSERT INTO sniper_results (run_date,symbol,grade,fused_score,close,stop_loss,r1,r2,r3,story,sector) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (date_label,r["symbol"],r["grade"],r["fused"],r["close"],
-                 r["stop_loss"],r["r1"],r["r2"],r["r3"],r["story"],r.get("sector","DIVERSIFIED"))
-            )
-            # NEW: outcome tracking (initial state)
-            con.execute(
-                "INSERT OR IGNORE INTO pick_outcomes (run_date,symbol,entry_price,stop_loss,r1,r2,r3,grade,fused_score,story,status) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (date_label,r["symbol"],r["close"],r["stop_loss"],r["r1"],r["r2"],r["r3"],
-                 r["grade"],r["fused"],r["story"],"open")
-            )
-        con.commit(); con.close()
+        with _db_conn(write=True) as con:
+            for r in top_picks:
+                # Existing sniper_results
+                con.execute(
+                    "INSERT INTO sniper_results (run_date,symbol,grade,fused_score,close,stop_loss,r1,r2,r3,story,sector) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (date_label,r["symbol"],r["grade"],r["fused"],r["close"],
+                     r["stop_loss"],r["r1"],r["r2"],r["r3"],r["story"],r.get("sector","DIVERSIFIED"))
+                )
+                # NEW: outcome tracking (initial state)
+                con.execute(
+                    "INSERT OR IGNORE INTO pick_outcomes (run_date,symbol,entry_price,stop_loss,r1,r2,r3,grade,fused_score,story,status) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (date_label,r["symbol"],r["close"],r["stop_loss"],r["r1"],r["r2"],r["r3"],
+                     r["grade"],r["fused"],r["story"],"open")
+                )
         log.info(f"DB: {len(top_picks)} picks saved for outcome tracking")
     except Exception as e:
         log.debug(f"DB persist: {e}")
+
+    # BUG FIX [ML-001]: second backfill + retrain pass at end of run().
+    # The first _update_meta_outcomes() at the START of run() backfills outcomes
+    # for picks from previous runs that resolved since the last session.  But today's
+    # picks were only just written to pick_outcomes above.  Running a second pass here
+    # ensures the training set includes any outcomes that resolved DURING today's run
+    # (e.g. intraday exits from yesterday's picks confirmed by the outcome engine
+    # earlier in this session).  The retrained model is then ready for tomorrow's run.
+    # Under < 50 samples this is a no-op — the function logs and returns None safely.
+    log.info("Post-run meta-labeler refresh…")
+    _update_meta_outcomes()
+    refreshed_model = _train_meta_labeler(min_samples=50)
+    if refreshed_model:
+        _save_meta_model(refreshed_model)
+        log.info("Meta-model refreshed with today's resolved outcomes")
+
     log.info(f"\n✅ Done | {len(top_picks)} picks | Macro: {macro['macro_state']} | "
              f"VIX: {macro['vix_val']:.1f} | Source: {data_source} | "
              f"Bismillah 🤲")
