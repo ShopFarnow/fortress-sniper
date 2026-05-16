@@ -210,7 +210,7 @@ _SECTOR_YF_CALLS     = 0
 
 # Claude (Anthropic) — signal coherence + halal screening
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL       = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CLAUDE_MODEL       = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
 
 # OpenAI — filing sentiment (mini) + sandbox/weekly (batch)
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
@@ -864,10 +864,18 @@ def _fetch_shariah_csv() -> set:
         "Shariah CSV: all 3 URLs failed — falling back to hardcoded list. "
         "Halal screening is DEGRADED. Check niftyindices.com reachability."
     )
-    _tg_health_alert(
-        "⚠️ Shariah CSV fetch FAILED (all 3 URLs). "
-        "Running on hardcoded fallback list — halal screening may be stale."
-    )
+    # BUG#7 FIX: Only send Telegram alert when ALL sources fail AND no DB cache exists.
+    # Previously this fired every run when NSE blocks the CI IP — spamming the channel.
+    # The alert is now suppressed when a valid DB cache will be used as fallback.
+    _db_cache = _load_shariah_db()
+    if len(_db_cache) < 100:
+        # No usable DB cache either — genuinely degraded, alert warranted
+        _tg_health_alert(
+            "⚠️ Shariah CSV fetch FAILED (all 3 URLs). "
+            "Running on hardcoded fallback list — halal screening may be stale."
+        )
+    else:
+        log.info(f"Shariah CSV fetch failed but DB cache has {len(_db_cache)} symbols — no alert sent")
     return set()
 
 
@@ -1382,9 +1390,16 @@ def _nse_json(sess: requests.Session, url: str, params: dict = None, timeout: in
         except (requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError,
                 IOError,
-                ValueError) as e:            # BUG-004 FIX: retry on ValueError (HTML/empty body)
+                ValueError,
+                json.JSONDecodeError) as e:   # BUG-004 FIX + BUG#2: catch JSONDecodeError explicitly
             last_exc = e
-            log.warning(f"NSE request attempt {attempt+1}/3 failed ({type(e).__name__}): {url} — {e}")
+            log.warning(f"NSE request attempt {attempt+1}/{NSE_MAX_RETRIES} failed ({type(e).__name__}): {url} — {e}")
+            # BUG#2 FIX: HTML/empty body means session cookies expired; rebuild before retry
+            if isinstance(e, (json.JSONDecodeError, ValueError)):
+                global _NSE_SESSION
+                with _NSE_SESSION_LOCK:
+                    _NSE_SESSION = None   # force full session rebuild on next _get_nse_session() call
+                log.info("NSE session reset — cookies may have expired; rebuilding on next request")
     raise last_exc
 
 
@@ -2484,13 +2499,17 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame,
     alt_pct  = (close-ma_ref)/ma_ref*100 if ma_ref>0 else 0.0
 
     if alt_pct < -SNIPER_CFG["ma200_tolerance"]*100 and ma_label=="MA200":
-        # RC3 FIX: Widen tolerance in CHOP/PANIC regimes — mean-reversion and
+        # RC3 FIX + BUG#3 FIX: Widen tolerance in CHOP/PANIC regimes — mean-reversion and
         # bounce entries happen exactly at MA200 dips. Static 5% tolerance killed
         # quality IT stocks in correction (WIPRO, VIMTALABS, ZENSARTECH in the log).
-        # CHOP  → 7.5% (1.5×): controlled pullback entries are valid
-        # PANIC → 10%  (2.0×): catch high-quality stocks in a broad flush
-        # MASSACRE → tolerance unchanged (pipeline returns None upstream anyway)
-        regime_scale = {"CHOP": 1.5, "PANIC": 2.0}.get(macro_state, 1.0)
+        # BUG#3: Stocks 18-29% below MA200 ARE falling knives; the veto is CORRECT.
+        # The fix is NOT to widen tolerance further — it's to ensure the regime label
+        # itself is accurate. If macro_state=CHOP and vix<22, these vetoes are intentional.
+        # For genuine bounce candidates slightly below MA200 (<12%), raise the ceiling:
+        # CHOP  → 12%: controlled pullback entries are valid (was 7.5%)
+        # PANIC → 18%: catch high-quality stocks in a broad flush (was 10%)
+        # MASSACRE → unchanged (pipeline returns None upstream)
+        regime_scale = {"CHOP": 2.4, "PANIC": 3.6}.get(macro_state, 1.0)
         effective_tol = SNIPER_CFG["ma200_tolerance"] * regime_scale * 100
         if alt_pct < -effective_tol:
             log.info(f"FORTRESS VETO {symbol}: alt_pct={alt_pct:.1f}% below MA200 tol "
@@ -6125,19 +6144,67 @@ def _generate_sandbox_proposal():
         log.error(f"Sandbox proposal: {e}")
 
 
+def _load_approved_params():
+    """
+    BUG#4 FIX: Load dynamically approved strategy parameters from strategy_approved DB.
+    Overrides SECTOR_TRUTH multipliers and APEX weights (W dict) if approved values exist.
+    strategy_approved is written by _generate_sandbox_proposal() after human review.
+    Safe to call at startup — falls back to hardcoded defaults if table is empty.
+    """
+    try:
+        with _db_conn() as con:
+            rows = con.execute(
+                "SELECT param_name, param_value FROM strategy_approved"
+            ).fetchall()
+        if not rows:
+            return
+        for param_name, param_value in rows:
+            try:
+                val = float(param_value)
+            except (ValueError, TypeError):
+                continue
+            # Sector truth multipliers: stored as "SECTOR_TRUTH:NIFTY IT" etc.
+            if param_name.startswith("SECTOR_TRUTH:"):
+                sector_key = param_name.split(":", 1)[1]
+                if sector_key in SECTOR_TRUTH:
+                    old = SECTOR_TRUTH[sector_key]
+                    SECTOR_TRUTH[sector_key] = round(max(0.0, min(2.0, val)), 3)
+                    log.info(f"strategy_approved: SECTOR_TRUTH[{sector_key}] {old} → {SECTOR_TRUTH[sector_key]}")
+            # APEX engine weights: stored as "APEX_W:whale_radar" etc.
+            elif param_name.startswith("APEX_W:"):
+                engine_key = param_name.split(":", 1)[1]
+                if engine_key in W:
+                    old = W[engine_key]
+                    W[engine_key] = round(max(0.0, min(1.0, val)), 4)
+                    log.info(f"strategy_approved: W[{engine_key}] {old} → {W[engine_key]}")
+            # Scalar params like APEX_MIN_SCORE, ACCOUNT_RISK_PCT
+            elif param_name == "APEX_MIN_SCORE":
+                global APEX_MIN_SCORE
+                APEX_MIN_SCORE = int(val)
+                log.info(f"strategy_approved: APEX_MIN_SCORE → {APEX_MIN_SCORE}")
+            elif param_name == "ACCOUNT_RISK_PCT":
+                global ACCOUNT_RISK_PCT
+                ACCOUNT_RISK_PCT = round(max(0.005, min(0.05, val)), 4)
+                log.info(f"strategy_approved: ACCOUNT_RISK_PCT → {ACCOUNT_RISK_PCT}")
+        log.info(f"strategy_approved: loaded {len(rows)} param override(s) ✅")
+    except Exception as e:
+        log.debug(f"_load_approved_params: {e} — using hardcoded defaults")
+
+
 def run():
     """
     Single-pass unified pipeline:
     1. Init DB + caches
     2. Macro regime (one fetch, cached)
     3. Halal universe (one fetch, cached)
-    4. Bhavcopy (NSE → Sheets → yfinance, one path)
+    4. Bhavcopy (NSE - Sheets - yfinance, one path)
     5. Intelligence: FII/DII, Insider, Filings, Earnings (one fetch each)
     6. Score each halal candidate through both engines (one loop)
     7. Rank by fused score, sector cap, bucket (mid/small)
     8. Outputs: Excel, HTML, Sheets, Telegram (one send)
     """
     _init_db()
+    _load_approved_params()   # BUG#4 FIX: load dynamic params from strategy_approved DB
     _, date_label = _get_last_trading_day()
 
     # DEBUG: Verify LLM keys — booleans only, safe to keep in production logs.
