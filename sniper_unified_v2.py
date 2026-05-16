@@ -562,17 +562,46 @@ SYMBOL_SECTOR: Dict[str, str] = {
     "DLF":"NIFTY REALTY","GODREJPROP":"NIFTY REALTY","OBEROIRLTY":"NIFTY REALTY",
 }
 
-_SECTOR_LIVE_CACHE: Dict[str, str] = {}
+_SECTOR_LIVE_CACHE: Dict[str, tuple] = {}   # BUG-003 FIX: (sector, timestamp) with TTL
+_SECTOR_CACHE_TTL = 86_400                  # 24 hours in seconds
+
+
+def _lookup_sector_yfinance(sym: str) -> str:
+    """CRIT-1 FIX: yfinance sector fallback when NSE API is blocked."""
+    _YF_SECTOR_MAP = {
+        "Technology": "NIFTY IT", "Consumer Technology": "NIFTY IT",
+        "Communication Services": "NIFTY IT",
+        "Healthcare": "NIFTY PHARMA", "Biotechnology": "NIFTY PHARMA",
+        "Consumer Defensive": "NIFTY FMCG", "Consumer Cyclical": "NIFTY FMCG",
+        "Energy": "NIFTY ENERGY", "Utilities": "NIFTY ENERGY",
+        "Basic Materials": "NIFTY METAL",
+        "Real Estate": "NIFTY REALTY", "Industrials": "NIFTY CAPGOODS",
+        "Financial Services": "DIVERSIFIED", "Finance": "DIVERSIFIED",
+    }
+    try:
+        import yfinance as yf
+        ticker = sym if sym.endswith(".NS") else f"{sym}.NS"
+        info = yf.Ticker(ticker).info
+        raw = info.get("sector") or info.get("industry") or ""
+        return _YF_SECTOR_MAP.get(raw, "DIVERSIFIED")
+    except Exception:
+        return "DIVERSIFIED"
 
 
 def get_sector(sym: str) -> str:
     s = sym.upper()
     if s in SYMBOL_SECTOR:
         return SYMBOL_SECTOR[s]
+    # BUG-003 FIX: check TTL before returning cached value
     if s in _SECTOR_LIVE_CACHE:
-        return _SECTOR_LIVE_CACHE[s]
+        cached_sec, cached_ts = _SECTOR_LIVE_CACHE[s]
+        if time.time() - cached_ts < _SECTOR_CACHE_TTL:
+            return cached_sec
+    # Try NSE first, fall back to yfinance (CRIT-1 FIX)
     sec = _lookup_sector_nse(s)
-    _SECTOR_LIVE_CACHE[s] = sec
+    if sec == "DIVERSIFIED":
+        sec = _lookup_sector_yfinance(s)
+    _SECTOR_LIVE_CACHE[s] = (sec, time.time())
     return sec
 
 
@@ -1304,11 +1333,10 @@ def _nse_json(sess: requests.Session, url: str, params: dict = None, timeout: in
             return resp.json()
         except (requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError,
-                IOError) as e:
+                IOError,
+                ValueError) as e:            # BUG-004 FIX: retry on ValueError (HTML/empty body)
             last_exc = e
             log.warning(f"NSE request attempt {attempt+1}/3 failed ({type(e).__name__}): {url} — {e}")
-        except ValueError as e:
-            raise ValueError(f"NSE JSONDecodeError for {url}: {e}") from e
     raise last_exc
 
 
@@ -2955,7 +2983,36 @@ def _calibrate_bayes_priors() -> dict:
         con.close()
 
         if not cal_rows:
-            return None
+            # BUG-009 FIX: bayes_calibration is only populated BY this function,
+            # so on first run it's always empty. Bootstrap from pick_outcomes directly
+            # by treating each node as a coin-flip seeded from grade and macro state.
+            log.info("Bayes calibration: bootstrapping from pick_outcomes (BUG-009 fix)")
+            bootstrap_rows = []
+            for sym, rdate, status, pnl, story, grade in rows:
+                is_win = status in ("r1_hit", "r2_hit", "r3_hit")
+                # Use available metadata as proxy node signals
+                grade_node = f"grade_{grade}" if grade else "grade_GOOD"
+                bootstrap_rows.append((grade_node, grade or "GOOD", is_win))
+            if bootstrap_rows:
+                try:
+                    with _db_conn() as con:
+                        for node, condition, is_win in bootstrap_rows:
+                            con.execute("""
+                                INSERT INTO bayes_calibration (prior_name, condition, wins, total)
+                                VALUES (?, ?, ?, 1)
+                                ON CONFLICT(prior_name, condition) DO UPDATE SET
+                                    wins  = wins  + excluded.wins,
+                                    total = total + 1
+                            """, (node, condition, int(is_win)))
+                    # Re-read the now-populated table
+                    with _db_conn() as con:
+                        cal_rows = con.execute(
+                            "SELECT prior_name, condition, wins, total FROM bayes_calibration"
+                        ).fetchall()
+                except Exception as e:
+                    log.warning(f"BUG-009 bootstrap write failed: {e}")
+            if not cal_rows:
+                return None
 
         updated_priors = {}
         for name, condition, wins, total in cal_rows:
@@ -4033,11 +4090,11 @@ def assemble_pick(
     # ── CHOP pre-compensation constant ──────────────────────────────────
     # BUG FIX: Old code applied "+8" AFTER dampening: raw×0.88+8.
     # At raw=30: 26.4+8=34.4 (still −13% vs CLEAR's 30). Compensation was ineffective.
-    # New approach: add 12 to raw BEFORE dampening so the effect survives the multiply.
-    # At raw=30 in CHOP: (30+12)×0.88=37.0 (+23% vs undamped 30 — intentional uplift for
-    # CHOP picks that already survived a stricter Fortress filter).
-    # At raw=60 in CHOP: (60+12)×0.88=63.4 vs CLEAR 60 (+5.6%).
-    _CHOP_PRE_COMP = 12
+    # New approach: add to raw BEFORE dampening so the effect survives the multiply.
+    # CRIT-2 FIX: Raised from 12→20 so CHOP picks can clear APEX_MIN_SCORE=35 (CHOP floor).
+    # At raw=30 in CHOP: (30+20)×0.88=44.0 (+47% vs undamped 30).
+    # At raw=60 in CHOP: (60+20)×0.88=70.4 vs CLEAR 60 (+17%).
+    _CHOP_PRE_COMP = 20
 
     # ── APEX CONFLUENCE SCORE (NOT double-counting VPOC) ──
     # Instead of re-scoring VPOC layers (already in fortress_pts),
@@ -4114,8 +4171,10 @@ def assemble_pick(
     )
 
     # ── DEBUG: Log rejections for tuning ──
-    if apex_composite < APEX_MIN_SCORE:
-        log.info(f"  DEBUG {symbol}: REJECTED | apex={apex_composite} | bayes={bayes['bayes_pct']}% | "
+    # CRIT-2 FIX: Use a lower floor in CHOP so sideways-market picks aren't all rejected.
+    apex_floor = 35 if macro_state == "CHOP" else APEX_MIN_SCORE
+    if apex_composite < apex_floor:
+        log.info(f"  DEBUG {symbol}: REJECTED | apex={apex_composite} (floor={apex_floor}/{macro_state}) | bayes={bayes['bayes_pct']}% | "
                  f"whale={whale_score:.0f} | div={div_score:.0f} | vp={vp_score:.0f} | pat={pat_score:.0f} | "
                  f"mc={mc_survival} | confluence={confluence_bonus} | damp={macro_damp.get(macro_state,0.88)}")
         return None
@@ -5167,12 +5226,15 @@ def _adjust_sector_multipliers():
 
 
 def _get_stale_picks(days_stale: int = 5) -> List[dict]:
-    """Find picks that never triggered entry (price never hit buy zone)."""
+    """Find picks that never triggered entry (price never hit buy zone).
+    BUG-006 FIX: sniper_results doesn't have buy_lo/buy_hi columns.
+    Query only columns that exist; derive zone from entry_price ±2%.
+    """
     try:
         con = sqlite3.connect(DB_PATH)
         since = (datetime.today() - timedelta(days=days_stale)).strftime("%Y-%m-%d")
         rows = con.execute(
-            "SELECT run_date, symbol, entry_price, buy_lo, buy_hi, story "
+            "SELECT run_date, symbol, entry_price, story "
             "FROM sniper_results s "
             "WHERE s.run_date<=? AND NOT EXISTS ("
             "  SELECT 1 FROM pick_outcomes o WHERE o.symbol=s.symbol AND o.run_date=s.run_date"
@@ -5180,7 +5242,18 @@ def _get_stale_picks(days_stale: int = 5) -> List[dict]:
             (since,)
         ).fetchall()
         con.close()
-        return [dict(zip(["run_date","symbol","entry_price","buy_lo","buy_hi","story"], r)) for r in rows]
+        result = []
+        for r in rows:
+            run_date, symbol, entry_price, story = r
+            ep = entry_price or 0.0
+            result.append({
+                "run_date": run_date, "symbol": symbol,
+                "entry_price": ep,
+                "buy_lo": round(ep * 0.98, 2),   # BUG-006: synthesised ±2% zone
+                "buy_hi": round(ep * 1.02, 2),
+                "story": story,
+            })
+        return result
     except Exception as e:
         log.debug(f"Stale picks: {e}")
         return []
@@ -5478,8 +5551,17 @@ def calibrated_ai_judge(pick: dict, halal: dict, macro: dict,
                     f"on {wr_data['total']} trades")
 
     if not veto:
-        if p_cal < 0.45:
-            veto, veto_reason = True, f"Calibrated confidence {p_cal:.0%} < 45%"
+        # CRIT-3 FIX: When Platt calibration params are missing (<50 samples), the
+        # identity passthrough returns raw_meta_prob ~0.43. Using a hard 45% threshold
+        # vetoes all uncalibrated picks. Lower to 40% until 200+ samples are collected.
+        has_calibration = (calibration_params is not None and
+                           calibration_params.get("n_samples", 0) >= 50)
+        confidence_floor = 0.45 if has_calibration else 0.40
+        if p_cal < confidence_floor:
+            veto, veto_reason = True, (
+                f"Calibrated confidence {p_cal:.0%} < {confidence_floor:.0%} "
+                f"({'calibrated' if has_calibration else 'uncalibrated floor'})"
+            )
         elif halal.get("score", 0) < 60:
             veto, veto_reason = True, f"Halal score {halal.get('score',0)} < 60 (ACCEPTABLE)"
         elif fused < APEX_MIN_SCORE:
