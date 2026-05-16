@@ -1,5 +1,8 @@
 # ═══════════════════════════════════════════════════════════════
 # GitHub Actions: UNIFIED HALAL SNIPER v3.0-M
+# CACHE-FIXED: Scoped keys per job + restore fallback prevents
+# "Unable to reserve cache" collisions when sniper/reply/weekly
+# overlap or when a previous run's save hasn't expired.
 # ═══════════════════════════════════════════════════════════════
 
 name: 🕌 Unified Halal Sniper v3.0-M
@@ -107,11 +110,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # CACHE FIX [GH-001]: Scoped key + restore fallback.
+      # Problem: static key "sniper-db-cache" collides when reply-handler
+      # or weekly-review runs concurrently or when a previous run's cache
+      # hasn't expired. GitHub cache is immutable — second save always fails.
+      # Fix: Each job writes to its own scoped key. All jobs restore from
+      # the broad prefix "sniper-db-" so they always get the latest DB.
       - name: 🗄️ Restore DB from cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-cache
+          key: sniper-db-main-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sniper-db-main-
+            sniper-db-reply-
+            sniper-db-weekly-
+            sniper-db-
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
@@ -125,7 +139,7 @@ jobs:
         continue-on-error: true
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-cache
+          key: sniper-db-main-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: 📤 Upload outputs
         uses: actions/upload-artifact@v4
@@ -176,11 +190,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      # CACHE FIX [GH-001]: reply-handler gets its own scoped key.
+      # Restore tries reply first, then main, then weekly, then any legacy.
       - name: 🗄️ Restore DB from cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-cache
+          key: sniper-db-reply-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sniper-db-reply-
+            sniper-db-main-
+            sniper-db-weekly-
+            sniper-db-
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
@@ -194,7 +215,7 @@ jobs:
         continue-on-error: true
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-cache
+          key: sniper-db-reply-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: 📤 Upload updated DB
         uses: actions/upload-artifact@v4
@@ -234,11 +255,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # CACHE FIX [GH-001]: weekly-review gets its own scoped key.
+      # Restore tries weekly first, then main (most likely source of big DB).
       - name: 🗄️ Restore DB from cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-cache
+          key: sniper-db-weekly-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sniper-db-weekly-
+            sniper-db-main-
+            sniper-db-reply-
+            sniper-db-
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
@@ -252,4 +280,4 @@ jobs:
         continue-on-error: true
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-cache
+          key: sniper-db-weekly-${{ github.run_id }}-${{ github.run_attempt }}
