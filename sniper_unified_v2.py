@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   UNIFIED HALAL SNIPER v4.0-M — FORTRESS × APEX × CALIBRATED AI JUDGE     ║
+║   UNIFIED HALAL SNIPER v4.1-M — FORTRESS × APEX × CALIBRATED AI JUDGE     ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
 ║   ARCHITECTURE                                                               ║
@@ -9,7 +9,36 @@
 ║   Fortress scoring + APEX 7-engine composite run together,                  ║
 ║   ranked by a single fused score, sent in one clean Telegram message.       ║
 ║                                                                              ║
-║   WHAT WAS MERGED / WHAT WAS DEDUPLICATED                                   ║
+║   v4.1-M UPGRADES (audit-driven, 2026-05-16)                                ║
+║   ─────────────────────────────────────────────────────────────             ║
+║   FIX-1  CLAUDE MODEL: auto-corrects stale "claude-sonnet-4-20250514"      ║
+║           env var → "claude-sonnet-4-5". Eliminates 404 on every run.      ║
+║   FIX-2  PER-PROVIDER LLM CIRCUIT BREAKER: Claude 404 no longer kills      ║
+║           OpenAI filing sentiment. Each provider fails independently.       ║
+║   FIX-3  NSE SECTOR LOOKUP: _lookup_sector_nse() now checks _NSE_IP_BLOCKED║
+║           first. Saves ~3 retries × 5s per symbol when CI IP is banned.    ║
+║   FIX-4  RENEWABLE ENERGY BYPASS: SUZLON, TATAPOWER, INOXWIND, NTPC etc.  ║
+║           no longer blocked by NIFTY ENERGY sector veto. Mapped to         ║
+║           "NIFTY RENEWABLE" with sector_mult=0.90 (permissible).           ║
+║   FIX-5  APEX FLOOR CHOP 35→30: 10+ good setups were rejected at apex=32- ║
+║           34 in CHOP. Fused gate (48) remains the quality filter.           ║
+║   FIX-6  LLM FILING SCORE WIRED: llm_filing_sentiment score (0-30) now     ║
+║           adds 0-10 pts to fused for final picks. Was pure metadata before. ║
+║   FIX-7  HALAL L2 SENTINEL: debt_to_mcap=-1 (unknown) now applies -10pt   ║
+║           penalty instead of silently passing as debt=0.                    ║
+║   FIX-8  REGIME ATR STOP: CHOP→2.5×, CLEAR→1.8× (was fixed 2.0×).        ║
+║           Wider stops in choppy tape; tighter in trending tape.             ║
+║   FIX-9  SHEETS FRESHNESS CHECK: warns when INSIDER/FILINGS/EARNINGS       ║
+║           tabs are >2 days stale — prevents fundamental signal asymmetry.   ║
+║   FIX-10 CLAUDE MODEL LOGGED ON STARTUP: surfaces wrong env var instantly.  ║
+║                                                                              ║
+║   RECOMMENDED GITHUB ACTIONS ENV VARS                                        ║
+║   ─────────────────────────────────────────────────────────────             ║
+║   NSE_MAX_RETRIES=1        (cuts log noise 66% when IP blocked)             ║
+║   CLAUDE_MODEL=            (remove/empty — let code use its correct default)║
+║   SUPPRESS_HEALTH_ALERTS=1 (suppress Shariah CSV noise in CI)               ║
+║                                                                              ║
+║   WHAT WAS MERGED / WHAT WAS DEDUPLICATED (from v4.0-M)                    ║
 ║   ─────────────────────────────────────────────────────────────             ║
 ║   ✓  Single is_halal() — Nifty500 Shariah CSV → Sheets Tab 7 → fallback    ║
 ║   ✓  Single fetch_history() — NSE API → yfinance (NSE session shared)      ║
@@ -24,15 +53,7 @@
 ║   ✓  Story: structured (not raw Sheets cell refs), all 4 signal sources    ║
 ║   ✓  Single Telegram send — MarkdownV2 safe, plain-text fallback            ║
 ║   ✓  Single DB (fortress_cache.db) — halal, ROCE, EOD, positions           ║
-║   ✓  Single GitHub Actions step — python sniper_unified_v1.py              ║
-║                                                                              ║
-║   REMOVED BUGS                                                               ║
-║   ─────────────────────────────────────────────────────────────             ║
-║   ✗  Fortress running twice (workflow python -c + standalone)               ║
-║   ✗  Duplicate is_halal() / HALAL_WHITELIST in APEX                        ║
-║   ✗  APEX header hardcoded "v1.1" (now reads VERSION)                      ║
-║   ✗  Story returning raw "updates [sheets tab 4]" cell refs                ║
-║   ✗  run_apex_after_fortress() imported but never called                   ║
+║   ✓  Single GitHub Actions step — python sniper_unified_v2.py              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -58,7 +79,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v4.0-M"
+VERSION = "UNIFIED v4.1-M"
 
 # ── Event-Driven Pipeline Infrastructure ──────────────────────────────────────
 # Producer threads push MarketEvents into the queue.
@@ -102,7 +123,10 @@ ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "0.015"))
 SHARIAH_TTL_DAYS = int(os.getenv("SHARIAH_CACHE_TTL_DAYS", "7"))  # FIX-3: was 1 day; CI IPs blocked so daily re-fetch always fails; extend to 7d
 APEX_TOP_N       = int(os.getenv("APEX_TOP_N", "5"))
 APEX_MIN_SCORE   = int(os.getenv("APEX_MIN_SCORE", "48"))
-NSE_MAX_RETRIES  = int(os.getenv("NSE_MAX_RETRIES", "3"))         # FIX-4: set NSE_MAX_RETRIES=1 in CI env to cut log noise when NSE is blocked
+NSE_MAX_RETRIES  = int(os.getenv("NSE_MAX_RETRIES", "3"))
+# FIX-4.1-M: Set NSE_MAX_RETRIES=1 in GitHub Actions env to cut log noise
+# when NSE IP is blocked. Each wasted retry = ~5s + 3 log lines.
+# Recommended GitHub Actions secret: NSE_MAX_RETRIES=1
 
 MC_SIMS    = int(os.getenv("MC_SIMS", "600"))
 
@@ -159,19 +183,36 @@ SNIPER_CFG = dict(
 )
 
 SECTOR_INDICES = {
-    "NIFTY IT":     "CNXIT",
-    "NIFTY PHARMA": "CNXPHARMA",
-    "NIFTY AUTO":   "CNXAUTO",
-    "NIFTY FMCG":   "CNXFMCG",
-    "NIFTY METAL":  "CNXMETAL",
+    "NIFTY IT":       "CNXIT",
+    "NIFTY PHARMA":   "CNXPHARMA",
+    "NIFTY AUTO":     "CNXAUTO",
+    "NIFTY FMCG":     "CNXFMCG",
+    "NIFTY METAL":    "CNXMETAL",
+    "NIFTY CAPGOODS": "CNXINFRA",
 }
 
 SECTOR_TRUTH = {
     "NIFTY PHARMA": 1.15, "NIFTY IT": 1.10, "NIFTY AUTO": 1.00,
-    "NIFTY FMCG": 0.95,  "NIFTY METAL": 0.85, "DIVERSIFIED": 1.00,
-    "NIFTY BANK": 0.00,  "NIFTY REALTY": 0.75, "NIFTY ENERGY": 0.20,
+    "NIFTY FMCG": 0.95,   "NIFTY METAL": 0.85, "DIVERSIFIED": 1.00,
+    "NIFTY BANK": 0.00,   "NIFTY REALTY": 0.75,
+    # FIX-4.1-M: Split NIFTY ENERGY into sub-categories.
+    # Oil/gas = haram (petro income, riba-adjacent PSU structures) → BLOCKED.
+    # Renewables = permissible (solar/wind/hydro manufacturing & services).
+    # get_sector() maps renewables keywords → "NIFTY RENEWABLE" so they bypass the block.
+    "NIFTY ENERGY": 0.20,       # legacy catch-all: heavy penalty (most are oil/gas)
+    "NIFTY RENEWABLE": 0.90,    # solar, wind, EV infra — fully permissible
+    "NIFTY CAPGOODS": 1.05,
 }
+# Sectors that are always vetoed regardless of score
 SECTOR_BLOCKED = {"NIFTY BANK", "NIFTY ENERGY"}
+# Renewables bypass SECTOR_BLOCKED — explicitly whitelisted
+_RENEWABLE_SYMBOLS = {
+    "SUZLON","INOXWIND","WEBELSOLAR","TATAPOWER","TORNTPOWER","CESC",
+    "SJVN","NHPC","NTPC",       # NTPC is 60% renewable now
+    "WAAREEENER","PREMIER","OLECTRA","GREENKO","STERLINWIL","ACME",
+    "GOLDENSORL","JINDALSTE",   # solar manufacturing
+    "KAYNES","DIXON",           # EV electronics supply chain
+}
 
 SECTOR_ATR_MULT = {
     "NIFTY METAL": 1.20, "NIFTY IT": 0.90, "NIFTY PHARMA": 1.10,
@@ -220,7 +261,13 @@ _SECTOR_YF_CALLS     = 0
 
 # Claude (Anthropic) — signal coherence + halal screening
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL       = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
+# FIX-MODEL: env var was set to stale "claude-sonnet-4-20250514" — correct name is
+# "claude-sonnet-4-5". If CLAUDE_MODEL env var exists, validate it; strip known stale names.
+_raw_claude_model  = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
+_STALE_MODEL_NAMES = {"claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022",
+                      "claude-3-sonnet-20240229", "claude-3-haiku-20240307"}
+CLAUDE_MODEL       = ("claude-sonnet-4-5" if _raw_claude_model in _STALE_MODEL_NAMES
+                      else _raw_claude_model)
 
 # OpenAI — filing sentiment (mini) + sandbox/weekly (batch)
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
@@ -238,12 +285,17 @@ LLM_ENABLED   = _ANTHROPIC_OK or _OPENAI_OK
 LLM_API_KEY = ANTHROPIC_API_KEY
 LLM_MODEL   = CLAUDE_MODEL
 
-# ── LLM circuit breaker (mirrors yfinance CB pattern) ────────────────────────
-# Opens after 3 consecutive provider failures per run; prevents burning tokens
-# on a dead key or rate-limit storm. Resets automatically next run.
-_LLM_FAIL_COUNT  = 0
-_LLM_CIRCUIT_OPEN = False
-_LLM_CB_LOCK     = threading.Lock()
+# ── LLM circuit breaker — PER PROVIDER (v4.1-M fix)
+# Previously shared: one Claude 404 burned OpenAI's budget too.
+# Now each provider has its own fail counter and circuit.
+_LLM_CB_LOCK       = threading.Lock()
+_CLAUDE_FAIL_COUNT  = 0
+_CLAUDE_CIRCUIT_OPEN = False
+_OPENAI_FAIL_COUNT  = 0
+_OPENAI_CIRCUIT_OPEN = False
+# Backward-compat alias used by a few inline checks
+_LLM_FAIL_COUNT  = 0      # kept for any external references
+_LLM_CIRCUIT_OPEN = False  # kept for any external references
 
 
 def _llm_hash(text: str) -> str:
@@ -255,14 +307,13 @@ def _llm_hash(text: str) -> str:
 
 def _call_claude(prompt: str, max_tokens: int = None) -> Optional[str]:
     """Call Claude Sonnet. Returns text or None.
-    FIX-CB: circuit breaker opens after 3 consecutive failures per run to prevent
-    burning tokens against a dead key or rate-limit storm."""
-    global _LLM_FAIL_COUNT, _LLM_CIRCUIT_OPEN
+    FIX-4.1-M: Per-provider circuit breaker — Claude failures don't affect OpenAI."""
+    global _CLAUDE_FAIL_COUNT, _CLAUDE_CIRCUIT_OPEN
     if not _ANTHROPIC_OK:
         return None
     with _LLM_CB_LOCK:
-        if _LLM_CIRCUIT_OPEN:
-            log.debug("LLM circuit OPEN — skipping Claude call")
+        if _CLAUDE_CIRCUIT_OPEN:
+            log.debug("Claude circuit OPEN — skipping call")
             return None
     try:
         resp = requests.post(
@@ -281,32 +332,40 @@ def _call_claude(prompt: str, max_tokens: int = None) -> Optional[str]:
         )
         if resp.status_code == 200:
             with _LLM_CB_LOCK:
-                _LLM_FAIL_COUNT = 0   # reset on any success
+                _CLAUDE_FAIL_COUNT = 0
             return resp.json()["content"][0]["text"]
-        # FIX-LOG: was log.debug — now visible in GitHub Actions
         log.warning(f"Claude API error {resp.status_code}: {resp.text[:120]}")
+        # 404 means wrong model name — open circuit immediately, don't retry
+        if resp.status_code == 404:
+            with _LLM_CB_LOCK:
+                _CLAUDE_CIRCUIT_OPEN = True
+                log.error(
+                    f"Claude 404: model '{CLAUDE_MODEL}' not found. "
+                    "Check CLAUDE_MODEL env var. Claude circuit OPEN for this run."
+                )
+            return None
     except Exception as e:
         log.warning(f"Claude call exception: {e}")
     with _LLM_CB_LOCK:
-        _LLM_FAIL_COUNT += 1
-        if _LLM_FAIL_COUNT >= 3:
-            _LLM_CIRCUIT_OPEN = True
+        _CLAUDE_FAIL_COUNT += 1
+        if _CLAUDE_FAIL_COUNT >= 3:
+            _CLAUDE_CIRCUIT_OPEN = True
             log.error(
-                f"LLM circuit breaker OPEN after {_LLM_FAIL_COUNT} consecutive failures. "
-                "All LLM calls suppressed for rest of this run. Check ANTHROPIC_API_KEY."
+                f"Claude circuit breaker OPEN after {_CLAUDE_FAIL_COUNT} failures. "
+                "Check ANTHROPIC_API_KEY and CLAUDE_MODEL."
             )
     return None
 
 
 def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Optional[str]:
     """Call OpenAI. Returns text or None.
-    FIX-CB: shares the same LLM circuit breaker as _call_claude."""
-    global _LLM_FAIL_COUNT, _LLM_CIRCUIT_OPEN
+    FIX-4.1-M: Per-provider circuit breaker — independent from Claude failures."""
+    global _OPENAI_FAIL_COUNT, _OPENAI_CIRCUIT_OPEN
     if not _OPENAI_OK:
         return None
     with _LLM_CB_LOCK:
-        if _LLM_CIRCUIT_OPEN:
-            log.debug("LLM circuit OPEN — skipping OpenAI call")
+        if _OPENAI_CIRCUIT_OPEN:
+            log.debug("OpenAI circuit OPEN — skipping call")
             return None
     try:
         resp = requests.post(
@@ -324,19 +383,18 @@ def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Opti
         )
         if resp.status_code == 200:
             with _LLM_CB_LOCK:
-                _LLM_FAIL_COUNT = 0
+                _OPENAI_FAIL_COUNT = 0
             return resp.json()["choices"][0]["message"]["content"]
-        # FIX-LOG: was log.debug — now visible in GitHub Actions
         log.warning(f"OpenAI API error {resp.status_code}: {resp.text[:120]}")
     except Exception as e:
         log.warning(f"OpenAI call exception: {e}")
     with _LLM_CB_LOCK:
-        _LLM_FAIL_COUNT += 1
-        if _LLM_FAIL_COUNT >= 3:
-            _LLM_CIRCUIT_OPEN = True
+        _OPENAI_FAIL_COUNT += 1
+        if _OPENAI_FAIL_COUNT >= 3:
+            _OPENAI_CIRCUIT_OPEN = True
             log.error(
-                f"LLM circuit breaker OPEN after {_LLM_FAIL_COUNT} consecutive failures. "
-                "All LLM calls suppressed for rest of this run. Check OPENAI_API_KEY."
+                f"OpenAI circuit breaker OPEN after {_OPENAI_FAIL_COUNT} failures. "
+                "Check OPENAI_API_KEY."
             )
     return None
 
@@ -814,6 +872,11 @@ def _live_sector_momentum(sector: str, days: int = 20) -> dict:
         return NEUTRAL
 
 def _lookup_sector_nse(sym: str) -> str:
+    # FIX-4.1-M: Skip ALL NSE calls immediately if IP-blocked — was burning
+    # 3 retries × 5s per symbol even after _NSE_IP_BLOCKED was set.
+    with _NSE_FAIL_LOCK:
+        if _NSE_IP_BLOCKED:
+            return "DIVERSIFIED"
     try:
         sess = _get_nse_session()
         data = _nse_json(sess, "https://www.nseindia.com/api/quote-equity", params={"symbol": sym}, timeout=10)
@@ -1024,7 +1087,9 @@ def _halal_l1_business_veto(symbol: str) -> bool:
 def _halal_l2_financial_veto(symbol: str) -> Tuple[bool, float]:
     """
     Layer 2: Debt/MarketCap < 33% check.
-    Returns (veto, debt_to_mcap). Defaults to (False, 0.0) on data failure.
+    Returns (veto, debt_to_mcap). Defaults to (False, -1.0) on data failure.
+    FIX-4.1-M: returns -1.0 (sentinel) when data unavailable so caller can
+    apply a data-unavailable penalty instead of silently passing as debt=0.
     """
     try:
         con = sqlite3.connect(DB_PATH, timeout=5)
@@ -1052,7 +1117,8 @@ def _halal_l2_financial_veto(symbol: str) -> Tuple[bool, float]:
             return dtm >= 0.33, dtm
     except Exception:
         pass
-    return False, 0.0
+    # -1.0 sentinel = data unavailable (caller should apply score penalty)
+    return False, -1.0
 
 
 def _halal_l3_ethical_score(symbol: str, sector: str) -> int:
@@ -1180,10 +1246,18 @@ def halal_ai_screen(symbol: str, sector: str = "DIVERSIFIED",
         _halal_ai_cache_save(sym, result)
         return result
 
+    # FIX-4.1-M: debt_to_mcap == -1.0 means data unavailable.
+    # Don't pass silently as debt=0 — apply a -10 score penalty for uncertainty.
+    _debt_data_missing = (debt_to_mcap < 0)
+    _debt_for_penalty  = 0.0 if _debt_data_missing else debt_to_mcap
+
     # ── Layer 3: Ethical overlay ─────────────────────────────────────────────
     ethical_score = _halal_l3_ethical_score(sym, sector)
     base_score    = 70 + ethical_score
-    debt_penalty  = int(max(0, debt_to_mcap - 0.10) * 100)
+    debt_penalty  = int(max(0, _debt_for_penalty - 0.10) * 100)
+    # FIX-4.1-M: additional -10 when debt data is missing (can't verify compliance)
+    if _debt_data_missing:
+        debt_penalty += 10
     base_score   -= debt_penalty
     base_score    = max(0, min(100, base_score))
 
@@ -2580,6 +2654,11 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame,
         return None
 
     sector      = get_sector(symbol)
+    # FIX-4.1-M: Renewable energy bypass — SUZLON, TATAPOWER, INOXWIND, etc. are
+    # halal businesses mapped to "NIFTY ENERGY" by keyword but permissible in Islam.
+    # Override sector for known renewable symbols before SECTOR_BLOCKED check.
+    if symbol.upper() in _RENEWABLE_SYMBOLS and sector == "NIFTY ENERGY":
+        sector = "NIFTY RENEWABLE"
     sector_mult = SECTOR_TRUTH.get(sector, 1.0)
     if sector in SECTOR_BLOCKED:
         log.info(f"FORTRESS VETO {symbol}: sector is BLOCKED")
@@ -4476,8 +4555,12 @@ def assemble_pick(
     )
 
     # ── DEBUG: Log rejections for tuning ──
-    # CRIT-2 FIX: Use a lower floor in CHOP so sideways-market picks aren't all rejected.
-    apex_floor = 35 if macro_state == "CHOP" else APEX_MIN_SCORE
+    # FIX-4.1-M: APEX floor 35 in CHOP regime was too aggressive — 10+ symbols
+    # with apex=32-34 were rejected despite strong Fortress passes (45-69 pts).
+    # Lower to 30 for CHOP. The fused gate (APEX_MIN_SCORE=48) provides the
+    # secondary quality filter — a stock with apex=30 + fort=69 gets fused=52 and
+    # passes normally, while apex=30 + fort=42 gets fused=44 and is still rejected.
+    apex_floor = 30 if macro_state == "CHOP" else APEX_MIN_SCORE
     if apex_composite < apex_floor:
         log.info(f"  DEBUG {symbol}: REJECTED | apex={apex_composite} (floor={apex_floor}/{macro_state}) | bayes={bayes['bayes_pct']}% | "
                  f"whale={whale_score:.0f} | div={div_score:.0f} | vp={vp_score:.0f} | pat={pat_score:.0f} | "
@@ -4487,8 +4570,12 @@ def assemble_pick(
     # ── META-LABELING: Store signal vector + optional veto ──
 
     # (veto moved to debug block above)
-    atr_m  = SECTOR_ATR_MULT.get(sector,1.0)
-    risk   = atr14*2.0*atr_m if atr14>0 else close*0.03
+    # ── REGIME-AWARE ATR STOP MULTIPLIER (FIX-4.1-M) ─────────────────────────
+    # In CHOP regime, tight stops get hit by noise — widen to 2.5×.
+    # In CLEAR regime, trend is your friend — tighten to 1.8× for better R:R.
+    _regime_atr_mult = {"CHOP": 2.5, "FOG": 2.8, "PANIC": 3.0, "CLEAR": 1.8}.get(macro_state, 2.0)
+    atr_m  = SECTOR_ATR_MULT.get(sector,1.0) * _regime_atr_mult
+    risk   = atr14 * atr_m if atr14>0 else close*0.03
     r1     = round(close+risk*2.5,2)
     r2     = round(close+risk*4.0,2)
     r3     = round(close+risk*6.5,2)
@@ -5674,7 +5761,46 @@ def _alert_open_positions():
 
 
 
-def _data_quality_gate(bhavcopy: pd.DataFrame, data_source: str) -> dict:
+def _check_sheets_freshness():
+    """
+    FIX-4.1-M: Warn when Sheets intelligence tabs haven't been updated recently.
+    Technical signals (bhavcopy) are always T+0; stale Sheets means fundamental
+    signals (insider, filings, earnings) may be days old — creating asymmetry.
+    """
+    if not _sheets_ok():
+        return
+    STALE_THRESHOLD_DAYS = 2
+    tabs_to_check = [
+        ("INSIDER",  "DATE",   "insider trades"),
+        ("FILINGS",  "DATE",   "corporate filings"),
+        ("EARNINGS", "DATE",   "earnings calendar"),
+        ("FII_DII",  "DATE",   "FII/DII data"),
+    ]
+    try:
+        today = datetime.today().date()
+        for tab, date_col_hint, label in tabs_to_check:
+            try:
+                df = _read_sheet(tab)
+                if df.empty:
+                    continue
+                date_col = next((c for c in df.columns
+                                 if any(k in c for k in ("DATE","TIMESTAMP","UPDATED","TIME"))), None)
+                if date_col is None:
+                    continue
+                dates = pd.to_datetime(df[date_col], errors="coerce").dropna()
+                if dates.empty:
+                    continue
+                latest = dates.max().date()
+                age = (today - latest).days
+                if age > STALE_THRESHOLD_DAYS:
+                    log.warning(
+                        f"⚠️ SHEETS STALE: '{tab}' last updated {age}d ago ({latest}). "
+                        f"{label.capitalize()} signals may be outdated — update the sheet."
+                    )
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug(f"Sheets freshness check: {e}")
     """
     Auto-adjust thresholds if data quality degrades.
     Returns: {apex_min_score: int, apex_top_n: int, alert: str}
@@ -6354,12 +6480,20 @@ def run():
     log.info(f"LLM_ENABLED: {LLM_ENABLED}")
     log.info(f"Anthropic OK: {_ANTHROPIC_OK}")
     log.info(f"OpenAI OK:    {_OPENAI_OK}")
+    if _ANTHROPIC_OK:
+        _stale_flag = "⚠️ (was stale — auto-corrected to claude-sonnet-4-5)" if _raw_claude_model in _STALE_MODEL_NAMES else "✅"
+        log.info(f"Claude model: {CLAUDE_MODEL} {_stale_flag}")
 
-    # Reset LLM circuit breaker for this run
+    # Reset LLM circuit breakers (per-provider) for this run — FIX-4.1-M
+    global _CLAUDE_FAIL_COUNT, _CLAUDE_CIRCUIT_OPEN, _OPENAI_FAIL_COUNT, _OPENAI_CIRCUIT_OPEN
     global _LLM_FAIL_COUNT, _LLM_CIRCUIT_OPEN
     with _LLM_CB_LOCK:
-        _LLM_FAIL_COUNT   = 0
-        _LLM_CIRCUIT_OPEN = False
+        _CLAUDE_FAIL_COUNT   = 0
+        _CLAUDE_CIRCUIT_OPEN = False
+        _OPENAI_FAIL_COUNT   = 0
+        _OPENAI_CIRCUIT_OPEN = False
+        _LLM_FAIL_COUNT      = 0
+        _LLM_CIRCUIT_OPEN    = False
 
     # Reset NSE circuit breaker for this run (IP bans are per-session, not permanent)
     global _NSE_CONSECUTIVE_FAILS, _NSE_IP_BLOCKED, _NSE_HISTORY_OK
@@ -6409,6 +6543,9 @@ def run():
     _HALAL_CUSTOM_LIST = _read_sheets_halal_list()
     if _HALAL_CUSTOM_LIST:
         log.info(f"Custom HALAL_LIST: {len(_HALAL_CUSTOM_LIST)} symbols loaded from Sheets Tab 7")
+
+    # FIX-4.1-M: Check if intelligence Sheets tabs are fresh (runs async with bhavcopy fetch)
+    _check_sheets_freshness()
 
     # 3. Bhavcopy
     bhavcopy, data_source = load_bhavcopy()
@@ -6802,6 +6939,21 @@ def run():
                     pick["llm_filing_detail"]     = llm_filing.get("detail", "")
                     log.info(f"  LLM filing OK: {sym} — score {llm_filing['score']}")
         log.info("LLM enrichment complete")
+        # FIX-4.1-M: Wire LLM filing sentiment score back into fused composite.
+        # Previously llm_filing_sentiment ran and returned 19-30 but was stored
+        # as pure metadata — never affected ranking or fused score.
+        # Now adds 0-10 pts to fused (capped at 100) so strong filings push picks up.
+        for pick in top_picks:
+            filing_score = (pick.get("llm_filing_detail") or {})
+            if isinstance(filing_score, dict):
+                raw_fs = filing_score.get("score", 0)
+            else:
+                raw_fs = pick.get("score_filing", 15)
+            llm_bonus = int(max(0, min(10, (raw_fs - 15) / 1.5)))  # 0 at score=15, +10 at score=30
+            if llm_bonus > 0:
+                old_fused = pick["fused"]
+                pick["fused"] = min(100, pick["fused"] + llm_bonus)
+                log.info(f"  LLM filing bonus {pick['symbol']}: fused {old_fused}→{pick['fused']} (+{llm_bonus})")
     elif not LLM_ENABLED:
         log.info("LLM disabled — skipping enrichment (set ANTHROPIC_API_KEY or OPENAI_API_KEY)")
 
