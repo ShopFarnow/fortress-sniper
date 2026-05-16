@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   UNIFIED HALAL SNIPER v3.0-M — FORTRESS × APEX FUSED ENGINE              ║
+║   UNIFIED HALAL SNIPER v4.0-M — FORTRESS × APEX × CALIBRATED AI JUDGE     ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
 ║   ARCHITECTURE                                                               ║
@@ -58,7 +58,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v3.0-M"
+VERSION = "UNIFIED v4.0-M"
 
 # ── Event-Driven Pipeline Infrastructure ──────────────────────────────────────
 # Producer threads push MarketEvents into the queue.
@@ -202,20 +202,93 @@ _SECTOR_YF_CALLS     = 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1b — LLM CONFIG (optional, gracefully degrading)
+# [PATCH-A]  MULTI-PROVIDER LLM CONFIG  (replaces SECTION 1b — v4.0-M)
 # ══════════════════════════════════════════════════════════════════════════════
+# Each task routes to the cheapest capable model.
+# To enable: set the relevant API key env var. Keys absent → rule-based fallback.
 
-LLM_API_KEY      = os.getenv("ANTHROPIC_API_KEY", "")
-LLM_MODEL        = os.getenv("LLM_MODEL", "claude-sonnet-4-20250514")  # Default: cheapest capable model
-LLM_MAX_TOKENS   = int(os.getenv("LLM_MAX_TOKENS", "512"))
-LLM_ENABLED      = bool(LLM_API_KEY)  # Auto-disable if no key
+# Claude (Anthropic) — signal coherence + halal screening
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL       = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+
+# OpenAI — filing sentiment (mini) + sandbox/weekly (batch)
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MINI_MODEL  = os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini")
+OPENAI_BATCH_MODEL = os.getenv("OPENAI_BATCH_MODEL", "gpt-4o")
+
+LLM_MAX_TOKENS     = int(os.getenv("LLM_MAX_TOKENS", "512"))
+
+# Backward-compat: if only ANTHROPIC_API_KEY set, it covers all LLM tasks
+_ANTHROPIC_OK = bool(ANTHROPIC_API_KEY)
+_OPENAI_OK    = bool(OPENAI_API_KEY)
+LLM_ENABLED   = _ANTHROPIC_OK or _OPENAI_OK
+
+# Legacy shims (used elsewhere in the codebase)
+LLM_API_KEY = ANTHROPIC_API_KEY
+LLM_MODEL   = CLAUDE_MODEL
 
 
 def _llm_hash(text: str) -> str:
-    """SHA256 hash for LLM cache deduplication."""
     import hashlib
     return hashlib.sha256(text.encode()).hexdigest()[:32]
 
+
+# ── Provider routers ─────────────────────────────────────────────────────────
+
+def _call_claude(prompt: str, max_tokens: int = None) -> Optional[str]:
+    """Call Claude Sonnet. Returns text or None."""
+    if not _ANTHROPIC_OK:
+        return None
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": CLAUDE_MODEL,
+                "max_tokens": max_tokens or LLM_MAX_TOKENS,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json()["content"][0]["text"]
+        log.warning(f"Claude {resp.status_code}: {resp.text[:80]}")
+    except Exception as e:
+        log.debug(f"Claude call failed: {e}")
+    return None
+
+
+def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Optional[str]:
+    """Call OpenAI. Returns text or None."""
+    if not _OPENAI_OK:
+        return None
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model or OPENAI_MINI_MODEL,
+                "max_tokens": max_tokens or LLM_MAX_TOKENS,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"]
+        log.warning(f"OpenAI {resp.status_code}: {resp.text[:80]}")
+    except Exception as e:
+        log.debug(f"OpenAI call failed: {e}")
+    return None
+
+
+# ── Shared SQLite LLM cache ──────────────────────────────────────────────────
 
 def _llm_cached(text: str, prompt_type: str) -> Optional[str]:
     """Check SQLite cache for existing LLM result."""
@@ -243,7 +316,7 @@ def _llm_store_cache(text: str, prompt_type: str, result: str, model: str = ""):
         con = sqlite3.connect(DB_PATH)
         con.execute(
             "INSERT OR REPLACE INTO llm_cache (text_hash, prompt_type, result, model) VALUES (?,?,?,?)",
-            (_llm_hash(text), prompt_type, result, model or LLM_MODEL)
+            (_llm_hash(text), prompt_type, result, model or CLAUDE_MODEL)
         )
         con.commit(); con.close()
     except Exception:
@@ -252,54 +325,26 @@ def _llm_store_cache(text: str, prompt_type: str, result: str, model: str = ""):
 
 def _llm_call(prompt: str, prompt_type: str, max_tokens: int = None) -> Optional[str]:
     """
-    Call Claude API with caching. Returns None if disabled or failed.
-    Designed to be provider-agnostic — swap the request block for OpenAI/Gemini.
+    Legacy single-provider call shim. Routes to Claude first, then OpenAI.
+    New code should call _call_claude / _call_openai directly.
     """
     if not LLM_ENABLED:
         return None
-
-    # Check cache first
     cached = _llm_cached(prompt, prompt_type)
     if cached:
         return cached
+    raw = _call_claude(prompt, max_tokens) or _call_openai(prompt, max_tokens=max_tokens)
+    if raw:
+        _llm_store_cache(prompt, prompt_type, raw)
+    return raw
 
-    # API call
-    try:
-        import requests
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": LLM_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json={
-                "model": LLM_MODEL,
-                "max_tokens": max_tokens or LLM_MAX_TOKENS,
-                "messages": [{"role": "user", "content": prompt}]
-            },
-            timeout=30
-        )
-        if resp.status_code == 200:
-            result = resp.json()["content"][0]["text"]
-            _llm_store_cache(prompt, prompt_type, result)
-            return result
-        else:
-            log.warning(f"LLM API error {resp.status_code}: {resp.text[:100]}")
-    except Exception as e:
-        log.debug(f"LLM call failed: {e}")
 
-    return None
-
+# ── Task-specific callers ────────────────────────────────────────────────────
 
 def _llm_alpha_mine(subject: str, symbol: str = "") -> dict:
-    """
-    Extract continuous numerical factors from filing text.
-    Returns standardized factors for direct mathematical integration.
-    Separated from structured_reasoning (which evaluates internal signal coherence).
-    """
+    """Filing sentiment → GPT-4o mini (cheapest). Falls back to Claude, then rule."""
     if not LLM_ENABLED:
-        return {"score": None, "factors": {}, "source": "LLM_DISABLED"}
+        return {"score": 15, "factors": {}, "source": "LLM_DISABLED"}
 
     cache_key = f"alpha_mine:{symbol}:{_llm_hash(subject)}"
     cached = _llm_cached(cache_key, "alpha_mine")
@@ -309,121 +354,62 @@ def _llm_alpha_mine(subject: str, symbol: str = "") -> dict:
         except Exception:
             pass
 
-    prompt = """Analyze this Indian corporate filing. Extract exactly these numerical factors:
-
-
-
-SURPRISE_FACTOR: [-1.0 to 1.0]  # Unexpectedness vs market consensus
-
-CONFIDENCE: [0.0 to 1.0]        # Management certainty in language
-
-URGENCY: [0.0 to 1.0]           # Time-sensitivity implied
-
-SENTIMENT: [-1.0 to 1.0]        # Directional sentiment
-
-MATERIALITY: [0.0 to 1.0]       # Likely price impact magnitude
-
-
-
-Filing: {subject}
-
-Symbol: {symbol}
-
-
-
-Return ONLY as JSON: {{"SURPRISE_FACTOR": X.XX, "CONFIDENCE": X.XX, "URGENCY": X.XX, "SENTIMENT": X.XX, "MATERIALITY": X.XX}}""".format(subject=subject, symbol=symbol)
-
-    result = _llm_call(prompt, "alpha_mine", max_tokens=256)
-    if not result:
-        return {"score": None, "factors": {}, "source": "LLM_FAILED"}
+    prompt = (
+        "Analyze this Indian corporate filing. Return ONLY JSON (no markdown):\n"
+        '{"SURPRISE_FACTOR": X.XX, "CONFIDENCE": X.XX, "URGENCY": X.XX, '
+        '"SENTIMENT": X.XX, "MATERIALITY": X.XX}\n'
+        f"Ranges: SURPRISE_FACTOR/SENTIMENT [-1,1], others [0,1]\n"
+        f"Filing: {subject[:800]}\nSymbol: {symbol}"
+    )
+    # Route: GPT-4o mini first, fall back to Claude
+    raw = _call_openai(prompt, model=OPENAI_MINI_MODEL, max_tokens=200) or _call_claude(prompt, max_tokens=200)
+    if not raw:
+        return {"score": 15, "factors": {}, "source": "LLM_FAILED"}
 
     try:
-        json_str = result
-        if "```json" in result:
-            json_str = result.split("```json")[1].split("```")[0].strip()
-        elif "```" in result:
-            json_str = result.split("```")[1].split("```")[0].strip()
-
-        factors = json.loads(json_str)
-
+        txt = raw.strip().replace("```json", "").replace("```", "")
+        factors = json.loads(txt)
         validated = {}
         for key, default in [("SURPRISE_FACTOR", 0.0), ("CONFIDENCE", 0.5),
                               ("URGENCY", 0.5), ("SENTIMENT", 0.0), ("MATERIALITY", 0.5)]:
-            val = factors.get(key, default)
-            try:
-                val = float(val)
-            except (TypeError, ValueError):
-                val = default
-            if key == "SURPRISE_FACTOR" or key == "SENTIMENT":
+            val = float(factors.get(key, default))
+            if key in ("SURPRISE_FACTOR", "SENTIMENT"):
                 val = max(-1.0, min(1.0, val))
             else:
                 val = max(0.0, min(1.0, val))
             validated[key] = round(val, 2)
-
-        alpha_score = (
-            validated["SURPRISE_FACTOR"] * 0.25 +
-            validated["CONFIDENCE"] * 0.20 +
-            validated["URGENCY"] * 0.15 +
-            validated["SENTIMENT"] * 0.30 +
-            validated["MATERIALITY"] * 0.10
-        ) * 30
-
-        alpha_score = (alpha_score + 15)
-        alpha_score = max(0, min(30, alpha_score))
-
-        result_dict = {
-            "score": round(alpha_score),
-            "factors": validated,
-            "source": "LLM_ALPHA_MINE"
-        }
-
-        _llm_store_cache(cache_key, "alpha_mine", json.dumps(result_dict))
+        alpha_score = int(max(0, min(30,
+            (validated["SURPRISE_FACTOR"] * 0.25 + validated["CONFIDENCE"] * 0.20 +
+             validated["URGENCY"] * 0.15 + validated["SENTIMENT"] * 0.30 +
+             validated["MATERIALITY"] * 0.10) * 30 + 15
+        )))
+        result_dict = {"score": alpha_score, "factors": validated, "source": "LLM_ALPHA_MINE"}
+        _llm_store_cache(cache_key, "alpha_mine", json.dumps(result_dict), OPENAI_MINI_MODEL)
         return result_dict
-
     except Exception as e:
-        log.debug(f"LLM alpha mine parse failed for {symbol}: {e}")
+        log.debug(f"Alpha mine parse {symbol}: {e}")
         return {"score": 15, "factors": {}, "source": "PARSE_ERROR"}
 
 
-# Backward compatibility wrapper
 def _llm_filing_sentiment(subject: str, symbol: str = "") -> dict:
-    """
-    DEPRECATED: Use _llm_alpha_mine for new code.
-    Maintains backward compatibility for existing callers.
-    Maps alpha factors to old categorical format.
-    """
+    """Backward-compat wrapper."""
     alpha = _llm_alpha_mine(subject, symbol)
     score = alpha.get("score", 15)
     factors = alpha.get("factors", {})
+    sentiment = "POSITIVE" if score >= 20 else ("NEGATIVE" if score <= 10 else "NEUTRAL")
+    return {"score": score, "sentiment": sentiment,
+            "detail": f"AlphaMine: SENTIMENT={factors.get('SENTIMENT', 0):.2f}",
+            "alpha_factors": factors}
 
-    sentiment = "NEUTRAL"
-    if score >= 20:
-        sentiment = "POSITIVE"
-    elif score <= 10:
-        sentiment = "NEGATIVE"
-
-    detail = f"AlphaMine: SENTIMENT={factors.get('SENTIMENT', 0):.2f}, CONFIDENCE={factors.get('CONFIDENCE', 0):.2f}"
-
-    return {
-        "score": score,
-        "detail": detail,
-        "sentiment": sentiment,
-        "alpha_factors": factors
-    }
 
 def _llm_structured_reasoning(symbol: str, signal_dict: dict) -> Optional[dict]:
-    """
-    Feed full signal dict as JSON to LLM. Returns structured reasoning:
-    {conviction: 0-100, key_risk: str, weight_override: dict, regime_note: str}
-    Cached per signal hash (SHA256 of sorted JSON).
-    """
+    """Signal coherence → Claude Sonnet (best reasoning). Falls back to OpenAI."""
     if not LLM_ENABLED:
         return None
 
-    import json, hashlib
+    import hashlib
     signal_json = json.dumps(signal_dict, sort_keys=True, default=str)
     signal_hash = hashlib.sha256(signal_json.encode()).hexdigest()[:16]
-
     cached = _llm_cached(signal_hash, "structured_reasoning")
     if cached:
         try:
@@ -431,33 +417,25 @@ def _llm_structured_reasoning(symbol: str, signal_dict: dict) -> Optional[dict]:
         except Exception:
             pass
 
-    prompt = "You are a quantitative trading analyst. Analyze this stock signal JSON and return ONLY a JSON object.\n\n"
-    prompt += f"Symbol: {symbol}\n"
-    prompt += f"Signals: {signal_json[:2000]}\n\n"
-    prompt += "Return EXACTLY this JSON format (no markdown, no explanation):\n"
-    prompt += '{"conviction": 0-100, "key_risk": "single sentence", "weight_override": {"whale_radar": 0.0-1.0, "divergence": 0.0-1.0, "vol_profile": 0.0-1.0, "pattern": 0.0-1.0, "bayesian": 0.0-1.0}, "regime_note": "single sentence"}'
-    prompt += "\n\nRules:\n"
-    prompt += "- conviction: 0=avoid, 50=neutral, 80+ strong buy\n"
-    prompt += "- weight_override: only override if strong reason, else null\n"
-    prompt += "- key_risk: the single biggest reason this trade could fail\n"
-    prompt += "- regime_note: how current market regime affects this setup"
-
-    result = _llm_call(prompt, "structured_reasoning", max_tokens=800)
-    if not result:
+    prompt = (
+        "You are a quantitative trading analyst. Analyze this NSE stock signal JSON.\n"
+        f"Symbol: {symbol}\nSignals: {signal_json[:2000]}\n\n"
+        "Return EXACTLY this JSON (no markdown):\n"
+        '{"conviction": 0-100, "key_risk": "single sentence", '
+        '"weight_override": {"whale_radar": 0.0-1.0, "divergence": 0.0-1.0, '
+        '"vol_profile": 0.0-1.0, "pattern": 0.0-1.0, "bayesian": 0.0-1.0}, '
+        '"regime_note": "single sentence"}'
+    )
+    # Route: Claude first (better at structured JSON), fall back to OpenAI
+    raw = _call_claude(prompt, max_tokens=600) or _call_openai(prompt, model=OPENAI_MINI_MODEL, max_tokens=600)
+    if not raw:
         return None
-
     try:
-        json_str = result
-        if "```json" in result:
-            json_str = result.split("```json")[1].split("```")[0].strip()
-        elif "```" in result:
-            json_str = result.split("```")[1].split("```")[0].strip()
-
-        parsed = json.loads(json_str)
+        txt = raw.strip().replace("```json", "").replace("```", "")
+        parsed = json.loads(txt)
         parsed["conviction"] = max(0, min(100, int(parsed.get("conviction", 50))))
-        parsed["key_risk"] = str(parsed.get("key_risk", ""))[:100]
+        parsed["key_risk"]   = str(parsed.get("key_risk", ""))[:100]
         parsed["regime_note"] = str(parsed.get("regime_note", ""))[:100]
-
         wo = parsed.get("weight_override")
         if isinstance(wo, dict):
             for k in ["whale_radar", "divergence", "vol_profile", "pattern", "bayesian"]:
@@ -465,21 +443,16 @@ def _llm_structured_reasoning(symbol: str, signal_dict: dict) -> Optional[dict]:
                     wo[k] = max(0.0, min(1.0, float(wo[k])))
         else:
             parsed["weight_override"] = None
-
-        _llm_store_cache(signal_hash, "structured_reasoning", json.dumps(parsed), LLM_MODEL)
+        _llm_store_cache(signal_hash, "structured_reasoning", json.dumps(parsed), CLAUDE_MODEL)
         return parsed
     except Exception as e:
-        log.debug(f"LLM structured parse failed for {symbol}: {e}")
+        log.debug(f"LLM structured parse {symbol}: {e}")
         return None
 
 
 def _llm_story_enhance(symbol: str, story_parts: list, technicals: dict) -> Optional[str]:
-    """Backward compatibility wrapper."""
-    signal_dict = {"parts": story_parts, "technicals": technicals}
-    result = _llm_structured_reasoning(symbol, signal_dict)
-    if result:
-        return result.get("regime_note", "")
-    return None
+    result = _llm_structured_reasoning(symbol, {"parts": story_parts, "technicals": technicals})
+    return result.get("regime_note") if result else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -902,6 +875,251 @@ def is_halal(symbol: str) -> bool:
     return sym in get_halal_universe()
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [PATCH-B]  HALAL AI SCREEN — 4-layer  (v4.0-M, runs post-APEX on top picks)
+# ══════════════════════════════════════════════════════════════════════════════
+# is_halal() is KEPT as fast pre-filter on bhavcopy candidates (no change).
+# halal_ai_screen() runs on top-N candidates only, after fortress+apex scoring.
+
+# Layer 1 hard-veto sets (business screen)
+_HALAL_L1_VETO_SYMBOLS = {
+    "HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK",
+    "BANDHANBNK","IDFCFIRSTB","FEDERALBNK","RBLBANK","BANKBARODA",
+    "CANBK","UNIONBANK","PNB","INDIANB","AUBANK","DCBBANK","YESBANK",
+    "BAJFINANCE","BAJAJFINSV","SBICARD","CHOLAFIN","HDFC","LICHSGFIN",
+    "M&MFIN","SHRIRAMFIN","MUTHOOTFIN","MANAPPURAM","IIFL","SUNDARMFIN",
+    "RECLTD","PFC","IRFC","HUDCO","PNBHOUSING",
+    "HDFCLIFE","SBILIFE","ICICIPRU","LICI","STARHEALTH","GICRE","NIACL",
+    "LTIM","NIFTYBEES","JUNIORBEES","GOLDBEES","BANKBEES","LIQUIDBEES",
+    "ITC",  # tobacco
+}
+_HALAL_L1_KW = (
+    "bank","bancorp","finance","finserv","fincorp","financial",
+    "insurance","insur","nifty","etf","reit","invit",
+    "liquid","overnight","gilt","treasury","casino","gaming",
+    "tobacco","alcohol","spirits","brewery","liquor",
+)
+_BEES_RE_AI = re.compile(r'\bbees\b', re.IGNORECASE)
+
+# Layer 3 ethical sector mapping (bonus/penalty, not veto)
+_HALAL_L3_SECTORS = {
+    "NIFTY IT": +8, "NIFTY PHARMA": +10, "NIFTY AUTO": +5,
+    "NIFTY FMCG": +3, "NIFTY METAL": +5, "NIFTY CAPGOODS": +10,
+    "NIFTY TEXTILES": +5, "NIFTY CHEMICAL": +5, "NIFTY REALTY": -5,
+    "NIFTY ENERGY": -5, "NIFTY BANK": -15, "DIVERSIFIED": 0,
+}
+
+HALAL_AI_TTL_DAYS = int(os.getenv("HALAL_AI_TTL_DAYS", "7"))
+
+
+def _halal_l1_business_veto(symbol: str) -> bool:
+    """Layer 1: hard veto on known haram business. True = VETO."""
+    sym = symbol.upper().strip()
+    if sym in _HALAL_L1_VETO_SYMBOLS:
+        return True
+    sl = sym.lower()
+    if any(kw in sl for kw in _HALAL_L1_KW):
+        return True
+    if _BEES_RE_AI.search(sl):
+        return True
+    return False
+
+
+def _halal_l2_financial_veto(symbol: str) -> Tuple[bool, float]:
+    """
+    Layer 2: Debt/MarketCap < 33% check.
+    Returns (veto, debt_to_mcap). Defaults to (False, 0.0) on data failure.
+    """
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        row = con.execute(
+            "SELECT debt_to_mcap, assessed_date FROM halal_ai_cache WHERE symbol=?",
+            (symbol.upper(),)
+        ).fetchone()
+        con.close()
+        if row:
+            age = (datetime.today().date() -
+                   datetime.strptime(row[1][:10], "%Y-%m-%d").date()).days
+            if age <= HALAL_AI_TTL_DAYS and row[0] is not None:
+                dtm = float(row[0])
+                return dtm >= 0.33, dtm
+    except Exception:
+        pass
+
+    try:
+        import yfinance as yf
+        info   = yf.Ticker(f"{symbol}.NS").info
+        debt   = float(info.get("totalDebt") or 0)
+        mcap   = float(info.get("marketCap") or 0)
+        if mcap > 0:
+            dtm = round(debt / mcap, 4)
+            return dtm >= 0.33, dtm
+    except Exception:
+        pass
+    return False, 0.0
+
+
+def _halal_l3_ethical_score(symbol: str, sector: str) -> int:
+    """Layer 3: ethical sector overlay. Returns ±15 pts, no veto."""
+    return _HALAL_L3_SECTORS.get(sector, 0)
+
+
+def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> dict:
+    """Layer 4: LLM business model analysis via Claude Sonnet (optional)."""
+    if not _ANTHROPIC_OK:
+        return {"llm_confidence": 0.5, "llm_flags": [], "llm_source": "DISABLED"}
+
+    cache_key = f"halal_l4:{symbol}:{_llm_hash(sector + business_desc[:200])}"
+    cached = _llm_cached(cache_key, "halal_l4")
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+
+    prompt = (
+        "You are an Islamic finance compliance analyst. Assess this Indian listed company.\n"
+        f"Symbol: {symbol}\nSector: {sector}\n"
+        f"Business description: {business_desc[:500] or 'Not available'}\n\n"
+        "Assess Shariah compliance. Return ONLY JSON (no markdown):\n"
+        '{"halal_confidence": 0.0-1.0, '
+        '"business_concern": "brief concern or NONE", '
+        '"revenue_model": "fee_based|interest_based|mixed|manufacturing|services", '
+        '"subsidiary_risk": "LOW|MEDIUM|HIGH", '
+        '"manual_review_needed": true|false}\n\n'
+        "1.0 = clearly permissible, 0.0 = clearly impermissible. "
+        "Be conservative — when uncertain, lower confidence."
+    )
+    raw = _call_claude(prompt, max_tokens=300)
+    if not raw:
+        return {"llm_confidence": 0.5, "llm_flags": [], "llm_source": "FAILED"}
+
+    try:
+        txt = raw.strip().replace("```json", "").replace("```", "")
+        parsed = json.loads(txt)
+        result = {
+            "llm_confidence":       max(0.0, min(1.0, float(parsed.get("halal_confidence", 0.5)))),
+            "llm_business_concern": str(parsed.get("business_concern", ""))[:100],
+            "llm_revenue_model":    str(parsed.get("revenue_model", "unknown")),
+            "llm_subsidiary_risk":  str(parsed.get("subsidiary_risk", "MEDIUM")),
+            "llm_manual_review":    bool(parsed.get("manual_review_needed", False)),
+            "llm_source":           CLAUDE_MODEL,
+        }
+        _llm_store_cache(cache_key, "halal_l4", json.dumps(result), CLAUDE_MODEL)
+        return result
+    except Exception as e:
+        log.debug(f"Halal L4 parse {symbol}: {e}")
+        return {"llm_confidence": 0.5, "llm_flags": [], "llm_source": "PARSE_ERROR"}
+
+
+def _halal_ai_cache_save(symbol: str, result: dict):
+    """Persist halal AI result to halal_ai_cache table."""
+    try:
+        today = datetime.today().strftime("%Y-%m-%d")
+        with _db_conn(write=True) as con:
+            con.execute("""
+                INSERT OR REPLACE INTO halal_ai_cache
+                  (symbol, score, veto, tier, debt_to_mcap, business_model,
+                   ethical_score, llm_confidence, assessed_date, source)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (symbol, result["score"], int(result["veto"]), result["tier"],
+                  result["debt_to_mcap"], result["business_model"],
+                  result["ethical_score"], result["llm_confidence"],
+                  today, result.get("source", "SCORED")))
+    except Exception as e:
+        log.debug(f"Halal AI cache save {symbol}: {e}")
+
+
+def halal_ai_screen(symbol: str, sector: str = "DIVERSIFIED",
+                    business_desc: str = "") -> dict:
+    """
+    Full 4-layer Halal AI Screen. Runs post-APEX on top-N candidates only.
+    Returns: {score, veto, tier, debt_to_mcap, business_model, ethical_score,
+              llm_confidence, veto_reason, source}
+    Tiers: score<40→RISKY, 40-69→ACCEPTABLE, 70+→PURE
+    Hard veto: L1 business, L2 debt≥33%, L4 confidence<0.30
+    """
+    sym = symbol.upper().strip()
+
+    # ── Check 7-day DB cache ─────────────────────────────────────────────────
+    try:
+        with _db_conn() as con:
+            row = con.execute(
+                "SELECT score, veto, tier, debt_to_mcap, business_model, "
+                "ethical_score, llm_confidence, assessed_date "
+                "FROM halal_ai_cache WHERE symbol=?",
+                (sym,)
+            ).fetchone()
+        if row:
+            age = (datetime.today().date() -
+                   datetime.strptime(row[7][:10], "%Y-%m-%d").date()).days
+            if age <= HALAL_AI_TTL_DAYS:
+                return {
+                    "score": row[0], "veto": bool(row[1]), "tier": row[2],
+                    "debt_to_mcap": row[3], "business_model": row[4],
+                    "ethical_score": row[5], "llm_confidence": row[6],
+                    "veto_reason": "" if not row[1] else "CACHED_VETO",
+                    "source": "CACHE",
+                }
+    except Exception:
+        pass
+
+    # ── Layer 1: Business screen ─────────────────────────────────────────────
+    if _halal_l1_business_veto(sym):
+        result = {"score": 0, "veto": True, "tier": "HARAM",
+                  "debt_to_mcap": 0.0, "business_model": "HARAM_BUSINESS",
+                  "ethical_score": 0, "llm_confidence": 0.0,
+                  "veto_reason": "L1: Haram business category", "source": "L1"}
+        _halal_ai_cache_save(sym, result)
+        return result
+
+    # ── Layer 2: Financial screen ────────────────────────────────────────────
+    l2_veto, debt_to_mcap = _halal_l2_financial_veto(sym)
+    if l2_veto:
+        result = {"score": 0, "veto": True, "tier": "HARAM",
+                  "debt_to_mcap": debt_to_mcap, "business_model": "HIGH_DEBT",
+                  "ethical_score": 0, "llm_confidence": 0.5,
+                  "veto_reason": f"L2: Debt/MCap {debt_to_mcap:.1%} >= 33%",
+                  "source": "L2"}
+        _halal_ai_cache_save(sym, result)
+        return result
+
+    # ── Layer 3: Ethical overlay ─────────────────────────────────────────────
+    ethical_score = _halal_l3_ethical_score(sym, sector)
+    base_score    = 70 + ethical_score
+    debt_penalty  = int(max(0, debt_to_mcap - 0.10) * 100)
+    base_score   -= debt_penalty
+    base_score    = max(0, min(100, base_score))
+
+    # ── Layer 4: LLM analysis (optional) ────────────────────────────────────
+    llm = _halal_l4_llm_screen(sym, sector, business_desc)
+    llm_conf  = llm.get("llm_confidence", 0.5)
+    llm_model = llm.get("llm_revenue_model", "unknown")
+
+    if _ANTHROPIC_OK:
+        llm_delta = int((llm_conf - 0.5) * 20)
+        base_score = max(0, min(100, base_score + llm_delta))
+        if llm_conf < 0.30:
+            result = {"score": 0, "veto": True, "tier": "HARAM",
+                      "debt_to_mcap": debt_to_mcap, "business_model": llm_model,
+                      "ethical_score": ethical_score, "llm_confidence": llm_conf,
+                      "veto_reason": f"L4: LLM confidence {llm_conf:.0%} < 30%",
+                      "source": "L4"}
+            _halal_ai_cache_save(sym, result)
+            return result
+
+    tier = "PURE" if base_score >= 70 else ("ACCEPTABLE" if base_score >= 40 else "RISKY")
+    result = {
+        "score": base_score, "veto": False, "tier": tier,
+        "debt_to_mcap": debt_to_mcap, "business_model": llm_model,
+        "ethical_score": ethical_score, "llm_confidence": llm_conf,
+        "veto_reason": "", "source": "SCORED",
+    }
+    _halal_ai_cache_save(sym, result)
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 3 — GOOGLE SHEETS CLIENT (single shared workbook)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1246,6 +1464,7 @@ def _init_db():
     con.commit()
     con.close()
     _migrate_db_v3()  # v3.0-M: additive migration (trade_decisions, weekly_reviews, meta_features columns)
+    _migrate_db_v4()  # v4.0-M: halal_ai_cache, platt_calibration, strategy_sandbox
 
 
 def _get_position(symbol: str) -> Optional[dict]:
@@ -5130,6 +5349,454 @@ def _early_exit_alert(symbol: str, entry_price: float, current_ltp: float) -> di
     }
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [PATCH-C]  CALIBRATED AI JUDGE  (v4.0-M — Platt-scaled meta_prob + Kelly)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _platt_calibrate(raw_prob: float, calibration_params: Optional[dict]) -> float:
+    """
+    Platt scaling: raw_prob → calibrated_prob.
+    params = {"A": float, "B": float, "n_samples": int}
+    Falls back to identity if params absent or < 50 training samples.
+    """
+    if not calibration_params or calibration_params.get("n_samples", 0) < 50:
+        return raw_prob
+    A = calibration_params.get("A", 0.0)
+    B = calibration_params.get("B", 0.0)
+    try:
+        return round(1.0 / (1.0 + math.exp(A * raw_prob + B)), 4)
+    except (OverflowError, ValueError):
+        return raw_prob
+
+
+def _load_calibration_params() -> Optional[dict]:
+    """Load Platt scaling params from DB (trained offline)."""
+    try:
+        with _db_conn() as con:
+            row = con.execute(
+                "SELECT A, B, n_samples, trained_at FROM platt_calibration "
+                "ORDER BY trained_at DESC LIMIT 1"
+            ).fetchone()
+        if row:
+            return {"A": row[0], "B": row[1], "n_samples": row[2], "trained_at": row[3]}
+    except Exception:
+        pass
+    return None
+
+
+def _kelly_fraction(p_calibrated: float, b: float = 2.0) -> str:
+    """
+    Fractional Kelly position size tier.
+    Returns: 'FULL' | 'HALF' | 'QUARTER' | 'VETO'
+    """
+    if p_calibrated >= 0.75:
+        return "FULL"
+    elif p_calibrated >= 0.55:
+        return "HALF"
+    elif p_calibrated >= 0.45:
+        return "QUARTER"
+    return "VETO"
+
+
+def _prev_day_context(symbol: str) -> dict:
+    """Check yesterday's pick status for cooling-off logic."""
+    yesterday = (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        with _db_conn() as con:
+            row = con.execute(
+                "SELECT status, pnl_pct FROM pick_outcomes WHERE symbol=? AND run_date=?",
+                (symbol.upper(), yesterday)
+            ).fetchone()
+        if row:
+            return {"status": row[0], "pnl_pct": row[1]}
+    except Exception:
+        pass
+    return {"status": None, "pnl_pct": None}
+
+
+def _weekly_wr_for_profile(setup_profile: str, grade: str, sector: str) -> dict:
+    """Win rate for this exact profile in last 30 days of YOUR decisions."""
+    try:
+        since = (datetime.today() - timedelta(days=30)).strftime("%Y-%m-%d")
+        with _db_conn() as con:
+            rows = con.execute("""
+                SELECT o.status, o.pnl_pct
+                FROM trade_decisions td
+                JOIN pick_outcomes o ON td.symbol=o.symbol AND td.run_date=o.run_date
+                JOIN meta_features mf ON td.symbol=mf.symbol AND td.run_date=mf.run_date
+                WHERE td.decision='TAKEN' AND td.run_date>=?
+                  AND o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
+                  AND mf.setup_profile=?
+            """, (since, setup_profile)).fetchall()
+        total = len(rows)
+        wins  = sum(1 for s, _ in rows if s in ("r1_hit", "r2_hit", "r3_hit"))
+        return {"win_rate": (wins / total) if total > 0 else 0.5, "total": total}
+    except Exception:
+        return {"win_rate": 0.5, "total": 0}
+
+
+def calibrated_ai_judge(pick: dict, halal: dict, macro: dict,
+                         calibration_params: Optional[dict] = None) -> dict:
+    """
+    Step 5: Calibrated AI Judge.
+    Input:  enriched pick dict + halal AI result + macro regime
+    Output: pick enriched with calibrated_confidence, position_size_tier,
+            veto (bool), veto_reason (str)
+    """
+    sym           = pick.get("symbol", "")
+    raw_meta_prob = pick.get("meta_prob", 0.55)
+    setup_profile = pick.get("setup_profile", "BHwdv")
+    grade         = pick.get("grade", "")
+    sector        = pick.get("sector", "DIVERSIFIED")
+    fused         = pick.get("fused", 0)
+
+    # ── Calibrate probability ────────────────────────────────────────────────
+    p_cal = _platt_calibrate(raw_meta_prob, calibration_params)
+    p_cal = _regime_scaled_confidence(p_cal, macro.get("macro_state", "CHOP"),
+                                      macro.get("vix_val", 18.0))
+
+    # ── Veto checks (deterministic) ──────────────────────────────────────────
+    veto, veto_reason = False, ""
+
+    if halal.get("veto"):
+        veto, veto_reason = True, f"Halal veto: {halal.get('veto_reason', '')}"
+
+    elif halal.get("score", 100) < 40:
+        veto, veto_reason = True, f"Halal score {halal['score']} < 40 (RISKY tier)"
+
+    else:
+        prev = _prev_day_context(sym)
+        if prev["status"] == "stopped" and (prev["pnl_pct"] or 0) < -5:
+            veto, veto_reason = True, f"Cooling-off: stopped at {prev['pnl_pct']:.1f}% yesterday"
+        elif not veto:
+            wr_data = _weekly_wr_for_profile(setup_profile, grade, sector)
+            if wr_data["total"] >= 5 and wr_data["win_rate"] < 0.30:
+                veto, veto_reason = (True,
+                    f"Your {setup_profile} win rate only {wr_data['win_rate']:.0%} "
+                    f"on {wr_data['total']} trades")
+
+    if not veto:
+        if p_cal < 0.45:
+            veto, veto_reason = True, f"Calibrated confidence {p_cal:.0%} < 45%"
+        elif halal.get("score", 0) < 60:
+            veto, veto_reason = True, f"Halal score {halal.get('score',0)} < 60 (ACCEPTABLE)"
+        elif fused < APEX_MIN_SCORE:
+            veto, veto_reason = True, f"Fused {fused} < APEX_MIN_SCORE {APEX_MIN_SCORE}"
+
+    size_tier = "VETO" if veto else _kelly_fraction(p_cal)
+
+    return {
+        **pick,
+        "calibrated_confidence": p_cal,
+        "raw_meta_prob":         raw_meta_prob,
+        "position_size_tier":    size_tier,
+        "halal_detail":          halal,
+        "veto":                  veto,
+        "veto_reason":           veto_reason,
+        "worth_flag":            _confidence_flag(p_cal) if not veto else "SKIP",
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [PATCH-D]  NO-RESPONSE = SKIPPED  (v4.0-M — Step 8 EOD auto-log)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _auto_log_skipped_picks(date_label: str):
+    """
+    Auto-log all today's AI-passed picks that received no Telegram reply as SKIPPED.
+    Called once at EOD (after Telegram reply window closes). No reminder sent.
+    """
+    try:
+        with _db_conn() as con:
+            all_picks = con.execute(
+                "SELECT symbol FROM sniper_results WHERE run_date=?",
+                (date_label,)
+            ).fetchall()
+            logged = {row[0] for row in con.execute(
+                "SELECT symbol FROM trade_decisions WHERE run_date=?",
+                (date_label,)
+            ).fetchall()}
+
+        unresponded = [r[0] for r in all_picks if r[0] not in logged]
+        if not unresponded:
+            return
+
+        log.info(f"Auto-logging {len(unresponded)} unresponded picks as SKIPPED")
+        for sym in unresponded:
+            _log_trade_decision(date_label, sym, "SKIPPED",
+                                skip_reason="no_response", ai_confidence=None)
+        log.info(f"SKIPPED auto-log complete: {', '.join(unresponded)}")
+    except Exception as e:
+        log.error(f"Auto-log skipped: {e}")
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [PATCH-E]  DB SCHEMA v4.0-M  (added at bottom of _init_db via _migrate_db_v4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DB_SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS halal_ai_cache (
+    symbol          TEXT PRIMARY KEY,
+    score           INTEGER NOT NULL,
+    veto            INTEGER NOT NULL DEFAULT 0,
+    tier            TEXT NOT NULL,
+    debt_to_mcap    REAL,
+    business_model  TEXT,
+    ethical_score   INTEGER DEFAULT 0,
+    llm_confidence  REAL DEFAULT 0.5,
+    assessed_date   TEXT NOT NULL,
+    source          TEXT DEFAULT 'SCORED',
+    llm_hash        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS platt_calibration (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    A           REAL NOT NULL,
+    B           REAL NOT NULL,
+    n_samples   INTEGER NOT NULL,
+    ece         REAL,
+    trained_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS strategy_sandbox (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_text   TEXT NOT NULL,
+    param_name      TEXT,
+    param_old       TEXT,
+    param_new       TEXT,
+    backtest_wr     REAL,
+    backtest_dd     REAL,
+    backtest_sharpe REAL,
+    status          TEXT DEFAULT 'PROPOSED',
+    created_at      TEXT DEFAULT (datetime('now')),
+    reviewed_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS strategy_approved (
+    param_name      TEXT PRIMARY KEY,
+    param_value     TEXT NOT NULL,
+    approved_at     TEXT NOT NULL,
+    sandbox_id      INTEGER
+);
+"""
+
+
+def _migrate_db_v4():
+    """v4.0-M additive migration. Safe to run on every startup."""
+    try:
+        with _db_conn(write=True) as con:
+            con.executescript(_DB_SCHEMA_V4)
+        log.info("DB v4.0-M migration complete ✅")
+    except Exception as e:
+        log.debug(f"DB v4 migration: {e}")
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [PATCH-F]  WEEKLY AI STATUS AGENT  (v4.0-M — Step 10, read-only LLM analysis)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _weekly_ai_status_agent():
+    """
+    Step 10: Weekly AI Status Agent.
+    Reads performance data, generates observations via GPT-4o (batch).
+    NEVER mutates DB or parameters. Falls back to _send_weekly_review() if no LLM key.
+    """
+    if not (_ANTHROPIC_OK or _OPENAI_OK):
+        _send_weekly_review()
+        return
+
+    log.info("Weekly AI Status Agent running...")
+    try:
+        since = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+        with _db_conn() as con:
+            perf = con.execute("""
+                SELECT grade, status, pnl_pct, sector
+                FROM pick_outcomes WHERE run_date>=? AND status!='open'
+            """, (since,)).fetchall()
+            decisions = con.execute("""
+                SELECT decision, COUNT(*) FROM trade_decisions WHERE run_date>=?
+                GROUP BY decision
+            """, (since,)).fetchall()
+            halal_corr = con.execute("""
+                SELECT h.tier, o.status, o.pnl_pct
+                FROM halal_ai_cache h
+                JOIN pick_outcomes o ON h.symbol=o.symbol
+                WHERE o.run_date>=? AND o.status!='open'
+            """, (since,)).fetchall()
+
+        total   = len(perf)
+        wins    = sum(1 for _, s, _, _ in perf if s in ("r1_hit","r2_hit","r3_hit"))
+        avg_pnl = (sum(p or 0 for _, _, p, _ in perf) / total) if total > 0 else 0
+        dec_map = {d: c for d, c in decisions}
+        sector_wr = {}
+        for _, status, pnl, sector in perf:
+            sector_wr.setdefault(sector, {"wins": 0, "total": 0})
+            sector_wr[sector]["total"] += 1
+            if status in ("r1_hit","r2_hit","r3_hit"):
+                sector_wr[sector]["wins"] += 1
+
+        context = {
+            "week": since,
+            "total_closed": total,
+            "wins": wins,
+            "win_rate_pct": round(wins/total*100, 1) if total > 0 else 0,
+            "avg_pnl_pct": round(avg_pnl, 2),
+            "taken": dec_map.get("TAKEN", 0),
+            "skipped": dec_map.get("SKIPPED", 0),
+            "sector_win_rates": {
+                s: round(v["wins"]/v["total"]*100, 1)
+                for s, v in sector_wr.items() if v["total"] >= 2
+            },
+            "halal_tier_performance": {
+                tier: {
+                    "wins": sum(1 for t, s, _ in halal_corr if t==tier and s in ("r1_hit","r2_hit","r3_hit")),
+                    "total": sum(1 for t, _, _ in halal_corr if t==tier)
+                }
+                for tier in ("PURE", "ACCEPTABLE", "RISKY")
+            }
+        }
+
+        prompt = (
+            "You are a trading performance analyst reviewing a week of NSE halal swing trades.\n"
+            f"Context: {json.dumps(context, indent=2)}\n\n"
+            "Generate a structured report with EXACTLY these sections:\n"
+            "OBSERVATIONS: 2-3 factual bullet points about what happened\n"
+            "PATTERNS: 1-2 repeating patterns you notice\n"
+            "ANOMALIES: anything unexpected vs historical norms\n\n"
+            "Rules:\n"
+            "- Be factual, not prescriptive\n"
+            "- Never say 'Set X = Y' or suggest parameter changes\n"
+            "- Flag halal tier correlation if noteworthy\n"
+            "- Keep under 300 words"
+        )
+        report = (_call_openai(prompt, model=OPENAI_BATCH_MODEL, max_tokens=400) or
+                  _call_claude(prompt, max_tokens=400))
+
+        if not report:
+            _send_weekly_review()
+            return
+
+        week_start = since
+        with _db_conn(write=True) as con:
+            con.execute("""
+                INSERT OR REPLACE INTO weekly_reviews
+                  (week_start, signals_total, taken, skipped, wins, losses,
+                   avg_pnl, summary_text)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (week_start, total, dec_map.get("TAKEN",0), dec_map.get("SKIPPED",0),
+                  wins, total-wins, avg_pnl, report))
+
+        msg = (f"\U0001f4ca WEEKLY AI REPORT | {since} \u2192 {datetime.today().strftime('%Y-%m-%d')}\n\n"
+               f"{report}\n\n\U0001f91d Read-only analysis. No parameters changed.")
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
+        log.info("Weekly AI Status Agent complete ✅")
+
+    except Exception as e:
+        log.error(f"Weekly AI Status Agent failed: {e}")
+        _send_weekly_review()
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [PATCH-G]  SANDBOX PARAMETER PROPOSALS  (v4.0-M — Step 11, human-gated)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _generate_sandbox_proposal():
+    """
+    Step 11: Generate parameter proposals from LLM based on 90-day analysis.
+    Saves to strategy_sandbox (status=PROPOSED). NEVER touches production.
+    Requires 90 days of data and 30+ closed trades.
+    """
+    if not (_ANTHROPIC_OK or _OPENAI_OK):
+        log.info("Sandbox proposals require LLM key — skipping")
+        return
+
+    try:
+        with _db_conn() as con:
+            oldest = con.execute("SELECT MIN(run_date) FROM pick_outcomes").fetchone()
+            count  = con.execute("SELECT COUNT(*) FROM pick_outcomes WHERE status!='open'").fetchone()
+        if not oldest or not oldest[0]:
+            log.info("No historical data — skipping sandbox proposals"); return
+        data_days = (datetime.today().date() -
+                     datetime.strptime(oldest[0], "%Y-%m-%d").date()).days
+        if data_days < 90 or (count[0] if count else 0) < 30:
+            log.info(f"Only {data_days}d data ({count[0] if count else 0} closed trades) "
+                     "— sandbox proposals need 90d/30 trades"); return
+    except Exception as e:
+        log.debug(f"Sandbox data check: {e}"); return
+
+    try:
+        since = (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d")
+        with _db_conn() as con:
+            perf = con.execute("""
+                SELECT grade, status, pnl_pct, sector, fused_score
+                FROM pick_outcomes WHERE run_date>=? AND status!='open'
+            """, (since,)).fetchall()
+            current_params = {
+                "APEX_MIN_SCORE": APEX_MIN_SCORE,
+                "APEX_TOP_N": APEX_TOP_N,
+                "CAPACITY_MAX_OPEN": CAPACITY_MAX_OPEN,
+                "CAPACITY_MAX_WEEK": CAPACITY_MAX_WEEK,
+                "MC_SIMS": MC_SIMS,
+            }
+
+        total = len(perf)
+        if total < 10: return
+        wins = sum(1 for _, s, _, _, _ in perf if s in ("r1_hit","r2_hit","r3_hit"))
+
+        prompt = (
+            "You are a trading strategy parameter optimiser. "
+            "Based on 90-day performance data, suggest 1-3 parameter adjustments.\n"
+            f"Current params: {json.dumps(current_params)}\n"
+            f"Performance: {total} trades, {wins} wins ({wins/total*100:.1f}% WR), "
+            f"avg P&L {sum(p or 0 for _,_,p,_,_ in perf)/total:.1f}%\n\n"
+            "Return a JSON array of proposals:\n"
+            '[{"param": "APEX_MIN_SCORE", "old_value": 48, "new_value": 52, '
+            '"rationale": "Raise threshold in CHOP regime — reduces false positives"}]\n\n'
+            "Rules:\n"
+            "- Maximum 3 proposals\n"
+            "- Only suggest params from the current_params dict\n"
+            "- Changes must be modest (+-10% max)\n"
+            "- Require >=5% win rate improvement as justification"
+        )
+        raw = (_call_openai(prompt, model=OPENAI_BATCH_MODEL, max_tokens=500) or
+               _call_claude(prompt, max_tokens=500))
+        if not raw: return
+
+        txt = raw.strip().replace("```json", "").replace("```", "")
+        proposals = json.loads(txt)
+        if not isinstance(proposals, list): return
+
+        with _db_conn(write=True) as con:
+            for p in proposals[:3]:
+                con.execute("""
+                    INSERT INTO strategy_sandbox
+                      (proposal_text, param_name, param_old, param_new)
+                    VALUES (?,?,?,?)
+                """, (
+                    p.get("rationale", "")[:500],
+                    str(p.get("param", "")),
+                    str(p.get("old_value", "")),
+                    str(p.get("new_value", "")),
+                ))
+        log.info(f"Sandbox: {len(proposals)} proposal(s) saved (status=PROPOSED). "
+                 "Review at strategy_sandbox table before approving.")
+
+        notif = "\U0001f52c SANDBOX PROPOSALS (pending your review):\n\n"
+        for p in proposals[:3]:
+            notif += (f"\u2022 {p.get('param')}: {p.get('old_value')} \u2192 {p.get('new_value')}\n"
+                      f"  Reason: {p.get('rationale','')[:80]}\n\n")
+        notif += "\u2139\ufe0f Run SQL: UPDATE strategy_sandbox SET status='APPROVED' WHERE id=X to approve."
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, notif)
+
+    except Exception as e:
+        log.error(f"Sandbox proposal: {e}")
+
+
 def run():
     """
     Single-pass unified pipeline:
@@ -5481,6 +6148,21 @@ def run():
         r["worth_flag"]  = _confidence_flag(r["meta_prob"])
         r["macro_state"] = macro.get("macro_state", "CHOP")   # propagate for profile display
 
+    # ── v4.0-M: Halal AI Screen + Calibrated AI Judge ──────────────────────
+    log.info("Running Halal AI Screen + Calibrated AI Judge on top picks...")
+    cal_params = _load_calibration_params()
+    judged_picks = []
+    for pick in top_picks:
+        sector = pick.get("sector", "DIVERSIFIED")
+        halal  = halal_ai_screen(pick["symbol"], sector)
+        judged = calibrated_ai_judge(pick, halal, macro, cal_params)
+        if not judged["veto"]:
+            judged_picks.append(judged)
+        else:
+            log.info(f"  VETO {pick['symbol']}: {judged['veto_reason']}")
+    top_picks = judged_picks
+    log.info(f"After AI Judge: {len(top_picks)} picks pass")
+
     # ── v3.0-M: Capacity guard ─────────────────────────────────────────────
     capacity = _capacity_guard(date_label)
     if capacity.get("note"):
@@ -5493,7 +6175,9 @@ def run():
         vn = "" if r.get("vol_reliable",True) else " [NO-VOL]"
         log.info(f"  #{rank} {r['symbol']:12s} | Fused {r['fused']}/100 | Fort {r['fort_pct']:.0f}% "
                  f"| APEX {r['apex_composite']}/100 | {r['grade']}{vn} "
-                 f"| AI {round(r.get('meta_prob',0.55)*100)}% [{r.get('worth_flag','—')}]")
+                 f"| AI {round(r.get('meta_prob',0.55)*100)}% [{r.get('worth_flag','—')}] "
+                 f"| Halal: {r.get('halal_detail',{}).get('tier','?')}/{r.get('halal_detail',{}).get('score','?')}"  
+                 f"| Cal: {r.get('calibrated_confidence',r.get('meta_prob',0)):.0%} | Size: {r.get('position_size_tier','?')}")
         log.info(f"       Buy ₹{r['buy_lo']}-{r['buy_hi']} | SL ₹{r['stop_loss']} | "
                  f"R1 ₹{r['r1']} | R2 ₹{r['r2']} | MC {r['mc_survival']}%")
         log.info(f"       {r['story'][:80]}")
@@ -5548,6 +6232,9 @@ def run():
         _save_meta_model(refreshed_model)
         log.info("Meta-model refreshed with today's resolved outcomes")
 
+    # v4.0-M: auto-log any unresponded picks as SKIPPED at EOD
+    _auto_log_skipped_picks(date_label)
+
     log.info(f"\n✅ Done | {len(top_picks)} picks | Macro: {macro['macro_state']} | "
              f"VIX: {macro['vix_val']:.1f} | Source: {data_source} | "
              f"Bismillah 🤲")
@@ -5560,9 +6247,14 @@ def run():
 
 if __name__ == "__main__":
     import sys
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     if "--weekly-review" in sys.argv:
         # Run standalone: python sniper_unified_v2.py --weekly-review
         _init_db()
-        _send_weekly_review()
+        _weekly_ai_status_agent()   # v4.0-M: AI agent (was _send_weekly_review)
+    elif "--sandbox-proposals" in sys.argv:
+        # Run standalone: python sniper_unified_v2.py --sandbox-proposals
+        _init_db()
+        _generate_sandbox_proposal()
     else:
         run()
