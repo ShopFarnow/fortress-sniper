@@ -20,15 +20,14 @@ Supported reply formats:
 
 FIXES in this version:
   FIX-A  Bare "SKIPPED" (no symbol) now marks ALL of today's picks as SKIPPED.
-         Common pattern: user reviews Telegram picks at end of day and replies
-         "SKIPPED" to dismiss everything — was silently ignored before.
-  FIX-B  Symbol validation before every DB write. If the symbol is not in
-         today's sniper_results, the handler replies with an error and refuses
-         to create an orphan row (which would corrupt the feedback loop).
-  FIX-C  PARTIAL with shares=0 now warns the user instead of silently logging
-         a zero-share decision (uninformative for the capacity guard).
-  FIX-D  Added HELP / ? command so users can retrieve the format list in-chat.
-  FIX-E  Unrecognised commands now get a helpful nudge instead of silent drop.
+  FIX-B  Symbol validation before every DB write.
+  FIX-C  PARTIAL with shares=0 now warns the user.
+  FIX-D  Added HELP / ? command.
+  FIX-E  Unrecognised commands get a helpful nudge.
+  FIX-H4 Input sanitization: symbols restricted to ^[A-Z&]{1,20}$,
+         reasons/skip text capped at 100 chars and stripped of control chars.
+         Prevents corrupt data from reaching SQLite even though parameterized
+         queries already block SQL injection.
 """
 
 import os, re, sqlite3, logging, requests
@@ -45,9 +44,14 @@ DB_PATH          = Path(os.getenv("CACHE_PATH", "outputs/sniper_cache.db"))
 
 # ── Patterns (case-insensitive) ───────────────────────────────────────────────
 _TAKEN   = re.compile(r"^TAKEN\s+([A-Z&]+)(?:\s+[@:]?\s*([\d.]+))?", re.I)
-_SKIPPED = re.compile(r"^SKIPPED(?:\s+([A-Z&]+)(?:\s+(.+))?)?$", re.I)  # FIX-A: symbol now optional
+_SKIPPED = re.compile(r"^SKIPPED(?:\s+([A-Z&]+)(?:\s+(.+))?)?$", re.I)
 _PARTIAL = re.compile(r"^PARTIAL\s+([A-Z&]+)(?:\s+[@:]?\s*([\d.]+))?(?:\s+(\d+))?", re.I)
-_HELP    = re.compile(r"^(HELP|\?)$", re.I)  # FIX-D
+_HELP    = re.compile(r"^(HELP|\?)$", re.I)
+
+# H4: Strict symbol and reason validators
+_SYMBOL_RE   = re.compile(r"^[A-Z&]{1,20}$")   # NSE symbols: letters + & only, ≤20 chars
+_CTRL_STRIP  = re.compile(r"[\x00-\x1f\x7f]")  # strip control chars from free-text fields
+_MAX_REASON  = 100                               # max length for skip_reason
 
 _HELP_TEXT = (
     "📖 SNIPER reply commands:\n"
@@ -57,6 +61,28 @@ _HELP_TEXT = (
     "  SKIPPED                — skip ALL today's picks\n"
     "  HELP or ?              — this message"
 )
+
+
+# ── H4: Input sanitization helpers ───────────────────────────────────────────
+
+def _sanitize_symbol(raw: str) -> str:
+    """
+    Return uppercased symbol if it matches ^[A-Z&]{1,20}$, else raise ValueError.
+    Rejects anything that could corrupt the skip_reason or symbol columns.
+    """
+    sym = raw.strip().upper()
+    if not _SYMBOL_RE.match(sym):
+        raise ValueError(f"Invalid symbol '{sym}' — must match ^[A-Z&]{{1,20}}$")
+    return sym
+
+
+def _sanitize_reason(raw: str) -> str:
+    """
+    Strip control characters and cap at _MAX_REASON chars.
+    Never raises — returns a cleaned string.
+    """
+    cleaned = _CTRL_STRIP.sub("", raw).strip()
+    return cleaned[:_MAX_REASON]
 
 
 # ── Offset persistence ────────────────────────────────────────────────────────
@@ -204,7 +230,12 @@ def process_updates():
         # ── TAKEN ─────────────────────────────────────────────────────────────
         m = _TAKEN.match(text)
         if m:
-            sym   = m.group(1)
+            try:
+                sym = _sanitize_symbol(m.group(1))
+            except ValueError as ve:
+                _send_ack(chat_id, f"⚠️ {ve}")
+                _save_offset(uid + 1)
+                continue
             price = float(m.group(2)) if m.group(2) else None
 
             # FIX-B: validate symbol exists in today's picks before writing
@@ -226,8 +257,24 @@ def process_updates():
         # ── SKIPPED ───────────────────────────────────────────────────────────
         m = _SKIPPED.match(text)
         if m:
-            sym    = m.group(1)  # None when bare "SKIPPED"
-            reason = (m.group(2) or "unspecified").lower() if sym else "skipped all"
+            raw_sym = m.group(1)  # None when bare "SKIPPED"
+
+            # H4: validate symbol when present
+            if raw_sym is not None:
+                try:
+                    sym = _sanitize_symbol(raw_sym)
+                except ValueError as ve:
+                    _send_ack(chat_id, f"⚠️ {ve}")
+                    _save_offset(uid + 1)
+                    continue
+            else:
+                sym = None
+
+            # H4: sanitize free-text reason
+            raw_reason = m.group(2) or ""
+            reason = _sanitize_reason(raw_reason) if sym else "skipped all"
+            if sym and not reason:
+                reason = "unspecified"
 
             # FIX-A: bare "SKIPPED" → mark every today's pick as SKIPPED
             if sym is None:
@@ -260,7 +307,12 @@ def process_updates():
         # ── PARTIAL ───────────────────────────────────────────────────────────
         m = _PARTIAL.match(text)
         if m:
-            sym    = m.group(1)
+            try:
+                sym = _sanitize_symbol(m.group(1))
+            except ValueError as ve:
+                _send_ack(chat_id, f"⚠️ {ve}")
+                _save_offset(uid + 1)
+                continue
             price  = float(m.group(2)) if m.group(2) else None
             shares = int(m.group(3)) if m.group(3) else 0
 
