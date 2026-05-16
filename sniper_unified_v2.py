@@ -190,6 +190,16 @@ _YF_FAIL_THRESHOLD   = 3           # skip all yf calls after 3 consecutive failu
 _YF_CIRCUIT_OPEN_UNTIL: float = 0.0  # C3: epoch-seconds; >0 means circuit open (24 h ban)
 _NSE_HISTORY_OK      = None        # None=unknown, True=working, False=broken (speeds up loop when NSE is down)
 
+# NSE IP-block circuit breaker — mirrors the yfinance pattern.
+# When GitHub Actions IP is banned by NSE, every call fails identically.
+# After _NSE_FAIL_THRESHOLD consecutive JSONDecodeError/empty-body failures
+# across ANY endpoint, we mark NSE as IP-blocked for the rest of the run
+# and stop wasting retries (saves 3-5 min of log spam per run).
+_NSE_CONSECUTIVE_FAILS = 0           # incremented on each full 3-retry failure
+_NSE_FAIL_LOCK         = threading.Lock()
+_NSE_FAIL_THRESHOLD    = 5           # 5 consecutive symbol failures → IP blocked
+_NSE_IP_BLOCKED        = False       # True = skip ALL NSE calls this run
+
 _YF_BACKOFF_BASE   = 2.0   # C3: base for exponential back-off (seconds)
 _YF_BACKOFF_MAX    = 60.0  # C3: cap per-attempt sleep
 _YF_MAX_ATTEMPTS   = 4     # C3: per-call retry budget
@@ -1368,15 +1378,34 @@ def _get_nse_session() -> requests.Session:
 
 def _nse_json(sess: requests.Session, url: str, params: dict = None, timeout: int = 15):
     """
-    C4 FIX: Retry NSE requests up to 3× with exponential back-off + jitter.
-    NSE API returns 503 under load; a single bare request silently cascades
-    to yfinance, triggering the rate-limit death spiral (C3).
-    Delays: ~2s, ~4s, ~8s (+ ±25 % jitter each time).
+    C4 FIX + LOG-STORM FIX: Retry NSE requests up to NSE_MAX_RETRIES times.
+
+    KEY CHANGES vs previous version:
+    1. IP-block guard: if _NSE_IP_BLOCKED is True, raise immediately — no log spam,
+       no retries, no session rebuilds. Saves 3-5 min per run when GitHub Actions
+       IP is banned by NSE.
+    2. Single session rebuild per CALL (not per attempt): we rebuild the session
+       at most once per _nse_json() invocation. The old code reset _NSE_SESSION=None
+       on every attempt, causing 3× session rebuilds per symbol (each rebuild hits
+       nseindia.com + market-data page = ~3s each = 9s overhead per symbol).
+    3. Success resets the consecutive-fail counter so transient failures don't
+       permanently open the circuit.
+    4. After NSE_FAIL_THRESHOLD full-retry failures, _NSE_IP_BLOCKED is set True
+       and a single Telegram alert is sent (not one per symbol).
     """
+    global _NSE_SESSION, _NSE_CONSECUTIVE_FAILS, _NSE_IP_BLOCKED
+
+    # Circuit breaker: IP is blocked — fail fast, no log spam
+    with _NSE_FAIL_LOCK:
+        if _NSE_IP_BLOCKED:
+            raise IOError("NSE IP-blocked (circuit open) — skipping all NSE calls this run")
+
     last_exc: Exception = RuntimeError("unreachable")
-    for attempt in range(NSE_MAX_RETRIES):  # FIX-4: was hardcoded 3; set NSE_MAX_RETRIES=1 in CI
+    session_rebuilt = False   # rebuild session AT MOST ONCE per call, not per attempt
+
+    for attempt in range(NSE_MAX_RETRIES):
         if attempt:
-            base_delay = 2 ** attempt          # 2, 4
+            base_delay = 2 ** attempt          # 2s, 4s
             jitter     = base_delay * 0.25 * random.random()
             time.sleep(base_delay + jitter)
         try:
@@ -1386,20 +1415,40 @@ def _nse_json(sess: requests.Session, url: str, params: dict = None, timeout: in
                 raise ValueError(f"NSE empty/HTML body ({resp.status_code}) for {url}")
             if resp.status_code == 503:
                 raise IOError(f"NSE 503 Service Unavailable for {url}")
+            # SUCCESS — reset consecutive-fail counter
+            with _NSE_FAIL_LOCK:
+                _NSE_CONSECUTIVE_FAILS = 0
             return resp.json()
         except (requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError,
                 IOError,
                 ValueError,
-                json.JSONDecodeError) as e:   # BUG-004 FIX + BUG#2: catch JSONDecodeError explicitly
+                json.JSONDecodeError) as e:
             last_exc = e
-            log.warning(f"NSE request attempt {attempt+1}/{NSE_MAX_RETRIES} failed ({type(e).__name__}): {url} — {e}")
-            # BUG#2 FIX: HTML/empty body means session cookies expired; rebuild before retry
-            if isinstance(e, (json.JSONDecodeError, ValueError)):
-                global _NSE_SESSION
+            log.warning(f"NSE attempt {attempt+1}/{NSE_MAX_RETRIES} failed "
+                        f"({type(e).__name__}): {e}")
+            # Rebuild session ONCE per call (not per attempt) when body is bad
+            if not session_rebuilt and isinstance(e, (json.JSONDecodeError, ValueError)):
                 with _NSE_SESSION_LOCK:
-                    _NSE_SESSION = None   # force full session rebuild on next _get_nse_session() call
-                log.info("NSE session reset — cookies may have expired; rebuilding on next request")
+                    _NSE_SESSION = None
+                sess = _get_nse_session()
+                session_rebuilt = True
+                log.debug("NSE session rebuilt (once per call)")
+
+    # All retries exhausted — increment circuit breaker counter
+    with _NSE_FAIL_LOCK:
+        _NSE_CONSECUTIVE_FAILS += 1
+        fails = _NSE_CONSECUTIVE_FAILS
+        if fails >= _NSE_FAIL_THRESHOLD and not _NSE_IP_BLOCKED:
+            _NSE_IP_BLOCKED = True
+            log.error(
+                f"NSE IP-BLOCK DETECTED after {fails} consecutive failures. "
+                f"All NSE calls disabled for this run. Pipeline switching to yfinance-only mode."
+            )
+            _tg_health_alert(
+                f"NSE IP blocked on GitHub Actions ({fails} consecutive failures). "
+                f"Switched to yfinance-only mode for today's run."
+            )
     raise last_exc
 
 
@@ -2016,8 +2065,11 @@ def fetch_history(symbol: str, days: int = 300,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_fii_dii() -> dict:
-    NEUTRAL = {"score": 15, "label": "↔ MIXED", "detail": "FII/DII data unavailable", "fii_net": 0, "dii_net": 0}
-    if not FORCE_SHEETS and not FORCE_YFINANCE:
+    NEUTRAL = {"score": 15, "label": "MIXED", "detail": "FII/DII data unavailable", "fii_net": 0, "dii_net": 0}
+    # IP-block guard: skip NSE entirely if circuit is open
+    with _NSE_FAIL_LOCK:
+        nse_ok = not _NSE_IP_BLOCKED
+    if not FORCE_SHEETS and not FORCE_YFINANCE and nse_ok:
         try:
             sess = _get_nse_session()
             data = _nse_json(sess, "https://www.nseindia.com/api/fiidiiTradeReact")
@@ -2061,7 +2113,9 @@ def fetch_fii_dii() -> dict:
 
 def fetch_insider_trades(days_back: int = 30) -> dict:
     result: dict = {}
-    if not FORCE_SHEETS and not FORCE_YFINANCE:
+    with _NSE_FAIL_LOCK:
+        nse_ok = not _NSE_IP_BLOCKED
+    if not FORCE_SHEETS and not FORCE_YFINANCE and nse_ok:
         try:
             sess   = _get_nse_session()
             data   = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit", params={"index":"equities"})
@@ -2183,7 +2237,9 @@ def fetch_filings(days_back: int = 14) -> dict:
 
         return score, detail, label
 
-    if not FORCE_SHEETS and not FORCE_YFINANCE:
+    with _NSE_FAIL_LOCK:
+        nse_ok = not _NSE_IP_BLOCKED
+    if not FORCE_SHEETS and not FORCE_YFINANCE and nse_ok:
         try:
             sess = _get_nse_session()
             data = _nse_json(sess, "https://www.nseindia.com/api/corporates-corporateActions",
@@ -2222,7 +2278,9 @@ def fetch_filings(days_back: int = 14) -> dict:
 
 def fetch_earnings_calendar() -> dict:
     cal: dict = {}
-    if not FORCE_SHEETS and not FORCE_YFINANCE:
+    with _NSE_FAIL_LOCK:
+        nse_ok = not _NSE_IP_BLOCKED
+    if not FORCE_SHEETS and not FORCE_YFINANCE and nse_ok:
         try:
             sess  = _get_nse_session()
             evts  = _nse_json(sess,"https://www.nseindia.com/api/event-calendar",params={"index":"equities"})
@@ -5287,19 +5345,28 @@ def push_gsheets(picks: list, date_label: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _get_yesterday_picks() -> List[dict]:
-    """Fetch yesterday's picks that are still 'open' and need tracking."""
+    """Fetch all open picks from the last MC_HORIZON days, deduplicated by symbol.
+    DUPLICATE FIX: Uses GROUP BY + MAX(id) so reruns that inserted multiple rows
+    for the same symbol/date return only one row per (run_date, symbol) pair.
+    Also looks back MC_HORIZON days (not just yesterday) so picks that haven't
+    hit a target yet continue to be tracked across multiple days."""
     try:
         con = sqlite3.connect(DB_PATH)
-        yesterday = (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+        since = (datetime.today() - timedelta(days=MC_HORIZON)).strftime("%Y-%m-%d")
+        # SELECT the row with MAX(id) per (run_date, symbol) to deduplicate
         rows = con.execute(
             "SELECT run_date, symbol, entry_price, stop_loss, r1, r2, r3, grade, fused_score, story "
-            "FROM pick_outcomes WHERE status='open' AND run_date=?",
-            (yesterday,)
+            "FROM pick_outcomes "
+            "WHERE status='open' AND run_date>=? "
+            "GROUP BY run_date, symbol "
+            "HAVING id = MAX(id)",
+            (since,)
         ).fetchall()
         con.close()
-        return [dict(zip(["run_date","symbol","entry_price","stop_loss","r1","r2","r3","grade","fused_score","story"], r)) for r in rows]
+        return [dict(zip(["run_date","symbol","entry_price","stop_loss",
+                          "r1","r2","r3","grade","fused_score","story"], r)) for r in rows]
     except Exception as e:
-        log.debug(f"Get yesterday picks: {e}")
+        log.debug(f"Get open picks: {e}")
         return []
 
 
@@ -5380,25 +5447,40 @@ def _check_pick_outcome(pick: dict, hist: pd.DataFrame) -> dict:
 
 
 def _run_outcome_engine():
-    """Check all open picks from previous days and update their outcomes."""
+    """Check all open picks from previous days and update their outcomes.
+    LOG-STORM FIX: when NSE is IP-blocked, batch-preload histories via yfinance
+    instead of making per-symbol NSE calls that all fail after 3 retries each.
+    The deduplication in _get_yesterday_picks() ensures we process each symbol once."""
     log.info("=" * 70)
-    log.info("🔁 OUTCOME ENGINE — Checking yesterday's picks…")
+    log.info("OUTCOME ENGINE — Checking open picks…")
     log.info("=" * 70)
-    
+
     open_picks = _get_yesterday_picks()
     if not open_picks:
         log.info("  No open picks to check")
         return
-    
+
     log.info(f"  Tracking {len(open_picks)} open pick(s)")
-    sess = _get_nse_session()
-    
+
+    with _NSE_FAIL_LOCK:
+        ip_blocked = _NSE_IP_BLOCKED
+
+    sess = None if ip_blocked else _get_nse_session()
+
+    # Batch-preload histories for all open symbols via yfinance (one download call)
+    # This is much faster than per-symbol NSE calls when NSE is blocked
+    yf_cache: Dict[str, pd.DataFrame] = {}
+    if ip_blocked:
+        symbols = [p["symbol"] for p in open_picks]
+        log.info(f"  NSE IP-blocked — batch-loading {len(symbols)} histories via yfinance")
+        yf_cache = _preload_histories_yf(symbols, days=30)
+
     for pick in open_picks:
         sym = pick["symbol"]
         try:
-            hist = fetch_history(sym, days=30, sess=sess)
+            hist = fetch_history(sym, days=30, sess=sess, yf_cache=yf_cache if ip_blocked else None)
             outcome = _check_pick_outcome(pick, hist)
-            
+
             if outcome["status"] != "open":
                 _update_pick_outcome(
                     sym, pick["run_date"], outcome["status"],
@@ -5406,12 +5488,13 @@ def _run_outcome_engine():
                     outcome["days_held"], outcome["hit_target"]
                 )
             else:
-                log.info(f"  {sym}: still open ({outcome['days_held']} days)")
-                
-            time.sleep(0.3)
+                log.info(f"  {sym}: still open ({outcome['days_held']} days | "
+                         f"run_date={pick['run_date']})")
+
+            time.sleep(0.1)
         except Exception as e:
             log.debug(f"Outcome check {sym}: {e}")
-    
+
     log.info("  Outcome engine complete")
 
 
@@ -5513,7 +5596,10 @@ def _get_stale_picks(days_stale: int = 5) -> List[dict]:
 
 
 def _alert_open_positions():
-    """Alert if any open pick is within 5% of stop loss."""
+    """Alert if any open pick is within 5% of stop loss.
+    LOG-STORM FIX: if NSE is IP-blocked, skip NSE quote calls entirely and
+    use yfinance for live price — avoids 21 symbols × 3 retries × 3 attempts
+    of guaranteed-fail NSE calls at the start of every run."""
     try:
         con = sqlite3.connect(DB_PATH)
         rows = con.execute(
@@ -5521,39 +5607,65 @@ def _alert_open_positions():
             "FROM pick_outcomes WHERE status='open'"
         ).fetchall()
         con.close()
-        
+
         if not rows:
             return
-        
+
+        # Deduplicate: pick_outcomes can have duplicate open rows if reruns inserted them.
+        # Use a set to process each symbol only once.
+        seen_syms = set()
+        unique_rows = []
+        for row in rows:
+            sym = row[0]
+            if sym not in seen_syms:
+                seen_syms.add(sym)
+                unique_rows.append(row)
+        rows = unique_rows
+
         log.info("=" * 70)
-        log.info("🚨 OPEN POSITION ALERTS")
+        log.info(f"OPEN POSITION ALERTS — {len(rows)} unique symbol(s)")
         log.info("=" * 70)
-        
-        sess = _get_nse_session()
+
+        with _NSE_FAIL_LOCK:
+            ip_blocked = _NSE_IP_BLOCKED
+
+        sess = _get_nse_session() if not ip_blocked else None
+
         for sym, entry, stop, r1, days, status in rows:
+            latest = 0.0
             try:
-                # Get latest price
-                info = _nse_json(sess, "https://www.nseindia.com/api/quote-equity", 
-                                params={"symbol": sym}, timeout=10)
-                latest = float(info.get("priceInfo", {}).get("lastPrice", 0))
-                
+                if not ip_blocked and sess is not None:
+                    info = _nse_json(sess, "https://www.nseindia.com/api/quote-equity",
+                                     params={"symbol": sym}, timeout=10)
+                    latest = float(info.get("priceInfo", {}).get("lastPrice", 0))
+
+                # Fallback to yfinance if NSE blocked or returned 0
                 if latest <= 0:
+                    try:
+                        import yfinance as yf
+                        ticker_info = yf.Ticker(f"{sym}.NS").fast_info
+                        latest = float(getattr(ticker_info, "last_price", 0) or 0)
+                    except Exception:
+                        pass
+
+                if latest <= 0:
+                    log.debug(f"  {sym}: no live price available")
                     continue
-                    
+
                 stop_distance = (latest - stop) / stop * 100
-                r1_distance = (r1 - latest) / latest * 100
-                
+                r1_distance   = (r1 - latest) / latest * 100
+
                 if stop_distance <= 5:
-                    log.warning(f"  🔴 {sym}: ₹{latest:.0f} — only {stop_distance:.1f}% from stop! ({days} days in)")
+                    log.warning(f"  RED {sym}: Rs{latest:.0f} — only {stop_distance:.1f}% from stop! ({days} days)")
                 elif r1_distance <= 5:
-                    log.info(f"  🟢 {sym}: ₹{latest:.0f} — {r1_distance:.1f}% from R1 target ({days} days in)")
+                    log.info(f"  GREEN {sym}: Rs{latest:.0f} — {r1_distance:.1f}% from R1 ({days} days)")
                 else:
-                    log.info(f"  ⚪ {sym}: ₹{latest:.0f} | Stop: {stop_distance:.1f}% away | R1: {r1_distance:.1f}% away")
-                    
-                time.sleep(0.3)
+                    log.info(f"  {sym}: Rs{latest:.0f} | Stop {stop_distance:.1f}% away | R1 {r1_distance:.1f}% away")
+
+                time.sleep(0.2)
             except Exception as e:
                 log.debug(f"Alert check {sym}: {e}")
-                
+
     except Exception as e:
         log.debug(f"Open alerts: {e}")
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5928,7 +6040,36 @@ CREATE TABLE IF NOT EXISTS strategy_approved (
 -- Prevent duplicate sniper_results rows (reruns should not create duplicates)
 CREATE UNIQUE INDEX IF NOT EXISTS uq_sniper_results_date_symbol
     ON sniper_results(run_date, symbol);
+
+-- DUPLICATE FIX: Prevent duplicate pick_outcomes rows.
+-- The outcome engine was iterating over all rows including duplicates from reruns,
+-- causing 21 "still open" log entries for the same 5 symbols.
+-- This index makes INSERT OR IGNORE idempotent on reruns.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pick_outcomes_date_symbol
+    ON pick_outcomes(run_date, symbol);
 """
+
+
+def _deduplicate_pick_outcomes():
+    """
+    One-time cleanup: remove duplicate pick_outcomes rows that were inserted
+    before the UNIQUE index existed. Keeps the row with the highest id
+    (most recent insert) for each (run_date, symbol) pair.
+    Safe to call on every startup — fast no-op when no duplicates exist.
+    """
+    try:
+        with _db_conn(write=True) as con:
+            deleted = con.execute("""
+                DELETE FROM pick_outcomes
+                WHERE id NOT IN (
+                    SELECT MAX(id) FROM pick_outcomes
+                    GROUP BY run_date, symbol
+                )
+            """).rowcount
+        if deleted:
+            log.info(f"pick_outcomes dedup: removed {deleted} duplicate row(s)")
+    except Exception as e:
+        log.debug(f"pick_outcomes dedup: {e}")
 
 
 def _migrate_db_v4():
@@ -5936,7 +6077,8 @@ def _migrate_db_v4():
     try:
         with _db_conn(write=True) as con:
             con.executescript(_DB_SCHEMA_V4)
-        log.info("DB v4.0-M migration complete ✅")
+        log.info("DB v4.0-M migration complete")
+        _deduplicate_pick_outcomes()   # DUPLICATE FIX: clean existing dupes before index is enforced
     except Exception as e:
         log.debug(f"DB v4 migration: {e}")
 
@@ -6218,6 +6360,13 @@ def run():
     with _LLM_CB_LOCK:
         _LLM_FAIL_COUNT   = 0
         _LLM_CIRCUIT_OPEN = False
+
+    # Reset NSE circuit breaker for this run (IP bans are per-session, not permanent)
+    global _NSE_CONSECUTIVE_FAILS, _NSE_IP_BLOCKED, _NSE_HISTORY_OK
+    with _NSE_FAIL_LOCK:
+        _NSE_CONSECUTIVE_FAILS = 0
+        _NSE_IP_BLOCKED        = False
+    _NSE_HISTORY_OK = None   # re-probe NSE at start of each run
 
     # FEEDBACK LOOP (run first -- update yesterday before scoring today)
     # ---------------------------------------------------------------
