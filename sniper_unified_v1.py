@@ -58,7 +58,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v2.0"
+VERSION = "UNIFIED v3.0-M"
 
 # ── Event-Driven Pipeline Infrastructure ──────────────────────────────────────
 # Producer threads push MarketEvents into the queue.
@@ -104,6 +104,10 @@ APEX_TOP_N       = int(os.getenv("APEX_TOP_N", "5"))
 APEX_MIN_SCORE   = int(os.getenv("APEX_MIN_SCORE", "48"))
 
 MC_SIMS    = int(os.getenv("MC_SIMS", "600"))
+
+# v3.0-M: Capacity guard config
+CAPACITY_MAX_OPEN  = int(os.getenv("CAPACITY_MAX_OPEN", "4"))
+CAPACITY_MAX_WEEK  = int(os.getenv("CAPACITY_MAX_WEEK", "6"))
 MC_FAT_DF  = 5          # Student-t df — heavier tails for NSE gap risk
 MC_HORIZON = 12         # swing horizon (days)
 
@@ -1138,6 +1142,7 @@ def _init_db():
             log.debug(f"sniper_results sector migration: {e}")
     con.commit()
     con.close()
+    _migrate_db_v3()  # v3.0-M: additive migration (trade_decisions, weekly_reviews, meta_features columns)
 
 
 def _get_position(symbol: str) -> Optional[dict]:
@@ -2692,7 +2697,10 @@ def _update_meta_outcomes():
 
 
 def _train_meta_labeler(min_samples: int = 50) -> Optional[object]:
-    """Train RandomForest meta-labeler on historical meta_features."""
+    """
+    v1 meta-labeler — trains on ALL resolved signals.
+    Kept as internal fallback; prefer _train_meta_labeler_v2() in run().
+    """
     try:
         with _db_conn() as con:
             rows = con.execute(
@@ -2702,7 +2710,7 @@ def _train_meta_labeler(min_samples: int = 50) -> Optional[object]:
                    WHERE profitable IS NOT NULL""").fetchall()
 
         if len(rows) < min_samples:
-            log.info(f"Meta-labeler: {len(rows)} samples (< {min_samples}) -- skipping training")
+            log.info(f"Meta-labeler v1: {len(rows)} samples (< {min_samples}) -- skipping")
             return None
 
         import pandas as pd
@@ -2723,11 +2731,6 @@ def _train_meta_labeler(min_samples: int = 50) -> Optional[object]:
         X = df[feature_cols].fillna(0)
         y = df["profitable"]
 
-        regime_counts = df['macro_state'].value_counts()
-        for regime, count in regime_counts.items():
-            if count < 50:
-                log.warning(f"Meta-labeler: only {count} samples in {regime} regime (< 50)")
-
         from sklearn.model_selection import train_test_split
         from sklearn.calibration import CalibratedClassifierCV
         from sklearn.ensemble import RandomForestClassifier
@@ -2745,13 +2748,147 @@ def _train_meta_labeler(min_samples: int = 50) -> Optional[object]:
         y_prob = calibrated_clf.predict_proba(X_test)[:, 1]
         auc = roc_auc_score(y_test, y_prob)
         brier = brier_score_loss(y_test, y_prob)
-        log.info(f"Meta-labeler trained: AUC={auc:.3f} | Brier={brier:.3f} | n={len(rows)}")
+        log.info(f"Meta-labeler v1 trained: AUC={auc:.3f} | Brier={brier:.3f} | n={len(rows)}")
 
         return calibrated_clf
 
     except Exception as e:
-        log.warning(f"Meta-labeler training failed: {e}")
+        log.warning(f"Meta-labeler v1 training failed: {e}")
         return None
+
+
+def _train_meta_labeler_v2(min_samples: int = 20) -> Optional[object]:
+    """
+    Meta-labeler v2 (v3.0-M): trains on YOUR decisions, not all signals.
+
+    Labels:
+      1 (win)  = decision=TAKEN AND outcome in (r1_hit, r2_hit, r3_hit)
+      0 (loss) = decision=TAKEN AND outcome in (stopped, expired)
+    Skipped trades are excluded from training (counterfactual unknown).
+    Falls back to v1 training (all signals) if fewer than min_samples decisions exist.
+    """
+    try:
+        from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.pipeline import Pipeline
+        from sklearn.model_selection import cross_val_score
+        import pickle
+    except ImportError:
+        log.debug("sklearn not available — meta-labeler v2 skipped")
+        return None
+
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=10)
+
+        decision_count = con.execute(
+            "SELECT COUNT(*) FROM trade_decisions WHERE decision='TAKEN'"
+        ).fetchone()[0]
+
+        if decision_count >= min_samples:
+            log.info(f"Meta-labeler v2: {decision_count} personal decisions → PERSONALIZED mode")
+            rows = con.execute("""
+                SELECT mf.whale_score, mf.div_score, mf.vp_score, mf.pat_score,
+                       mf.bayes_pct, mf.mc_survival, mf.fort_norm, mf.apex_composite,
+                       mf.confluence_bonus, mf.macro_state, mf.sector, mf.vix_level,
+                       mf.primary_fused_score,
+                       COALESCE(mf.days_to_earnings, -1),
+                       COALESCE(mf.signals_this_week, 0),
+                       COALESCE(mf.your_wr_this_grade, 0.5),
+                       COALESCE(mf.your_wr_this_sector, 0.5),
+                       COALESCE(mf.setup_profile, ''),
+                       o.status
+                FROM trade_decisions td
+                JOIN pick_outcomes o   ON td.symbol=o.symbol AND td.run_date=o.run_date
+                JOIN meta_features mf  ON td.symbol=mf.symbol AND td.run_date=mf.run_date
+                WHERE td.decision='TAKEN'
+                  AND o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
+            """).fetchall()
+        else:
+            log.info(f"Meta-labeler v2: only {decision_count} decisions — FALLBACK to all signals")
+            rows = con.execute("""
+                SELECT mf.whale_score, mf.div_score, mf.vp_score, mf.pat_score,
+                       mf.bayes_pct,
+                       COALESCE(mf.mc_survival, 50),
+                       COALESCE(mf.fort_norm, 50),
+                       COALESCE(mf.apex_composite, 50),
+                       COALESCE(mf.confluence_bonus, 0),
+                       mf.macro_state, mf.sector,
+                       COALESCE(mf.vix_level, 18),
+                       mf.primary_fused_score,
+                       COALESCE(mf.days_to_earnings, -1),
+                       0, 0.5, 0.5, '',
+                       o.status
+                FROM meta_features mf
+                JOIN pick_outcomes o ON mf.symbol=o.symbol AND mf.run_date=o.run_date
+                WHERE o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
+            """).fetchall()
+
+        columns = [
+            "whale_score","div_score","vp_score","pat_score",
+            "bayes_pct","mc_survival","fort_norm","apex_composite",
+            "confluence_bonus","macro_state","sector","vix_level",
+            "primary_fused_score","days_to_earnings","signals_this_week",
+            "your_wr_this_grade","your_wr_this_sector","setup_profile","status"
+        ]
+        con.close()
+
+        if len(rows) < min_samples:
+            log.info(f"Meta-labeler v2: {len(rows)} samples < {min_samples} minimum — skipping")
+            return None
+
+        df = pd.DataFrame(rows, columns=columns)
+        df["label"] = df["status"].isin(["r1_hit","r2_hit","r3_hit"]).astype(int)
+
+        df["macro_clear"]   = (df["macro_state"] == "CLEAR").astype(int)
+        df["macro_chop"]    = (df["macro_state"] == "CHOP").astype(int)
+        df["macro_panic"]   = (df["macro_state"].isin(["PANIC","MASSACRE"])).astype(int)
+        df["earnings_near"] = (df["days_to_earnings"].clip(lower=-1) < 8).astype(int)
+        df["high_capacity"] = (df["signals_this_week"] >= 4).astype(int)
+
+        for sec in ["NIFTY IT","NIFTY PHARMA","NIFTY AUTO","NIFTY FMCG","NIFTY METAL","DIVERSIFIED"]:
+            df[f"sec_{sec.replace(' ','_')}"] = (df["sector"] == sec).astype(int)
+
+        if df["setup_profile"].nunique() > 1:
+            top_profiles = df["setup_profile"].value_counts().head(8).index.tolist()
+            for p in top_profiles:
+                df[f"prof_{p}"] = (df["setup_profile"] == p).astype(int)
+
+        feature_cols = [c for c in df.columns if c not in
+                        ("status","label","macro_state","sector","setup_profile")]
+        X = df[feature_cols].fillna(0)
+        y = df["label"]
+
+        if y.sum() < 3 or (1-y).sum() < 3:
+            log.warning("Meta-labeler v2: too few of one class — skipping")
+            return None
+
+        if len(rows) >= 100:
+            model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("clf", GradientBoostingClassifier(n_estimators=100, max_depth=3,
+                                                    learning_rate=0.1, random_state=42))
+            ])
+        else:
+            model = RandomForestClassifier(n_estimators=100, max_depth=4,
+                                           min_samples_leaf=3, random_state=42,
+                                           class_weight="balanced")
+
+        model.fit(X, y)
+        cv_scores = cross_val_score(model, X, y, cv=min(3, len(rows)//5 or 1), scoring="roc_auc")
+        log.info(f"Meta-labeler v2 trained: {len(rows)} samples | "
+                 f"AUC {cv_scores.mean():.3f}±{cv_scores.std():.3f} | "
+                 f"Mode: {'PERSONALIZED' if decision_count >= min_samples else 'FALLBACK'}")
+
+        if not hasattr(model, "feature_names_in_"):
+            model.feature_names_in_ = X.columns.tolist()
+
+        return model
+
+    except Exception as e:
+        log.debug(f"Meta-labeler v2 training failed: {e}")
+        return None
+
+
 
 
 def _load_meta_model(model_path: str = "meta_model.pkl") -> Optional[object]:
@@ -2826,7 +2963,392 @@ def _get_meta_probability(model, features: dict) -> float:
         return 0.55
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5b — DB MIGRATION v3.0-M  (called from _init_db)
+# ══════════════════════════════════════════════════════════════════════════════
 
+_DB_SCHEMA_V3 = """
+-- A1. Human decision log — feeds the personalized AI Brain
+CREATE TABLE IF NOT EXISTS trade_decisions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date     TEXT    NOT NULL,
+    symbol       TEXT    NOT NULL,
+    decision     TEXT    NOT NULL,   -- TAKEN | SKIPPED | PARTIAL
+    entry_price  REAL,
+    shares_taken INTEGER DEFAULT 0,
+    skip_reason  TEXT,
+    ai_confidence REAL,
+    worth_flag   TEXT,               -- WORTH_YOUR_TIME | MAYBE | SKIP
+    setup_profile TEXT,
+    logged_at    TEXT DEFAULT (datetime('now')),
+    UNIQUE(run_date, symbol)
+);
+
+-- A2. Weekly review snapshots
+CREATE TABLE IF NOT EXISTS weekly_reviews (
+    week_start         TEXT PRIMARY KEY,
+    signals_total      INTEGER DEFAULT 0,
+    taken              INTEGER DEFAULT 0,
+    skipped            INTEGER DEFAULT 0,
+    wins               INTEGER DEFAULT 0,
+    losses             INTEGER DEFAULT 0,
+    avg_pnl            REAL,
+    ai_accuracy_high   REAL,
+    ai_accuracy_mid    REAL,
+    ai_accuracy_low    REAL,
+    summary_text       TEXT,
+    generated_at       TEXT DEFAULT (datetime('now'))
+);
+"""
+
+
+def _migrate_db_v3():
+    """
+    Safe, additive v3.0-M migration. Called from _init_db().
+    All operations are idempotent — safe to run every startup.
+    """
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=10)
+        con.executescript(_DB_SCHEMA_V3)
+
+        # Additive ALTER TABLE — each wrapped to survive "already exists" errors
+        alter_stmts = [
+            ("meta_features", "setup_profile",       "TEXT"),
+            ("meta_features", "days_to_earnings",    "INTEGER DEFAULT -1"),
+            ("meta_features", "signals_this_week",   "INTEGER DEFAULT 0"),
+            ("meta_features", "your_wr_this_grade",  "REAL DEFAULT 0.5"),
+            ("meta_features", "your_wr_this_sector", "REAL DEFAULT 0.5"),
+            ("meta_features", "mc_survival",         "REAL"),
+            ("meta_features", "fort_norm",           "REAL"),
+            ("meta_features", "apex_composite",      "REAL"),
+            ("meta_features", "confluence_bonus",    "REAL"),
+            ("meta_features", "vix_level",           "REAL"),
+        ]
+        for table, col, dtype in alter_stmts:
+            try:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {dtype}")
+            except Exception:
+                pass  # Column already exists — fine
+
+        con.commit()
+        con.close()
+        log.info("DB v3.0-M migration complete ✅")
+    except Exception as e:
+        log.debug(f"DB v3 migration: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5c — SETUP PROFILE FINGERPRINTING  (v3.0-M)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_setup_profile(r: dict) -> str:
+    """
+    Fingerprint a signal into a 5-char setup profile code.
+    Format: [Grade][Macro][Whale][Divergence][VPOC]
+    Example: "PCHWV" = PRISTINE, CHOP, Whale detected, hidden div, at VPOC
+    """
+    grade_code = {"APEX": "A", "PRISTINE": "P", "GOOD": "G", "PROBE": "B"}.get(
+        r.get("grade", "PROBE"), "B"
+    )
+    macro_code = {"CLEAR": "C", "CHOP": "H", "PANIC": "P", "FOG": "F", "MASSACRE": "M"}.get(
+        r.get("macro_state", "CHOP"), "H"
+    )
+    whale_code = "W" if r.get("whale_score", 0) >= 15 else "w"
+    div_code   = "D" if r.get("div_score", 0) >= 10 else "d"
+    vpoc_code  = "V" if r.get("layer1", False) else "v"
+    return f"{grade_code}{macro_code}{whale_code}{div_code}{vpoc_code}"
+
+
+def _historical_win_rate_for_profile(profile: str, grade: str = None, sector: str = None,
+                                      lookback_days: int = 90) -> dict:
+    """
+    Query YOUR personal win rate for a given setup profile.
+    Returns: {total, wins, avg_pnl, win_rate, confidence_label}
+    """
+    empty = {"total": 0, "wins": 0, "avg_pnl": 0.0, "win_rate": 0.0, "confidence_label": "No history"}
+    try:
+        since = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        rows = con.execute("""
+            SELECT o.status, o.pnl_pct
+            FROM trade_decisions td
+            JOIN pick_outcomes o ON td.symbol = o.symbol AND td.run_date = o.run_date
+            JOIN meta_features mf ON td.symbol = mf.symbol AND td.run_date = mf.run_date
+            WHERE td.decision = 'TAKEN'
+              AND td.run_date >= ?
+              AND o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
+              AND mf.setup_profile = ?
+        """, (since, profile)).fetchall()
+        if len(rows) < 3 and grade:
+            rows = con.execute("""
+                SELECT o.status, o.pnl_pct
+                FROM trade_decisions td
+                JOIN pick_outcomes o ON td.symbol = o.symbol AND td.run_date = o.run_date
+                JOIN meta_features mf ON td.symbol = mf.symbol AND td.run_date = mf.run_date
+                WHERE td.decision = 'TAKEN'
+                  AND td.run_date >= ?
+                  AND o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
+                  AND mf.grade = ?
+            """, (since, grade)).fetchall()
+        con.close()
+        if not rows:
+            return empty
+        total = len(rows)
+        wins  = sum(1 for s, _ in rows if s in ("r1_hit", "r2_hit", "r3_hit"))
+        pnls  = [p for _, p in rows if p is not None]
+        avg_pnl  = round(sum(pnls) / len(pnls), 2) if pnls else 0.0
+        win_rate = round(wins / total * 100, 1)
+        if total < 3:
+            label = f"{wins}/{total} trades (limited data)"
+        elif win_rate >= 60:
+            label = f"{wins}/{total} wins avg {avg_pnl:+.1f}% 🟢"
+        elif win_rate >= 40:
+            label = f"{wins}/{total} wins avg {avg_pnl:+.1f}% 📊"
+        else:
+            label = f"{wins}/{total} wins avg {avg_pnl:+.1f}% 🔴"
+        return {"total": total, "wins": wins, "avg_pnl": avg_pnl,
+                "win_rate": win_rate, "confidence_label": label}
+    except Exception as e:
+        log.debug(f"Profile win rate query failed: {e}")
+        return empty
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5d — REGIME-SCALED CONFIDENCE  (v3.0-M)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _regime_scaled_confidence(meta_prob: float, macro_state: str, vix: float) -> float:
+    """
+    Scale AI confidence by macro regime.
+    Ceiling at 0.92 (never claim certainty), floor at 0.10.
+    """
+    if macro_state == "CLEAR":
+        if vix < 13:
+            scale = 1.12
+        elif vix < 17:
+            scale = 1.06
+        else:
+            scale = 1.00
+    elif macro_state == "CHOP":
+        scale = 0.88
+    elif macro_state == "FOG":
+        scale = 0.75
+    elif macro_state == "PANIC":
+        scale = 0.60
+    else:
+        scale = 0.40
+    return round(min(0.92, max(0.10, meta_prob * scale)), 3)
+
+
+def _confidence_flag(confidence: float) -> str:
+    """Convert 0-1 confidence to human label."""
+    if confidence >= 0.75:
+        return "WORTH YOUR TIME"
+    elif confidence >= 0.55:
+        return "MAYBE"
+    return "SKIP"
+
+
+def _confidence_emoji(flag: str) -> str:
+    return {"WORTH YOUR TIME": "🟢", "MAYBE": "🔵", "SKIP": "⚪"}.get(flag, "⚪")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5e — CAPACITY GUARD  (v3.0-M)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _capacity_guard(date_label: str) -> dict:
+    """
+    Prevent alert fatigue and over-trading.
+    Returns: {slots_remaining, open_count, taken_this_week, warn, reduce_to_worth_only, note}
+    """
+    result = {
+        "slots_remaining": CAPACITY_MAX_OPEN,
+        "open_count": 0,
+        "taken_this_week": 0,
+        "warn": False,
+        "reduce_to_worth_only": False,
+        "note": ""
+    }
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        open_row = con.execute(
+            "SELECT COUNT(*) FROM pick_outcomes WHERE status = 'open'"
+        ).fetchone()
+        open_count = open_row[0] if open_row else 0
+
+        week_start = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+        week_row = con.execute(
+            "SELECT COUNT(*) FROM trade_decisions WHERE decision='TAKEN' AND run_date >= ?",
+            (week_start,)
+        ).fetchone()
+        taken_this_week = week_row[0] if week_row else 0
+
+        recent = con.execute("""
+            SELECT o.status FROM trade_decisions td
+            JOIN pick_outcomes o ON td.symbol=o.symbol AND td.run_date=o.run_date
+            WHERE td.decision='TAKEN'
+              AND o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')
+            ORDER BY td.logged_at DESC LIMIT 3
+        """).fetchall()
+        con.close()
+
+        consecutive_losses = sum(1 for (s,) in recent if s in ("stopped", "expired"))
+        slots = max(0, CAPACITY_MAX_OPEN - open_count)
+
+        result["open_count"]      = open_count
+        result["taken_this_week"] = taken_this_week
+        result["slots_remaining"] = slots
+
+        if open_count >= CAPACITY_MAX_OPEN:
+            result["warn"] = True
+            result["reduce_to_worth_only"] = True
+            result["note"] = f"⚠️ {open_count} open positions — only WORTH YOUR TIME signals today"
+        elif consecutive_losses >= 2:
+            result["warn"] = True
+            result["reduce_to_worth_only"] = True
+            result["note"] = f"⚠️ {consecutive_losses} consecutive losses — raising the bar"
+        elif taken_this_week >= CAPACITY_MAX_WEEK:
+            result["reduce_to_worth_only"] = True
+            result["note"] = f"📊 {taken_this_week} trades this week — quality over quantity"
+    except Exception as e:
+        log.debug(f"Capacity guard: {e}")
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5f — TRADE DECISION LOGGER  (v3.0-M)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _log_trade_decision(run_date: str, symbol: str, decision: str,
+                         entry_price: float = None, shares: int = 0,
+                         skip_reason: str = None, ai_confidence: float = None,
+                         worth_flag: str = None, setup_profile: str = None):
+    """
+    Log a manual trade decision to trade_decisions table.
+    Called by reply_handler.py when you reply to the Telegram bot.
+    """
+    try:
+        with _db_conn(write=True) as con:
+            con.execute("""
+                INSERT OR REPLACE INTO trade_decisions
+                  (run_date, symbol, decision, entry_price, shares_taken,
+                   skip_reason, ai_confidence, worth_flag, setup_profile)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (run_date, symbol.upper(), decision, entry_price, shares,
+                  skip_reason, ai_confidence, worth_flag, setup_profile))
+        log.info(f"Decision logged: {symbol} → {decision} "
+                 f"({'₹'+str(entry_price) if entry_price else skip_reason})")
+    except Exception as e:
+        log.error(f"Decision log failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5g — WEEKLY REVIEW  (v3.0-M)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _send_weekly_review():
+    """
+    Generate and send a personalised weekly performance review via Telegram.
+    Analyses YOUR decisions vs outcomes. Run every Friday via GitHub Actions.
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        week_start = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+        con = sqlite3.connect(DB_PATH, timeout=10)
+        decisions = con.execute("""
+            SELECT td.symbol, td.decision, td.entry_price, td.ai_confidence, td.worth_flag,
+                   o.status, o.pnl_pct, o.days_held
+            FROM trade_decisions td
+            LEFT JOIN pick_outcomes o ON td.symbol=o.symbol AND td.run_date=o.run_date
+            WHERE td.run_date >= ?
+        """, (week_start,)).fetchall()
+        total_signals = con.execute(
+            "SELECT COUNT(DISTINCT symbol) FROM sniper_results WHERE run_date >= ?",
+            (week_start,)
+        ).fetchone()[0]
+        con.close()
+
+        taken   = [d for d in decisions if d[1] == "TAKEN"]
+        skipped = [d for d in decisions if d[1] == "SKIPPED"]
+        closed  = [d for d in taken if d[5] and d[5] not in ("open", None)]
+        wins    = [d for d in closed if d[5] in ("r1_hit","r2_hit","r3_hit")]
+        losses  = [d for d in closed if d[5] in ("stopped","expired")]
+        pnls    = [d[6] for d in closed if d[6] is not None]
+        avg_pnl = round(sum(pnls)/len(pnls), 2) if pnls else 0.0
+
+        high_taken = [d for d in closed if d[3] and d[3] >= 0.75]
+        mid_taken  = [d for d in closed if d[3] and 0.55 <= d[3] < 0.75]
+        low_taken  = [d for d in closed if d[3] and d[3] < 0.55]
+
+        def _acc(grp):
+            if not grp: return None
+            return round(sum(1 for d in grp if d[5] in ("r1_hit","r2_hit","r3_hit")) / len(grp) * 100, 1)
+
+        acc_high = _acc(high_taken)
+        acc_mid  = _acc(mid_taken)
+        acc_low  = _acc(low_taken)
+        wr = round(len(wins)/len(closed)*100, 1) if closed else 0.0
+        week_num = datetime.today().strftime("%V")
+
+        lines = [
+            f"📊 WEEKLY REVIEW — Week {week_num} ({week_start} to today)",
+            "",
+            f"Signals: {total_signals} | Taken: {len(taken)} | Skipped: {len(skipped)} | Open: {len(taken)-len(closed)}",
+            "",
+            "📈 Your results (closed trades):",
+        ]
+        if closed:
+            best  = max(closed, key=lambda d: d[6] or -99)
+            worst = min(closed, key=lambda d: d[6] or 99)
+            lines += [
+                f"  Win rate: {len(wins)}/{len(closed)} ({wr}%) | Avg P&L: {avg_pnl:+.1f}%",
+                f"  Best: {best[0]} {best[6]:+.1f}% | Worst: {worst[0]} {worst[6]:+.1f}%",
+            ]
+        else:
+            lines.append("  No closed trades this week yet.")
+
+        lines += ["", "🤖 AI Confidence accuracy:"]
+        if acc_high is not None:
+            lines.append(f"  >75% confidence ({len(high_taken)} trades) → {acc_high}% win rate {'✅' if acc_high >= 60 else '⚠️'}")
+        if acc_mid is not None:
+            lines.append(f"  55-75% confidence ({len(mid_taken)} trades) → {acc_mid}% win rate {'📊' if acc_mid >= 50 else '⚠️'}")
+        if acc_low is not None:
+            lines.append(f"  <55% confidence ({len(low_taken)} trades) → {acc_low}% win rate {'🚫' if acc_low < 40 else '📊'}")
+
+        lines.append("")
+        if acc_low is not None and acc_low < 35 and len(low_taken) >= 2:
+            lines.append("💡 Insight: Skip signals under 55% confidence — your data confirms it loses.")
+        elif acc_high is not None and acc_high >= 65 and len(high_taken) >= 2:
+            lines.append("💡 Insight: High-confidence signals are working — trust the >75% threshold.")
+        elif wr < 40 and len(closed) >= 3:
+            lines.append("💡 Insight: Win rate low this week — consider tightening entry to buy zone only.")
+        else:
+            lines.append("💡 Stay consistent — the edge compounds over time. Bismillah 🤲")
+
+        msg = "\n".join(lines)
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
+
+        try:
+            con = sqlite3.connect(DB_PATH, timeout=10)
+            con.execute("""
+                INSERT OR REPLACE INTO weekly_reviews
+                  (week_start, signals_total, taken, skipped, wins, losses, avg_pnl,
+                   ai_accuracy_high, ai_accuracy_mid, ai_accuracy_low, summary_text)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (week_start, total_signals, len(taken), len(skipped),
+                  len(wins), len(losses), avg_pnl, acc_high, acc_mid, acc_low, msg))
+            con.commit(); con.close()
+        except Exception as e:
+            log.debug(f"Weekly review DB store: {e}")
+
+        log.info("Weekly review sent ✅")
+    except Exception as e:
+        log.error(f"Weekly review failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ── CALIBRATED PRIORS (based on NSE halal mid-cap backtest estimates) ──
 # These are conservative estimates. Replace with your actual backtest results.
 _BAYES_PRIORS = {
@@ -3610,57 +4132,153 @@ def _why_plain(r: dict) -> str:
     return " + ".join(parts[:3])
 
 
-def send_telegram(picks: list, macro: dict, fii_data: dict,
-                   date_label: str, data_source: str):
+def send_telegram_v3(picks: list, macro: dict, fii_data: dict,
+                      date_label: str, data_source: str,
+                      capacity: dict = None):
+    """
+    v3.0-M Telegram format:
+    - Shows AI Confidence % + WORTH YOUR TIME / MAYBE / SKIP flag
+    - Shows your personal win history for similar setups
+    - Shows regime context and capacity guard status
+    - Includes reply instructions (TAKEN / SKIPPED / PARTIAL)
+    - Filters to WORTH_YOUR_TIME only when capacity guard is active
+    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.info("Telegram not configured — skipping"); return
+        log.warning("Telegram: not configured"); return
 
-    ms = macro.get("macro_state", "CHOP")
+    if capacity is None:
+        capacity = _capacity_guard(date_label)
+
+    vix_val   = macro.get("vix_val", 0.0)
+    macro_st  = macro.get("macro_state", "CHOP")
+    macro_icon = {"CLEAR": "🟢", "CHOP": "🟡", "PANIC": "🔴",
+                  "FOG": "🌫️", "MASSACRE": "🚨"}.get(macro_st, "⚪")
 
     lines = [
-        f"Bismillah ⚔️ SNIPER {VERSION} | {date_label}",
-        "────────────────────────────",
+        f"⚔️ SNIPER {VERSION} | {date_label} | {macro_icon} {macro_st} | VIX {vix_val:.1f}",
+        f"📡 Source: {data_source} | Halal | Manual execution only",
     ]
+    if capacity.get("note"):
+        lines.append(capacity["note"])
+    lines.append("")
 
-    if ms == "MASSACRE":
-        lines.extend(["", "🚨 MARKET CRASH — NO TRADES TODAY."])
-    elif ms == "PANIC":
-        lines.extend(["", "🔴 MARKET PANIC — NO NEW TRADES."])
-    elif not picks:
-        lines.extend(["", "📭 No setups today. Patience is profit."])
-    else:
-        for i, r in enumerate(picks, 1):
-            sym = r["symbol"]
-            grade_plain = _grade_plain(r["grade"])
-            verdict = _verdict_plain(r)
-            why = _why_plain(r)
-            
-            dot = "🟢" if verdict.startswith("✅") else "🔴"
-            
-            block = [
-                "",
-                f"{dot} {sym}  ₹{r['close']:.0f}  |  {grade_plain}  |  Score {r['fused']}/100",
-                f"Buy: ₹{r['buy_lo']:.0f}–₹{r['buy_hi']:.0f}  |  Stop: ₹{r['stop_loss']:.0f} ({r['risk_pct']:.0f}%)  |  Re-Buy ₹{r['trail_stop']:.0f}",
-                f"Sell: ₹{r['r1']:.0f}→30%  |  ₹{r['r2']:.0f}→30%  |  ₹{r['r3']:.0f}→40%",
-                f"Why: {why}",
-                f"Verdict: {verdict}",
-                "────────────────────────────",
-            ]
-            lines.extend(block)
+    if macro_st == "MASSACRE":
+        lines.extend(["🚨 MARKET CRASH — NO TRADES TODAY.", ""])
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "\n".join(lines))
+        return
+    if macro_st == "PANIC":
+        lines.extend(["🔴 MARKET PANIC — NO NEW TRADES.", ""])
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "\n".join(lines))
+        return
+    if not picks:
+        lines.append("🤲 No qualifying picks today — patience is also a position.")
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "\n".join(lines))
+        return
 
-    lines.extend([
-        "",
-        f"🔎 Found {len(picks)} setup(s) | {MC_HORIZON}-day hold | Risk {ACCOUNT_RISK_PCT*100:.1f}%/trade",
-    ])
+    # Enrich each pick with v3 confidence fields
+    enriched = []
+    for r in picks:
+        profile   = r.get("setup_profile") or _get_setup_profile(r)
+        hist      = _historical_win_rate_for_profile(profile, r.get("grade"), r.get("sector"))
+        meta_prob = r.get("meta_prob", 0.55)
+        confidence = _regime_scaled_confidence(meta_prob, macro_st, vix_val)
+        flag       = _confidence_flag(confidence)
+        enriched.append({**r, "profile": profile, "history": hist,
+                         "confidence": confidence, "flag": flag})
+
+    # Capacity guard: filter if needed
+    display_picks = enriched
+    if capacity.get("reduce_to_worth_only"):
+        display_picks = [p for p in enriched if p["flag"] == "WORTH YOUR TIME"]
+        if not display_picks:
+            lines.append("🔒 Capacity guard active — no WORTH YOUR TIME signals today.")
+            lines.append("Existing positions are your priority.")
+            _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "\n".join(lines))
+            return
+        lines.append(f"🔒 Showing {len(display_picks)} WORTH YOUR TIME signals only (capacity guard)")
+        lines.append("")
+
+    # Build pick cards
+    for i, p in enumerate(display_picks, 1):
+        icon     = _confidence_emoji(p["flag"])
+        conf_pct = round(p["confidence"] * 100)
+        hist     = p["history"]
+
+        earn_warn = ""
+        earn_days = p.get("earn_days")
+        if earn_days is not None and 0 <= earn_days <= 3:
+            earn_warn = f"\n   🚫 Earnings in {earn_days}d — consider skipping"
+        elif earn_days is not None and 0 <= earn_days <= 8:
+            earn_warn = f"\n   ⚠️ Earnings in {earn_days}d"
+
+        vol_warn = " [NO-VOL]" if not p.get("vol_reliable", True) else ""
+
+        if hist["total"] >= 3:
+            hist_line = f"\n   📊 Your history: {hist['confidence_label']}"
+        elif hist["total"] > 0:
+            hist_line = f"\n   📊 Your history: {hist['wins']}/{hist['total']} similar trades"
+        else:
+            hist_line = "\n   📊 Your history: No similar setups yet"
+
+        if p["flag"] == "SKIP":
+            rec_note = "\n   🚫 AI recommends skip — false positive risk high"
+        elif p["flag"] == "MAYBE" and conf_pct < 60:
+            rec_note = "\n   ⚠️ Low confidence — consider skipping if busy"
+        else:
+            rec_note = ""
+
+        mom_tier = p.get("sector_momentum_tier", "")
+        mom_note = f" | Sector {mom_tier}" if mom_tier and mom_tier != "NEUTRAL" else ""
+
+        why = _why_plain(p)
+        verdict = _verdict_plain(p)
+        verdict_dot = "✅" if verdict.startswith("✅") else "⛔"
+
+        card = (
+            f"{icon} #{i} {p['symbol']}{vol_warn} — AI CONFIDENCE {conf_pct}% [{p['flag']}]\n"
+            f"   ₹{p['close']:.0f} | Buy: ₹{p['buy_lo']}–{p['buy_hi']} | "
+            f"SL ₹{p['stop_loss']} ({p['risk_pct']:.1f}%)\n"
+            f"   R1 ₹{p['r1']} | R2 ₹{p['r2']} | R3 ₹{p['r3']} | Grade {p['grade']}{mom_note}\n"
+            f"   Fortress: VPOC {'✓' if p.get('layer1') else '✗'} "
+            f"Vol {'✓' if p.get('vol_reliable',True) else '✗'} "
+            f"ADX {p.get('adx',0):.0f} | "
+            f"Whale {'✓' if p.get('whale_score',0)>=15 else '✗'} "
+            f"Bayes {p.get('bayes_pct',0)}%\n"
+            f"   Why: {why}\n"
+            f"   Verdict: {verdict_dot} {verdict.split('—',1)[-1].strip() if '—' in verdict else verdict}"
+            f"{hist_line}"
+            f"{earn_warn}"
+            f"{rec_note}"
+        )
+        lines.append(card)
+        lines.append("")
+
+    # Footer
+    lines.append("─" * 35)
+    lines.append("Reply to log your decision:")
+    lines.append("  TAKEN TCS @ 3445")
+    lines.append("  SKIPPED TCS earnings close")
+    lines.append("  PARTIAL TCS 50    ← if taking half size")
+    lines.append("")
+    lines.append(f"FII/DII: {fii_data.get('label','—')} | {fii_data.get('detail','')[:60]}")
+    lines.append(f"🔎 {len(display_picks)} pick(s) | {MC_HORIZON}-day hold | Risk {ACCOUNT_RISK_PCT*100:.1f}%/trade")
+    lines.append("🤲 Bismillah — trade only what you understand")
 
     full_msg = "\n".join(lines)
-    targets = [TELEGRAM_CHAT_ID] + TELEGRAM_SHARE_IDS
+    chunks = _split_msg(full_msg, limit=4000)
+    for chunk in chunks:
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, chunk)
 
-    for msg_part in _split_msg(full_msg):
-        for chat_id in targets:
-            if not chat_id: continue
-            _tg_post(TELEGRAM_TOKEN, chat_id, msg_part)
+    for share_id in TELEGRAM_SHARE_IDS:
+        if share_id and share_id != TELEGRAM_CHAT_ID:
+            _tg_post(TELEGRAM_TOKEN, share_id, chunks[0])
             time.sleep(0.3)
+
+
+def send_telegram(picks: list, macro: dict, fii_data: dict,
+                   date_label: str, data_source: str):
+    """Backward-compatible alias — delegates to send_telegram_v3."""
+    send_telegram_v3(picks, macro, fii_data, date_label, data_source)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 15 — OUTPUT: EXCEL, HTML, GOOGLE SHEETS
@@ -4335,8 +4953,9 @@ def run():
     _alert_open_positions()    # Warn if any open pick near stop
 
     # META-LABELER: Backfill outcomes + train/retrain model
+    # v3.0-M: first try personalized v2, fall back to v1 if not enough decisions
     _update_meta_outcomes()
-    meta_model = _train_meta_labeler(min_samples=50)
+    meta_model = _train_meta_labeler_v2(min_samples=20) or _train_meta_labeler(min_samples=50)
     if meta_model:
         _save_meta_model(meta_model)
 
@@ -4642,13 +5261,40 @@ def run():
     seen = set()
     top_picks = [r for r in top_picks if r["symbol"] not in seen and not seen.add(r["symbol"])]
 
+    # ── v3.0-M: Attach meta_prob, regime-scaled confidence, setup profile ──
+    meta_model_live = _load_meta_model()
+    for r in top_picks:
+        profile = _get_setup_profile(r)
+        r["setup_profile"] = profile
+        meta_features_v3 = {
+            "whale_score": r.get("whale_score", 0),
+            "div_score":   r.get("div_score", 0),
+            "vp_score":    r.get("vp_score", 0),
+            "pat_score":   r.get("pat_score", 0),
+            "bayes_pct":   r.get("bayes_pct", 0),
+            "macro_state": macro.get("macro_state", "CHOP"),
+            "sector":      r.get("sector", "DIVERSIFIED"),
+            "vix_level":   macro.get("vix_val", 18.0),
+            "primary_fused_score": r.get("fused", 0),
+        }
+        meta_prob = _get_meta_probability(meta_model_live, meta_features_v3)
+        r["meta_prob"]   = _regime_scaled_confidence(meta_prob, macro["macro_state"], macro.get("vix_val", 18.0))
+        r["worth_flag"]  = _confidence_flag(r["meta_prob"])
+        r["macro_state"] = macro.get("macro_state", "CHOP")   # propagate for profile display
+
+    # ── v3.0-M: Capacity guard ─────────────────────────────────────────────
+    capacity = _capacity_guard(date_label)
+    if capacity.get("note"):
+        log.info(f"Capacity guard: {capacity['note']}")
+
     log.info(f"\n{'='*70}")
     log.info(f"⚔️  TOP {len(top_picks)} PICKS")
     log.info(f"{'='*70}")
     for rank, r in enumerate(top_picks, 1):
         vn = "" if r.get("vol_reliable",True) else " [NO-VOL]"
         log.info(f"  #{rank} {r['symbol']:12s} | Fused {r['fused']}/100 | Fort {r['fort_pct']:.0f}% "
-                 f"| APEX {r['apex_composite']}/100 | {r['grade']}{vn}")
+                 f"| APEX {r['apex_composite']}/100 | {r['grade']}{vn} "
+                 f"| AI {round(r.get('meta_prob',0.55)*100)}% [{r.get('worth_flag','—')}]")
         log.info(f"       Buy ₹{r['buy_lo']}-{r['buy_hi']} | SL ₹{r['stop_loss']} | "
                  f"R1 ₹{r['r1']} | R2 ₹{r['r2']} | MC {r['mc_survival']}%")
         log.info(f"       {r['story'][:80]}")
@@ -4660,7 +5306,7 @@ def run():
     log.info("Pushing PERFORMANCE…"); _push_performance_tab(date_label)
     # AI_INSIGHTS pushed unconditionally — shows story+conviction even without LLM API key
     log.info("Pushing AI_INSIGHTS…"); _push_ai_insights_tab(top_picks, date_label)
-    log.info("Sending Telegram…");   send_telegram(top_picks, macro, fii_data, date_label, data_source)
+    log.info("Sending Telegram…");   send_telegram_v3(top_picks, macro, fii_data, date_label, data_source, capacity)
 
     # Persist results to DB + outcome tracking
     try:
@@ -4673,28 +5319,32 @@ def run():
                     (date_label,r["symbol"],r["grade"],r["fused"],r["close"],
                      r["stop_loss"],r["r1"],r["r2"],r["r3"],r["story"],r.get("sector","DIVERSIFIED"))
                 )
-                # NEW: outcome tracking (initial state)
+                # outcome tracking (initial state)
                 con.execute(
                     "INSERT OR IGNORE INTO pick_outcomes (run_date,symbol,entry_price,stop_loss,r1,r2,r3,grade,fused_score,story,status) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (date_label,r["symbol"],r["close"],r["stop_loss"],r["r1"],r["r2"],r["r3"],
                      r["grade"],r["fused"],r["story"],"open")
                 )
+                # v3.0-M: store setup_profile in meta_features for personalized learning
+                try:
+                    con.execute(
+                        "UPDATE meta_features SET setup_profile=?, days_to_earnings=? "
+                        "WHERE symbol=? AND run_date=?",
+                        (r.get("setup_profile",""), r.get("earn_days",-1),
+                         r["symbol"], date_label)
+                    )
+                except Exception:
+                    pass
         log.info(f"DB: {len(top_picks)} picks saved for outcome tracking")
     except Exception as e:
         log.debug(f"DB persist: {e}")
 
     # BUG FIX [ML-001]: second backfill + retrain pass at end of run().
-    # The first _update_meta_outcomes() at the START of run() backfills outcomes
-    # for picks from previous runs that resolved since the last session.  But today's
-    # picks were only just written to pick_outcomes above.  Running a second pass here
-    # ensures the training set includes any outcomes that resolved DURING today's run
-    # (e.g. intraday exits from yesterday's picks confirmed by the outcome engine
-    # earlier in this session).  The retrained model is then ready for tomorrow's run.
-    # Under < 50 samples this is a no-op — the function logs and returns None safely.
+    # v3.0-M: use personalized v2 labeler; fall back to v1 if insufficient decisions.
     log.info("Post-run meta-labeler refresh…")
     _update_meta_outcomes()
-    refreshed_model = _train_meta_labeler(min_samples=50)
+    refreshed_model = _train_meta_labeler_v2(min_samples=20) or _train_meta_labeler(min_samples=50)
     if refreshed_model:
         _save_meta_model(refreshed_model)
         log.info("Meta-model refreshed with today's resolved outcomes")
@@ -4710,4 +5360,10 @@ def run():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    run()
+    import sys
+    if "--weekly-review" in sys.argv:
+        # Run standalone: python sniper_unified_v2.py --weekly-review
+        _init_db()
+        _send_weekly_review()
+    else:
+        run()
