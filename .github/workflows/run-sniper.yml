@@ -14,7 +14,16 @@ on:
   schedule:
     # 13:00 UTC = 18:30 IST (Mon-Fri after market close)
     - cron: '0 13 * * 1-5'
+    # 3:00 UTC = 8:30 IST (Mon-Fri pre-market, reply poller start)
+    - cron: '0 3 * * 1-5'
+    # 10:30 UTC = 16:00 IST (Friday weekly review)
+    - cron: '30 10 * * 5'
   workflow_dispatch:      # manual trigger, no inputs
+
+env:
+  # Suppress Node.js 20 deprecation warnings — force Node 24 runtime
+  # Remove after GitHub completes migration (expected before Sept 2026)
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
 
@@ -149,9 +158,10 @@ jobs:
       - name: 💬 Poll Telegram replies
         run: python reply_handler.py
 
+      # ── FIXED: Conditional DB upload — only if DB exists ─────
       - name: 📤 Upload updated DB
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && hashFiles('outputs/sniper_cache.db') != ''
         with:
           name: reply-db-${{ github.run_id }}
           path: outputs/sniper_cache.db
@@ -165,7 +175,8 @@ jobs:
     name: 📊 Weekly Performance Review
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event_name == 'workflow_dispatch'   # also triggered by Friday cron below
+    # Only run on Friday cron or manual trigger
+    if: (github.event_name == 'schedule' && github.event.schedule == '30 10 * * 5') || github.event_name == 'workflow_dispatch'
 
     env:
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
