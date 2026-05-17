@@ -132,7 +132,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v4.7"  # v4.7: FIX-DEADLOCK (_batch_market_caps double-lock) | FIX-UNIVERSE (MAX_PRICE 800→3000, MAX_CANDIDATES 200→350) | FIX-RERUN (score_cache: same-day reruns skip fortress+APEX re-score, FAST_RERUN=true env var) | FIX-B2 (_today_label ddmmyyyy vs date_label yyyy-mm-dd mismatch — same-day DELETEs were silent no-ops)
+VERSION = "UNIFIED v4.7"  # v4.7: FIX-DEADLOCK | FIX-UNIVERSE (MAX_PRICE→3000, MAX_CANDS→350) | FIX-RERUN (score_cache+FAST_RERUN) | FIX-B2 (_today_label format mismatch) | FIX-YF-HANG (_batch_market_caps: replaced yf.Ticker().info with direct requests.get timeout=(5,12))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FIX-2.6 — SecureSecretsManager
@@ -7951,23 +7951,36 @@ def run():
                 return result
 
             # 2. Parallel fetch with hard timeout per symbol
-            # FIX-1: circuit breaker guard + socket timeout + manual executor shutdown
+            # FIX-YF-HANG: yf.Ticker().info uses requests/urllib3 internally.
+            # socket.setdefaulttimeout() does NOT apply to requests — it only
+            # affects bare socket connections. When Yahoo blocks the runner IP,
+            # yf.Ticker().info hangs in a C-level recv() that Python cannot
+            # interrupt. future.result(timeout=15) times out on the main thread
+            # but the worker thread remains as a zombie.
+            # Fix: call Yahoo Finance v7 quote API directly with requests.get()
+            # using timeout=(connect_s, read_s). requests/urllib3 enforces this
+            # at the Python level, so threads exit cleanly on timeout or block.
+            _YF_QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
+            _YF_HEADERS   = {"User-Agent": "Mozilla/5.0 (compatible; SniperBot/4.7)"}
+
             def _fetch_one(sym, _fallback=fallback_map):
-                # FIX-1.1: circuit breaker guard — skip if YF is banned this run
+                # Circuit breaker guard — skip if YF is banned this run
                 with _YF_FAIL_LOCK:
                     if time.time() < _YF_CIRCUIT_OPEN_UNTIL:
                         return sym, _fallback.get(sym, 100.0)
                 try:
-                    import yfinance as yf
-                    import socket as _socket
-                    _socket.setdefaulttimeout(15)   # FIX-1.3: hard socket timeout prevents infinite hang
-                    try:
-                        info = yf.Ticker(f"{sym}.NS").info
-                    finally:
-                        _socket.setdefaulttimeout(None)  # always restore global default
-                    mc = info.get("marketCap")
-                    if mc:
-                        return sym, float(mc) / 1e7
+                    resp = requests.get(
+                        _YF_QUOTE_URL,
+                        params={"symbols": f"{sym}.NS", "fields": "marketCap"},
+                        headers=_YF_HEADERS,
+                        timeout=(5, 12),   # connect=5s, read=12s — enforced by urllib3
+                    )
+                    if resp.status_code == 200:
+                        items = resp.json().get("quoteResponse", {}).get("result", [])
+                        if items:
+                            mc = items[0].get("marketCap")
+                            if mc:
+                                return sym, float(mc) / 1e7
                 except Exception:
                     pass
                 return sym, _fallback.get(sym, 100.0)
