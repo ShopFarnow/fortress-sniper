@@ -51,8 +51,6 @@ jobs:
           OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
           GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
-          ACCOUNT_EQUITY:    ${{ secrets.ACCOUNT_EQUITY }}
-          ACCOUNT_RISK_PCT:  ${{ secrets.ACCOUNT_RISK_PCT }}
           CACHE_PATH:        outputs/sniper_cache.db
 
   # ── JOB 2: Telegram reply poller — runs every 10 min during market hours ───
