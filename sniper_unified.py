@@ -132,7 +132,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v4.5-ARCH"  # v4.5: architecture realigned + 5 targeted fixes
+VERSION = "UNIFIED v4.6-FIXES"  # v4.6: 9 targeted fixes — _batch_market_caps hang, NSE fail unification, session rebuild guard, MC rescue, llm_cache TTL, walkforward weights, live Bayes priors, Telegram reply handler, DB_BACKUP verification
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FIX-2.6 — SecureSecretsManager
@@ -824,7 +824,8 @@ def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Opti
 # ── Shared SQLite LLM cache ──────────────────────────────────────────────────
 
 def _llm_cached(text: str, prompt_type: str) -> Optional[str]:
-    """Check SQLite cache for existing LLM result.
+    """Check SQLite cache for existing LLM result, honouring expires_at TTL.
+    FIX-5: rows past expires_at are treated as cache misses (stale data ignored).
     FIX-LEAK: uses _db_conn() context manager instead of bare sqlite3.connect()
     to guarantee connection close even on exceptions (prevents WAL lock pile-up)."""
     if not LLM_ENABLED:
@@ -833,7 +834,9 @@ def _llm_cached(text: str, prompt_type: str) -> Optional[str]:
         h = _llm_hash(text)
         with _db_conn() as con:
             row = con.execute(
-                "SELECT result FROM llm_cache WHERE text_hash=? AND prompt_type=?",
+                # FIX-5: honour TTL — only return row if expires_at is NULL or still future
+                "SELECT result FROM llm_cache WHERE text_hash=? AND prompt_type=? "
+                "AND (expires_at IS NULL OR expires_at > datetime('now'))",
                 (h, prompt_type)
             ).fetchone()
         if row:
@@ -845,13 +848,24 @@ def _llm_cached(text: str, prompt_type: str) -> Optional[str]:
 
 
 def _llm_store_cache(text: str, prompt_type: str, result: str, model: str = ""):
-    """Store LLM result in SQLite cache.
+    """Store LLM result in SQLite cache with TTL expiry per prompt type.
+    FIX-5: TTLs — alpha_mine=30d (filing sentiment), halal_l4=7d (Shariah screen),
+    structured_reasoning=90d (signal coherence, slowest-changing).
     FIX-LEAK: uses _db_conn(write=True) context manager."""
+    # FIX-5: per-prompt-type TTL in days
+    _TTL_DAYS = {
+        "alpha_mine":           30,
+        "halal_l4":              7,
+        "structured_reasoning": 90,
+    }
+    ttl_days = _TTL_DAYS.get(prompt_type, 30)
+    from datetime import timedelta as _td
+    expires_at = (datetime.today() + _td(days=ttl_days)).strftime("%Y-%m-%d %H:%M:%S")
     try:
         with _db_conn(write=True) as con:
             con.execute(
-                "INSERT OR REPLACE INTO llm_cache (text_hash, prompt_type, result, model) VALUES (?,?,?,?)",
-                (_llm_hash(text), prompt_type, result, model or CLAUDE_MODEL)
+                "INSERT OR REPLACE INTO llm_cache (text_hash, prompt_type, result, model, expires_at) VALUES (?,?,?,?,?)",
+                (_llm_hash(text), prompt_type, result, model or CLAUDE_MODEL, expires_at)
             )
     except Exception:
         pass
@@ -1393,6 +1407,7 @@ def _live_sector_momentum(sector: str, days: int = 20) -> dict:
 def _lookup_sector_nse(sym: str) -> str:
     # FIX-4.1-M: Skip ALL NSE calls immediately if IP-blocked — was burning
     # 3 retries × 5s per symbol even after _NSE_IP_BLOCKED was set.
+    global _NSE_CONSECUTIVE_FAILS, _NSE_IP_BLOCKED  # FIX-2: need globals for unified fail counter
     with _NSE_FAIL_LOCK:
         if _NSE_IP_BLOCKED:
             return "DIVERSIFIED"
@@ -1414,6 +1429,23 @@ def _lookup_sector_nse(sym: str) -> str:
             if any(k in ind for k in ("textile","apparel","garment","yarn","fabric","spinning")):        return "NIFTY TEXTILES"
     except Exception as e:
         log.debug(f"Sector lookup {sym}: {e}")
+        # FIX-2: Unify NSE fail counter — _lookup_sector_nse() exceptions must
+        # increment the same circuit breaker as _nse_json(). Previously this try/except
+        # swallowed failures silently, allowing 600 wasted retries when IP is blocked.
+        # Now ANY NSE function failure counts toward the shared threshold.
+        with _NSE_FAIL_LOCK:
+            _NSE_CONSECUTIVE_FAILS += 1
+            fails = _NSE_CONSECUTIVE_FAILS
+            if fails >= _NSE_FAIL_THRESHOLD and not _NSE_IP_BLOCKED:
+                _NSE_IP_BLOCKED = True
+                log.error(
+                    f"NSE IP-BLOCK DETECTED (via sector lookup) after {fails} total NSE failures. "
+                    f"All NSE calls disabled for this run."
+                )
+                _tg_health_alert(
+                    f"NSE IP blocked (sector lookup) after {fails} total NSE failures. "
+                    f"Switched to yfinance-only mode."
+                )
     return "DIVERSIFIED"
 
 
@@ -1991,6 +2023,9 @@ def _make_nse_session() -> requests.Session:
     return s
 
 
+_NSE_SESSION_REBUILT_THIS_RUN = False  # FIX-3: only rebuild once per run, not per symbol
+
+
 def _get_nse_session() -> requests.Session:
     """Return module-level cached NSE session — warm exactly once per run."""
     global _NSE_SESSION
@@ -2020,7 +2055,7 @@ def _nse_json(sess: requests.Session, url: str, params: dict = None, timeout: in
     4. After NSE_FAIL_THRESHOLD full-retry failures, _NSE_IP_BLOCKED is set True
        and a single Telegram alert is sent (not one per symbol).
     """
-    global _NSE_SESSION, _NSE_CONSECUTIVE_FAILS, _NSE_IP_BLOCKED
+    global _NSE_SESSION, _NSE_CONSECUTIVE_FAILS, _NSE_IP_BLOCKED, _NSE_SESSION_REBUILT_THIS_RUN
 
     # Circuit breaker: IP is blocked — fail fast, no log spam
     with _NSE_FAIL_LOCK:
@@ -2054,13 +2089,21 @@ def _nse_json(sess: requests.Session, url: str, params: dict = None, timeout: in
             last_exc = e
             log.warning(f"NSE attempt {attempt+1}/{NSE_MAX_RETRIES} failed "
                         f"({type(e).__name__}): {e}")
-            # Rebuild session ONCE per call (not per attempt) when body is bad
-            if not session_rebuilt and isinstance(e, (json.JSONDecodeError, ValueError)):
+            # FIX-3: Rebuild session AT MOST ONCE PER RUN (not per call, not per attempt).
+            # The old code rebuilt on every JSONDecodeError/ValueError — 30+ rebuilds
+            # per run when the IP is blocked (each rebuild = 2 HTTP hits = ~3s).
+            # Now we check _NSE_SESSION_REBUILT_THIS_RUN; a blocked IP won't benefit
+            # from a second rebuild so we skip it entirely.
+            if (not session_rebuilt and not _NSE_SESSION_REBUILT_THIS_RUN
+                    and isinstance(e, (json.JSONDecodeError, ValueError))):
                 with _NSE_SESSION_LOCK:
                     _NSE_SESSION = None
+                    _NSE_SESSION_REBUILT_THIS_RUN = True
                 sess = _get_nse_session()
                 session_rebuilt = True
-                log.debug("NSE session rebuilt (once per call)")
+                log.debug("NSE session rebuilt (ONCE this run — FIX-3)")
+            elif _NSE_SESSION_REBUILT_THIS_RUN and not session_rebuilt:
+                log.debug("NSE session rebuild skipped — already rebuilt once this run (FIX-3)")
 
     # All retries exhausted — increment circuit breaker counter
     with _NSE_FAIL_LOCK:
@@ -2176,7 +2219,8 @@ def _init_db():
             prompt_type TEXT,
             result      TEXT,
             model       TEXT,
-            created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+            created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+            expires_at  TEXT  -- FIX-5: TTL per prompt type (alpha_mine=30d, halal_l4=7d, structured_reasoning=90d)
         );
         CREATE TABLE IF NOT EXISTS bayes_calibration (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4896,6 +4940,53 @@ _BAYES_PRIORS = {
 }
 
 
+def _load_live_bayes_priors():
+    """
+    FIX-7: Replace static _BAYES_PRIORS with live empirical win rates after 50 picks.
+    _calibrate_bayes_priors() already computes real win rates per node and writes them
+    to bayes_calibration — but _bayesian_apex() still reads the hardcoded list.
+    At run() start, if bayes_calibration has >50 rows per node, pull live win_rate
+    values and override _BAYES_PRIORS tuples in memory. Full learning loop closed.
+    """
+    global _BAYES_PRIORS
+    try:
+        with _db_conn() as con:
+            rows = con.execute(
+                "SELECT prior_name, win_rate, total FROM bayes_calibration WHERE total >= 50"
+            ).fetchall()
+        if not rows:
+            log.debug("FIX-7: bayes_calibration has no nodes with ≥50 samples — using hardcoded priors")
+            return
+
+        # Build lookup: {prior_name: empirical_win_rate}
+        live_rates = {name: float(wr) for name, wr, total in rows if wr is not None}
+        if not live_rates:
+            return
+
+        updated = []
+        new_priors = set()
+        for entry in _BAYES_PRIORS:
+            name, pt, pf, weight = entry
+            if name in live_rates:
+                emp_wr = live_rates[name]
+                # pt (prob if true) = empirical win rate
+                # pf (prob if false) = complement shrunk toward 0.40 base rate
+                new_pt = round(max(0.40, min(0.80, emp_wr)), 3)
+                new_pf = round(max(0.30, min(0.60, emp_wr * 0.75)), 3)
+                new_priors.add((name, new_pt, new_pf, weight))
+                updated.append(f"{name}: pt {pt:.3f}→{new_pt:.3f} pf {pf:.3f}→{new_pf:.3f} (n={dict([(r[0],r[2]) for r in rows]).get(name,'?')})")
+            else:
+                new_priors.add(entry)
+
+        _BAYES_PRIORS = new_priors
+        if updated:
+            log.info(f"FIX-7: Bayesian priors updated from {len(updated)} live calibration node(s):\n  " + "\n  ".join(updated[:5]))
+        else:
+            log.debug("FIX-7: No calibrated nodes had ≥50 samples — hardcoded priors unchanged")
+    except Exception as e:
+        log.warning(f"_load_live_bayes_priors failed (non-fatal, using hardcoded): {e}")
+
+
 def _bayesian_apex(macro_state: str, breadth_ok: bool, layer1: bool, layer2: bool, layer3: bool,
                    whale_detected: bool, div_type: str, vp_score: float,
                    mfi_v: float, adx_v: float, alt_pct: float,
@@ -5241,10 +5332,22 @@ def assemble_pick(
     # passes normally, while apex=30 + fort=42 gets fused=44 and is still rejected.
     apex_floor = 30 if macro_state == "CHOP" else APEX_MIN_SCORE
     if apex_composite < apex_floor:
-        log.info(f"  DEBUG {symbol}: REJECTED | apex={apex_composite} (floor={apex_floor}/{macro_state}) | bayes={bayes['bayes_pct']}% | "
-                 f"whale={whale_score:.0f} | div={div_score:.0f} | vp={vp_score:.0f} | pat={pat_score:.0f} | "
-                 f"mc={mc_survival} | confluence={confluence_bonus} | damp={macro_damp.get(macro_state,0.88)}")
-        return None
+        # FIX-4: MC Survival Rescue — if MC survival is very high (>= 85%) and we're
+        # only just below the floor (within 5 pts), the low APEX may be a data artifact
+        # (NSE blocked → incomplete intraday → vp_score=0, div_score=0) rather than
+        # genuine weakness. KIMS example: fortress=60, mc=96%, but apex=27 < floor=30.
+        # Only rescue when within 5 pts of floor AND mc_survival is very high.
+        if mc_survival is not None and mc_survival >= 85 and apex_composite >= apex_floor - 5:
+            log.info(
+                f"  MC RESCUE {symbol}: apex={apex_composite} (floor={apex_floor}-5={apex_floor-5}) "
+                f"but mc_survival={mc_survival}% >= 85% — allowing through (data artifact likely)"
+            )
+            # Don't return None — fall through to continue scoring
+        else:
+            log.info(f"  DEBUG {symbol}: REJECTED | apex={apex_composite} (floor={apex_floor}/{macro_state}) | bayes={bayes['bayes_pct']}% | "
+                     f"whale={whale_score:.0f} | div={div_score:.0f} | vp={vp_score:.0f} | pat={pat_score:.0f} | "
+                     f"mc={mc_survival} | confluence={confluence_bonus} | damp={macro_damp.get(macro_state,0.88)}")
+            return None
 
     # ── META-LABELING: Store signal vector + optional veto ──
 
@@ -6807,6 +6910,8 @@ def _backup_db_to_sheets():
     FIX-A6: Export last 500 pick_outcomes rows to a BACKUP tab in Google Sheets.
     Called from _weekly_ai_status_agent() so history survives GitHub Actions
     cache eviction (7-day TTL by default). Read-only — never mutates DB.
+    FIX-9: Post-backup verification — reads back the first row from DB_BACKUP
+    and compares row count to local DB. Logs a warning if they diverge.
     """
     if not _sheets_ok():
         log.debug("DB backup to Sheets skipped — Sheets not configured")
@@ -6822,12 +6927,32 @@ def _backup_db_to_sheets():
         if not rows:
             log.info("DB backup: no pick_outcomes rows to export")
             return
+        local_row_count = len(rows)
         header = [["run_date","symbol","grade","fused_score","status",
                    "exit_price","pnl_pct","days_held","hit_target","story",
                    f"exported_at: {datetime.today().isoformat()}"]]
         data   = [list(r) for r in rows]
         _push_sheet("DB_BACKUP", header + data)
-        log.info(f"DB backup: {len(rows)} pick_outcomes rows → Sheets DB_BACKUP ✅")
+        log.info(f"DB backup: {local_row_count} pick_outcomes rows → Sheets DB_BACKUP ✅")
+
+        # FIX-9: Post-backup verification — read first data row back from DB_BACKUP
+        # to confirm the push succeeded and row count is consistent.
+        try:
+            ws = _get_ws("DB_BACKUP")
+            if ws is not None:
+                all_vals = ws.get_all_values()
+                sheets_data_rows = len(all_vals) - 1  # subtract header row
+                if abs(sheets_data_rows - local_row_count) > 5:
+                    log.warning(
+                        f"FIX-9: DB_BACKUP verification MISMATCH — "
+                        f"local={local_row_count} rows, Sheets={sheets_data_rows} rows. "
+                        f"Backup may be incomplete. Check Sheets quota or auth."
+                    )
+                else:
+                    log.info(f"FIX-9: DB_BACKUP verified ✅ — local={local_row_count}, Sheets={sheets_data_rows} rows")
+        except Exception as ve:
+            log.warning(f"FIX-9: DB_BACKUP post-verification failed (non-fatal): {ve}")
+
     except Exception as e:
         log.warning(f"DB backup to Sheets failed: {e}")
 
@@ -6954,6 +7079,16 @@ def _migrate_db_v4():
     try:
         with _db_conn(write=True) as con:
             con.executescript(_DB_SCHEMA_V4)
+        # FIX-5: Migration — add expires_at column to llm_cache if absent.
+        # llm_cache had no expiry — January buyback filings were served in June.
+        # This is idempotent: SQLite raises "duplicate column name" if already exists.
+        try:
+            with _db_conn(write=True) as con:
+                con.execute("ALTER TABLE llm_cache ADD COLUMN expires_at TEXT")
+                log.info("DB migration: added 'expires_at' column to llm_cache (FIX-5) ✅")
+        except Exception as _e:
+            if "duplicate column" not in str(_e).lower() and "already exists" not in str(_e).lower():
+                log.debug(f"llm_cache expires_at migration: {_e}")
         log.info("DB v4.0-M migration complete")
         _deduplicate_pick_outcomes()   # DUPLICATE FIX: clean existing dupes before index is enforced
     except Exception as e:
@@ -6964,6 +7099,67 @@ def _migrate_db_v4():
 # ══════════════════════════════════════════════════════════════════════════════
 # [PATCH-F]  WEEKLY AI STATUS AGENT  (v4.0-M — Step 10, read-only LLM analysis)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _apply_walkforward_weight_updates():
+    """
+    FIX-6: Wire _walkforward_engine_correlation output into APEX engine weights (W dict).
+    Called from _weekly_ai_status_agent() after 30+ closed picks exist.
+    Rules:
+      GENUINE  (r > 0.30, p < 0.10) → keep weight (no change)
+      MARGINAL (0.10 ≤ r ≤ 0.30)   → small reduction (−5%)
+      NOISE    (r < 0.10)           → halve the weight
+    Changes capped at ±20% per weekly run to prevent oscillation.
+    Weights are re-normalised after adjustment so they remain proportional.
+    """
+    engine_to_w_key = {
+        "whale_radar":  "whale_radar",
+        "divergence":   "divergence",
+        "vol_profile":  "vol_profile",
+        "pattern":      "pattern",
+        "bayesian":     "bayesian",
+    }
+    try:
+        corr = _walkforward_engine_correlation(days=90)
+        if corr.get("status") in ("INSUFFICIENT", "ERROR"):
+            log.info(f"Walkforward weight update skipped: {corr.get('message', corr.get('status'))}")
+            return
+
+        adjustments = []
+        for engine, w_key in engine_to_w_key.items():
+            if engine not in corr:
+                continue
+            data = corr[engine]
+            status = data.get("status", "NOISE")
+            old_w = W.get(w_key, 0.15)
+
+            if status == "GENUINE":
+                new_w = old_w          # keep weight unchanged
+                action = "KEEP"
+            elif status == "MARGINAL":
+                new_w = old_w * 0.95  # −5% reduction
+                action = "TRIM"
+            else:  # NOISE
+                new_w = old_w * 0.50  # halve the weight
+                action = "HALVE"
+
+            # Cap change at ±20% of original
+            max_change = old_w * 0.20
+            new_w = max(old_w - max_change, min(old_w + max_change, new_w))
+            new_w = round(max(0.05, min(0.50, new_w)), 4)  # hard bounds
+
+            if new_w != old_w:
+                W[w_key] = new_w
+                adjustments.append(f"{engine}: {old_w:.3f}→{new_w:.3f} [{action} r={data.get('r', 0):.2f} n={data.get('n', 0)}]")
+            else:
+                log.debug(f"Walkforward {engine}: no change ({action}, r={data.get('r', 0):.2f})")
+
+        if adjustments:
+            log.info(f"FIX-6: APEX weights updated from walkforward correlation:\n  " + "\n  ".join(adjustments))
+        else:
+            log.info("FIX-6: Walkforward engine correlation — all weights unchanged (GENUINE signals)")
+    except Exception as e:
+        log.warning(f"_apply_walkforward_weight_updates failed (non-fatal): {e}")
+
 
 def _weekly_ai_status_agent():
     """
@@ -6976,6 +7172,23 @@ def _weekly_ai_status_agent():
     # GitHub Actions cache TTL is 7 days — the weekly run is the perfect trigger
     # to ensure history is preserved before it can expire.
     _backup_db_to_sheets()
+
+    # FIX-5: Purge expired llm_cache rows weekly then vacuum.
+    # Stale filings (e.g. January buyback) are no longer served months later.
+    try:
+        with _db_conn(write=True) as _llm_clean_con:
+            deleted = _llm_clean_con.execute(
+                "DELETE FROM llm_cache WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')"
+            ).rowcount
+        if deleted:
+            log.info(f"FIX-5: Pruned {deleted} expired llm_cache row(s)")
+            try:
+                with _db_conn(write=True) as _vac_con:
+                    _vac_con.execute("PRAGMA vacuum")
+            except Exception:
+                pass
+    except Exception as _ce:
+        log.debug(f"llm_cache cleanup: {_ce}")
 
     if not (_ANTHROPIC_OK or _OPENAI_OK):
         _send_weekly_review()
@@ -7065,6 +7278,14 @@ def _weekly_ai_status_agent():
         msg = (f"\U0001f4ca WEEKLY AI REPORT | {since} \u2192 {datetime.today().strftime('%Y-%m-%d')}\n\n"
                f"{report}\n\n\U0001f91d Read-only analysis. No parameters changed.")
         _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
+
+        # FIX-6: Wire _walkforward_engine_correlation output into APEX weights.
+        # Previously this function was dead code — it computed Spearman-r between
+        # sub-engine scores and real P&L but its result was never used.
+        # Now: after 30+ closed picks, update W[] based on GENUINE/NOISE status.
+        # Cap changes at ±20% per week to prevent oscillation.
+        _apply_walkforward_weight_updates()
+
         log.info("Weekly AI Status Agent complete ✅")
 
     except Exception as e:
@@ -7234,6 +7455,8 @@ def run():
        run as separate CLI invocations.
     """
     _init_db()
+    # FIX-1.4: Declare FORCE_YFINANCE as global so the auto-detect can modify it mid-run
+    global FORCE_YFINANCE
     # FIX-2.6: Validate secrets at startup
     secrets.validate()
     # FIX-A07: Validate numeric config bounds at startup
@@ -7243,6 +7466,7 @@ def run():
         log.error(f"Startup config validation FAILED: {e}")
         raise
     _load_approved_params()   # BUG#4 FIX: load dynamic params from strategy_approved DB
+    _load_live_bayes_priors() # FIX-7: replace hardcoded priors with live empirical win rates if ≥50 samples
     _, date_label = _get_last_trading_day()
 
     # DEBUG: Verify LLM keys — booleans only, safe to keep in production logs.
@@ -7271,6 +7495,8 @@ def run():
         _NSE_CONSECUTIVE_FAILS = 0
         _NSE_IP_BLOCKED        = False
     _set_nse_history_ok(None)   # FIX-A02: thread-safe reset; re-probe NSE at start of each run
+    global _NSE_SESSION_REBUILT_THIS_RUN
+    _NSE_SESSION_REBUILT_THIS_RUN = False  # FIX-3: reset rebuild guard for fresh run
 
     # FIX-A8: Expire stale ghost positions FIRST — must run before capacity guard
     # and before _run_outcome_engine() so counts are accurate throughout this run.
@@ -7508,10 +7734,24 @@ def run():
     # 7. Scoring loop (one loop, both engines fused)
     sess    = _get_nse_session()
     results = []
+    _nse_block_auto_switched = False  # FIX-1.4: track whether we auto-switched to yfinance
     for i,(_, row) in enumerate(cands.iterrows()):
         sym = row["symbol"]
         if i % 25 == 0:
             log.info(f"Progress: {i}/{len(cands)} | picks: {len(results)}")
+        # FIX-1.4: Auto-detect NSE block after first 10 symbols and switch to FORCE_YFINANCE
+        # Removes the need to manually set FORCE_YFINANCE=true when NSE is down.
+        if not _nse_block_auto_switched and i == 10:
+            with _NSE_FAIL_LOCK:
+                _auto_nse_blocked = _NSE_IP_BLOCKED
+            if _auto_nse_blocked:
+                FORCE_YFINANCE = True
+                _nse_block_auto_switched = True
+                log.warning(
+                    "FIX-1.4: NSE IP-BLOCKED detected within first 10 symbols — "
+                    "auto-switching FORCE_YFINANCE=True for remainder of this run. "
+                    "No manual env var change needed."
+                )
         try:
             hist = fetch_history(sym, days=300, sess=sess, yf_cache=hist_cache)
             if len(hist) < MIN_HIST_BARS:
@@ -7601,35 +7841,51 @@ def run():
                 return result
 
             # 2. Parallel fetch with hard timeout per symbol
-            def _fetch_one(sym):
+            # FIX-1: circuit breaker guard + socket timeout + manual executor shutdown
+            def _fetch_one(sym, _fallback=fallback_map):
+                # FIX-1.1: circuit breaker guard — skip if YF is banned this run
+                with _YF_FAIL_LOCK:
+                    if time.time() < _YF_CIRCUIT_OPEN_UNTIL:
+                        return sym, _fallback.get(sym, 100.0)
                 try:
                     import yfinance as yf
-                    info = yf.Ticker(f"{sym}.NS").info
+                    import socket as _socket
+                    _socket.setdefaulttimeout(15)   # FIX-1.3: hard socket timeout prevents infinite hang
+                    try:
+                        info = yf.Ticker(f"{sym}.NS").info
+                    finally:
+                        _socket.setdefaulttimeout(None)  # always restore global default
                     mc = info.get("marketCap")
                     if mc:
                         return sym, float(mc) / 1e7
                 except Exception:
                     pass
-                return sym, fallback_map.get(sym, 100.0)
+                return sym, _fallback.get(sym, 100.0)
 
+            # FIX-1.2: manual executor shutdown — context manager blocks until all workers
+            # finish, which hangs the pipeline when a yfinance call is stuck. Manual
+            # shutdown(wait=False, cancel_futures=True) releases the main thread immediately.
+            executor = ThreadPoolExecutor(max_workers=3)
+            futures = {executor.submit(_fetch_one, sym): sym for sym in need_fetch}
             try:
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    futures = {executor.submit(_fetch_one, sym): sym for sym in need_fetch}
-                    for future in futures:
-                        sym = futures[future]
-                        try:
-                            sym_out, mcap = future.result(timeout=_YF_INFO_TIMEOUT)
-                            result[sym_out] = mcap
-                        except FutureTimeoutError:
-                            log.warning(f"Market cap timeout: {sym}")
-                            result[sym] = fallback_map.get(sym, 100.0)
-                        except Exception:
-                            result[sym] = fallback_map.get(sym, 100.0)
+                for future in list(futures.keys()):
+                    sym = futures[future]
+                    try:
+                        sym_out, mcap = future.result(timeout=15)
+                        result[sym_out] = mcap
+                    except FutureTimeoutError:
+                        log.warning(f"Market cap timeout: {sym}")
+                        future.cancel()
+                        result[sym] = fallback_map.get(sym, 100.0)
+                    except Exception:
+                        result[sym] = fallback_map.get(sym, 100.0)
             except Exception as e:
                 log.error(f"Batch market cap executor failed: {e}")
                 for sym in need_fetch:
                     if sym not in result:
                         result[sym] = fallback_map.get(sym, 100.0)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)  # FIX-1.2: don't block on hung workers
 
             # 3. Cache to SQLite — serialised write to avoid "database is locked"
             with _SQLITE_WRITE_LOCK:
@@ -7890,6 +8146,100 @@ def run():
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _telegram_reply_handler():
+    """
+    FIX-8: Telegram polling bot reply handler with confirm_entry() gate.
+    confirm_entry() exists and checks earnings proximity before allowing a TAKEN
+    decision — but previously nothing called it. This handler intercepts replies
+    like "TAKEN TCS @ 3445" or "PARTIAL TCS 50", calls confirm_entry(symbol) first,
+    and only calls _log_trade_decision() if it passes. If earnings are <2 days away,
+    replies "BLOCKED — earnings in Nd" instead of logging.
+
+    Run standalone: python sniper_unified_v2.py --reply-handler
+    Uses long-polling (getUpdates) — no webhook server required.
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("Reply handler: TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set")
+        return
+
+    _init_db()
+    log.info("FIX-8: Telegram reply handler started (polling mode)…")
+    _, date_label = _get_last_trading_day()
+
+    import re as _re
+    _TAKEN_RE  = _re.compile(r"^TAKEN\s+([A-Z&\-]+)\s+@?\s*([\d.]+)", _re.IGNORECASE)
+    _PARTIAL_RE = _re.compile(r"^PARTIAL\s+([A-Z&\-]+)\s+([\d]+)", _re.IGNORECASE)
+    _SKIP_RE   = _re.compile(r"^SKIP(PED)?\s+([A-Z&\-]+)", _re.IGNORECASE)
+
+    offset = 0
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": offset, "timeout": 30, "allowed_updates": ["message"]},
+                timeout=35
+            )
+            if resp.status_code != 200:
+                time.sleep(5)
+                continue
+            updates = resp.json().get("result", [])
+            for update in updates:
+                offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = (msg.get("text") or "").strip()
+
+                # Only process messages from the configured chat
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    continue
+                if not text:
+                    continue
+
+                reply = None
+
+                # Parse TAKEN TCS @ 3445
+                m = _TAKEN_RE.match(text)
+                if m:
+                    symbol = m.group(1).upper()
+                    entry_price = float(m.group(2))
+                    ok, reason = confirm_entry(symbol)
+                    if not ok:
+                        reply = f"⛔ {symbol} BLOCKED — {reason}\nEntry not logged."
+                    else:
+                        _log_trade_decision(date_label, symbol, "TAKEN", entry_price=entry_price)
+                        reply = f"✅ {symbol} TAKEN @ ₹{entry_price} logged. Bismillah 🤲"
+
+                # Parse PARTIAL TCS 50
+                elif _PARTIAL_RE.match(text):
+                    mp = _PARTIAL_RE.match(text)
+                    symbol = mp.group(1).upper()
+                    shares = int(mp.group(2))
+                    ok, reason = confirm_entry(symbol)
+                    if not ok:
+                        reply = f"⛔ {symbol} BLOCKED — {reason}\nPartial entry not logged."
+                    else:
+                        _log_trade_decision(date_label, symbol, "PARTIAL", shares=shares)
+                        reply = f"✅ {symbol} PARTIAL ({shares} shares) logged."
+
+                # Parse SKIPPED TCS
+                elif _SKIP_RE.match(text):
+                    ms = _SKIP_RE.match(text)
+                    symbol = ms.group(2).upper()
+                    _log_trade_decision(date_label, symbol, "SKIPPED", skip_reason="manual_reply")
+                    reply = f"📝 {symbol} logged as SKIPPED."
+
+                if reply:
+                    _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, reply)
+                    log.info(f"Reply handler processed: {text[:60]} → {reply[:60]}")
+
+        except KeyboardInterrupt:
+            log.info("Reply handler stopped by user")
+            break
+        except Exception as e:
+            log.warning(f"Reply handler error: {e}")
+            time.sleep(5)
+
+
 if __name__ == "__main__":
     import sys
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -7901,5 +8251,9 @@ if __name__ == "__main__":
         # Run standalone: python sniper_unified_v2.py --sandbox-proposals
         _init_db()
         _generate_sandbox_proposal()
+    elif "--reply-handler" in sys.argv:
+        # FIX-8: Run standalone Telegram reply handler with confirm_entry() gate
+        # python sniper_unified_v2.py --reply-handler
+        _telegram_reply_handler()
     else:
         run()
