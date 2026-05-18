@@ -9959,7 +9959,7 @@ def run():
         top_picks = _apply_tier4_to_picks(
             top_picks, macro,
             fii_data=fii_data,
-            earnings_cal=earnings_cal if "earnings_cal" in dir() else None
+            earnings_cal=earn_cal if "earn_cal" in dir() else None
         )
     # ─────────────────────────────────────────────────────────────────────────
 
