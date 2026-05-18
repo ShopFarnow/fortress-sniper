@@ -9736,7 +9736,7 @@ def run():
                 sym = p["symbol"]
                 # ACC-1: Fetch sentiment context for this symbol
                 sentiment = _fetch_market_sentiment(
-                    sym, fii_data, insider_map, filings, earnings_cal
+                    sym, fii_data, insider_map, filings, earn_cal
                 )
                 p["_sentiment"] = sentiment  # store for later save
 
@@ -9833,7 +9833,7 @@ def run():
                 return {}
 
         llm_results = _unified_llm_enrich(
-            top_picks, macro, fii_data, insider_map, filings, earnings_cal
+            top_picks, macro, fii_data, insider_map, filings, earn_cal
         )
 
         # Apply unified LLM output to each pick — ACC-1/OUT-2
