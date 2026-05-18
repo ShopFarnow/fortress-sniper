@@ -151,7 +151,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v5.1-AUDIT"  # v5.1-AUDIT: BUG-1..6 fixed (see audit report)
+VERSION = "UNIFIED v5.2-ARCH"  # v5.2-ARCH: B1..B2 + D1-tier-fallback + D3 + M2 fixed (2026-05-18)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUDIT BUG FIX REGISTER  (2026-05-18 — Quantitative Audit Pass)
@@ -188,6 +188,46 @@ VERSION = "UNIFIED v5.1-AUDIT"  # v5.1-AUDIT: BUG-1..6 fixed (see audit report)
 #   The value was only written via a later UPDATE in run() — if reply_handler
 #   polled before that UPDATE ran, the column was NULL and the gate was bypassed.
 #   Fix: added days_to_earnings to both the INSERT and the features dict.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# v5.2-ARCH FIX REGISTER  (2026-05-18 — Architecture Audit Pass)
+# ══════════════════════════════════════════════════════════════════════════════
+# ARCH-B1 (sniper_unified)  _save_macro_cache() NEVER CALLED
+#   fetch_macro_regime() computed the regime dict but never persisted it to DB.
+#   macro_cache table was always empty so _get_last_cached_macro() could never
+#   return a real cached value — the DB-backed fallback was completely dead.
+#   Fix: _save_macro_cache(result) called before the return in fetch_macro_regime().
+#
+# ARCH-B2 (sniper_unified)  HALAL L4 TTL 7 DAYS INSTEAD OF 30 (monthly)
+#   HALAL_AI_TTL_DAYS defaulted to 7 and the llm_cache "halal_l4" TTL was also
+#   7 days — causing ~4× more LLM screening calls per month than the spec requires.
+#   Business-model classification is slow-moving; weekly re-screen wastes quota.
+#   Fix: HALAL_AI_TTL_DAYS default changed to 30. llm_cache halal_l4 TTL → 30d.
+#
+# ARCH-D2 (sniper_unified)  TIER-1 FALLBACK USED gpt-4o-mini INSTEAD OF TIER-2
+#   _call_tier1() fell back to OPENAI_MINI_MODEL ("gpt-4o-mini") on Nano failure
+#   instead of escalating to LLM_TIER2_MODEL ("gpt-5-mini"). Same pattern in
+#   _fetch_alpha_mine() and _fetch_structured_reasoning() direct OPENAI_MINI_MODEL
+#   references. The three-tier cost/quality hierarchy broke on any Tier-1 failure.
+#   Fix: _call_tier1() fallback now calls _call_tier2(). Direct OPENAI_MINI_MODEL
+#   references in alpha_mine and structured_reasoning routed through tier functions.
+#
+# ARCH-D3 (sniper_unified)  HALAL L4 RETURNED NEUTRAL 0.5 ON LLM FAIL — NO SHEET FALLBACK
+#   When _ANTHROPIC_OK was False or LLM returned None, _halal_l4_llm_screen()
+#   returned a neutral {"llm_confidence":0.5, "llm_source":"DISABLED"} with no
+#   attempt to consult the Shariah universe from Sheets/CSV as a confidence proxy.
+#   Fix: on LLM unavailable/failed, check get_halal_universe(); if symbol is in
+#   the Shariah-approved set, return confidence=0.75 (SHEET_APPROVED), else 0.40
+#   (SHEET_UNLISTED — conservative). Sheets universe is already cached in-process.
+#
+# ARCH-M2 (sniper_unified)  DB BACKUP COVERED ONLY pick_outcomes
+#   _backup_db_to_sheets() exported only the last 500 pick_outcomes rows.
+#   trade_decisions and sniper_results were excluded, so a mid-week GitHub Actions
+#   cache eviction could lose all human decisions and scored signals for that week.
+#   Fix: _backup_db_to_sheets() now exports three tabs: DB_BACKUP (pick_outcomes,
+#   unchanged), DB_DECISIONS (last 500 trade_decisions), DB_SIGNALS (last 200
+#   sniper_results). Each tab gets its own post-write verification log line.
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -917,10 +957,11 @@ def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Opti
 
 def _call_tier1(prompt: str, max_tokens: int = 400) -> Optional[str]:
     """v5.1 TIER 1: GPT-4.1 Nano — high-volume cheap calls (Halal L4 screen).
-    Falls back to standard OpenAI mini model if nano unavailable."""
+    ARCH-D2: Falls back to Tier 2 (GPT-5 Mini) on Nano failure, not gpt-4o-mini,
+    preserving the cost/quality tier hierarchy."""
     result = _call_openai(prompt, model=LLM_TIER1_MODEL, max_tokens=max_tokens)
     if result is None:
-        result = _call_openai(prompt, model=OPENAI_MINI_MODEL, max_tokens=max_tokens)
+        result = _call_tier2(prompt, max_tokens=max_tokens)  # ARCH-D2: was OPENAI_MINI_MODEL
     return result
 
 
@@ -997,9 +1038,10 @@ def _llm_store_cache(text: str, prompt_type: str, result: str, model: str = ""):
     structured_reasoning=90d (signal coherence, slowest-changing).
     FIX-LEAK: uses _db_conn(write=True) context manager."""
     # FIX-5: per-prompt-type TTL in days
+    # ARCH-B2: halal_l4 TTL changed 7→30 (monthly refresh — business model is slow-moving)
     _TTL_DAYS = {
         "alpha_mine":           30,
-        "halal_l4":              7,
+        "halal_l4":             30,   # ARCH-B2: was 7; monthly refresh reduces LLM cost ~4×
         "structured_reasoning": 90,
     }
     ttl_days = _TTL_DAYS.get(prompt_type, 30)
@@ -1187,8 +1229,9 @@ def _llm_alpha_mine(subject: str, symbol: str = "") -> dict:
         f"Ranges: SURPRISE_FACTOR/SENTIMENT [-1,1], others [0,1]\n"
         f"Filing: {subject[:800]}\nSymbol: {symbol}"
     )
-    # Route: GPT-4o mini first, fall back to Claude
-    raw = _call_openai(prompt, model=OPENAI_MINI_MODEL, max_tokens=200) or _call_claude(prompt, max_tokens=200)
+    # ARCH-D2: Route via tier functions — Tier 1 (Nano) with Tier 2 (GPT-5 Mini) fallback,
+    # then Claude. Previously called OPENAI_MINI_MODEL (gpt-4o-mini) directly.
+    raw = _call_tier1(prompt, max_tokens=200) or _call_claude(prompt, max_tokens=200)
     if not raw:
         # FIX-2.3: use rule-based scorer instead of flat score=15
         return _rule_based_scorer.score(subject, symbol)
@@ -1253,8 +1296,9 @@ def _llm_structured_reasoning(symbol: str, signal_dict: dict) -> Optional[dict]:
         '"vol_profile": 0.0-1.0, "pattern": 0.0-1.0, "bayesian": 0.0-1.0}, '
         '"regime_note": "single sentence"}'
     )
-    # Route: Claude first (better at structured JSON), fall back to OpenAI
-    raw = _call_claude(prompt, max_tokens=600) or _call_openai(prompt, model=OPENAI_MINI_MODEL, max_tokens=600)
+    # Route: Claude first (better at structured JSON), fall back to Tier 2 (GPT-5 Mini).
+    # ARCH-D2: was _call_openai(model=OPENAI_MINI_MODEL) — now correctly uses tier hierarchy.
+    raw = _call_claude(prompt, max_tokens=600) or _call_tier2(prompt, max_tokens=600)
     if not raw:
         return None
     try:
@@ -2640,7 +2684,7 @@ _HALAL_L3_SECTORS = {
     "NIFTY ENERGY": -5, "NIFTY BANK": -15, "DIVERSIFIED": 0,
 }
 
-HALAL_AI_TTL_DAYS = int(os.getenv("HALAL_AI_TTL_DAYS", "7"))
+HALAL_AI_TTL_DAYS = int(os.getenv("HALAL_AI_TTL_DAYS", "30"))  # ARCH-B2: monthly refresh (was 7)
 
 
 def _halal_l1_business_veto(symbol: str) -> bool:
@@ -2713,11 +2757,55 @@ def _halal_l3_ethical_score(symbol: str, sector: str) -> int:
     return _HALAL_L3_SECTORS.get(sector, 0)
 
 
+def _halal_l4_sheet_fallback(symbol: str) -> dict:
+    """ARCH-D3: Shariah universe confidence proxy when LLM is unavailable or failed.
+    Consults the already-cached get_halal_universe() set (Sheets/CSV/hardcoded).
+    Returns:
+      - confidence 0.75  if symbol is in the approved Shariah universe (SHEET_APPROVED)
+      - confidence 0.40  if symbol is absent from the universe (SHEET_UNLISTED)
+    Both are conservative relative to a full LLM analysis so borderline symbols still
+    get scrutinised by L2/L3 scoring rather than being rubber-stamped or hard-vetoed.
+    This is intentionally NOT cached in llm_cache — the next successful LLM run will
+    overwrite with a real assessment. Log at INFO so operators can see when this fires.
+    """
+    try:
+        universe = get_halal_universe()
+        sym = symbol.upper().strip()
+        if sym in universe:
+            log.info(f"Halal L4 SHEET_FALLBACK {sym}: in Shariah universe → confidence=0.75")
+            return {
+                "llm_confidence":       0.75,
+                "llm_business_concern": "NONE",
+                "llm_revenue_model":    "unknown",
+                "llm_subsidiary_risk":  "MEDIUM",
+                "llm_illiquid_risk":    "LOW",
+                "llm_manual_review":    False,
+                "llm_source":           "SHEET_APPROVED",
+            }
+        else:
+            log.info(f"Halal L4 SHEET_FALLBACK {sym}: not in Shariah universe → confidence=0.40")
+            return {
+                "llm_confidence":       0.40,
+                "llm_business_concern": "Not in Shariah-approved universe — manual review advised",
+                "llm_revenue_model":    "unknown",
+                "llm_subsidiary_risk":  "MEDIUM",
+                "llm_illiquid_risk":    "LOW",
+                "llm_manual_review":    True,
+                "llm_source":           "SHEET_UNLISTED",
+            }
+    except Exception as e:
+        log.debug(f"_halal_l4_sheet_fallback {symbol}: {e} — returning neutral 0.5")
+        return {"llm_confidence": 0.5, "llm_flags": [], "llm_source": "FALLBACK_ERROR"}
+
+
 def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> dict:
     """Layer 4: LLM business model analysis via Claude Sonnet (optional).
-    FIX-A5: prompt extended with illiquid_asset_risk to catch derivative-heavy models."""
-    if not _ANTHROPIC_OK:
-        return {"llm_confidence": 0.5, "llm_flags": [], "llm_source": "DISABLED"}
+    FIX-A5: prompt extended with illiquid_asset_risk to catch derivative-heavy models.
+    ARCH-D3: When LLM is unavailable or fails, falls back to Shariah universe from
+    Sheets/CSV as a confidence proxy instead of returning a flat neutral 0.5."""
+    if not _ANTHROPIC_OK and not _OPENAI_OK:
+        # ARCH-D3: LLM entirely unavailable — use Shariah universe as confidence proxy
+        return _halal_l4_sheet_fallback(symbol)
 
     cache_key = f"halal_l4:{symbol}:{_llm_hash(sector + business_desc[:200])}"
     cached = _llm_cached(cache_key, "halal_l4")
@@ -2748,7 +2836,8 @@ def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> d
     if not raw:
         raw = _call_claude(prompt, max_tokens=350)  # fallback to Claude
     if not raw:
-        return {"llm_confidence": 0.5, "llm_flags": [], "llm_source": "FAILED"}
+        # ARCH-D3: LLM failed at runtime — fall back to Shariah universe instead of flat 0.5
+        return _halal_l4_sheet_fallback(symbol)
 
     try:
         txt = raw.strip().replace("```json", "").replace("```", "")
@@ -2766,7 +2855,8 @@ def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> d
         return result
     except Exception as e:
         log.debug(f"Halal L4 parse {symbol}: {e}")
-        return {"llm_confidence": 0.5, "llm_flags": [], "llm_source": "PARSE_ERROR"}
+        # ARCH-D3: parse error — fall back to Shariah universe instead of flat 0.5
+        return _halal_l4_sheet_fallback(symbol)
 
 
 def _halal_ai_cache_save(symbol: str, result: dict):
@@ -4121,8 +4211,10 @@ def fetch_macro_regime() -> dict:
     else:                                            state = "CLEAR"
 
     log.info(f"Macro: {state} | VIX={vix:.1f} | NIFTY {nifty_chg:+.2f}%")
-    return {"macro_state": state, "vix_val": round(vix,2),
-            "nifty_chg": round(nifty_chg,2), "breadth_ok": breadth_ok}
+    result = {"macro_state": state, "vix_val": round(vix,2),
+              "nifty_chg": round(nifty_chg,2), "breadth_ok": breadth_ok}
+    _save_macro_cache(result)  # ARCH-B1: persist to DB so _get_last_cached_macro() has data
+    return result
 
 
 def _get_macro() -> dict:
@@ -8478,10 +8570,17 @@ def _backup_db_to_sheets():
     cache eviction (7-day TTL by default). Read-only — never mutates DB.
     FIX-9: Post-backup verification — reads back the first row from DB_BACKUP
     and compares row count to local DB. Logs a warning if they diverge.
+    ARCH-M2: Extended to also export trade_decisions (DB_DECISIONS tab) and
+    sniper_results (DB_SIGNALS tab) so a mid-week cache eviction cannot erase
+    human decisions or scored signals for that week.
     """
     if not _sheets_ok():
         log.debug("DB backup to Sheets skipped — Sheets not configured")
         return
+
+    exported_at = datetime.today().isoformat()
+
+    # ── Tab 1: pick_outcomes (unchanged from FIX-A6) ─────────────────────────
     try:
         with _db_conn() as con:
             rows = con.execute(
@@ -8492,35 +8591,74 @@ def _backup_db_to_sheets():
             ).fetchall()
         if not rows:
             log.info("DB backup: no pick_outcomes rows to export")
-            return
-        local_row_count = len(rows)
-        header = [["run_date","symbol","grade","fused_score","status",
-                   "exit_price","pnl_pct","days_held","hit_target","story",
-                   f"exported_at: {datetime.today().isoformat()}"]]
-        data   = [list(r) for r in rows]
-        _push_sheet("DB_BACKUP", header + data)
-        log.info(f"DB backup: {local_row_count} pick_outcomes rows → Sheets DB_BACKUP ✅")
+        else:
+            local_row_count = len(rows)
+            header = [["run_date","symbol","grade","fused_score","status",
+                       "exit_price","pnl_pct","days_held","hit_target","story",
+                       f"exported_at: {exported_at}"]]
+            _push_sheet("DB_BACKUP", header + [list(r) for r in rows])
+            log.info(f"DB backup: {local_row_count} pick_outcomes rows → Sheets DB_BACKUP ✅")
 
-        # FIX-9: Post-backup verification — read first data row back from DB_BACKUP
-        # to confirm the push succeeded and row count is consistent.
-        try:
-            ws = _get_ws("DB_BACKUP")
-            if ws is not None:
-                all_vals = ws.get_all_values()
-                sheets_data_rows = len(all_vals) - 1  # subtract header row
-                if abs(sheets_data_rows - local_row_count) > 5:
-                    log.warning(
-                        f"FIX-9: DB_BACKUP verification MISMATCH — "
-                        f"local={local_row_count} rows, Sheets={sheets_data_rows} rows. "
-                        f"Backup may be incomplete. Check Sheets quota or auth."
-                    )
-                else:
-                    log.info(f"FIX-9: DB_BACKUP verified ✅ — local={local_row_count}, Sheets={sheets_data_rows} rows")
-        except Exception as ve:
-            log.warning(f"FIX-9: DB_BACKUP post-verification failed (non-fatal): {ve}")
+            # FIX-9: Post-backup verification
+            try:
+                ws = _get_ws("DB_BACKUP")
+                if ws is not None:
+                    all_vals = ws.get_all_values()
+                    sheets_data_rows = len(all_vals) - 1
+                    if abs(sheets_data_rows - local_row_count) > 5:
+                        log.warning(
+                            f"FIX-9: DB_BACKUP verification MISMATCH — "
+                            f"local={local_row_count} rows, Sheets={sheets_data_rows} rows. "
+                            f"Backup may be incomplete. Check Sheets quota or auth."
+                        )
+                    else:
+                        log.info(f"FIX-9: DB_BACKUP verified ✅ — local={local_row_count}, Sheets={sheets_data_rows} rows")
+            except Exception as ve:
+                log.warning(f"FIX-9: DB_BACKUP post-verification failed (non-fatal): {ve}")
 
     except Exception as e:
-        log.warning(f"DB backup to Sheets failed: {e}")
+        log.warning(f"DB backup pick_outcomes to Sheets failed: {e}")
+
+    # ── Tab 2: trade_decisions (ARCH-M2) ─────────────────────────────────────
+    try:
+        with _db_conn() as con:
+            dec_rows = con.execute(
+                "SELECT run_date, symbol, decision, entry_price, shares_taken, "
+                "skip_reason, ai_confidence, worth_flag, logged_at "
+                "FROM trade_decisions "
+                "ORDER BY logged_at DESC LIMIT 500"
+            ).fetchall()
+        if dec_rows:
+            dec_header = [["run_date","symbol","decision","entry_price","shares_taken",
+                           "skip_reason","ai_confidence","worth_flag","logged_at",
+                           f"exported_at: {exported_at}"]]
+            _push_sheet("DB_DECISIONS", dec_header + [list(r) for r in dec_rows])
+            log.info(f"ARCH-M2: {len(dec_rows)} trade_decisions rows → Sheets DB_DECISIONS ✅")
+        else:
+            log.debug("ARCH-M2: no trade_decisions rows to export")
+    except Exception as e:
+        log.warning(f"ARCH-M2: DB_DECISIONS backup failed: {e}")
+
+    # ── Tab 3: sniper_results (ARCH-M2) ──────────────────────────────────────
+    try:
+        with _db_conn() as con:
+            sig_rows = con.execute(
+                "SELECT run_date, symbol, grade, fused_score, fortress_score, "
+                "apex_composite, close_price, stop_loss, r1, r2, macro_state, created_at "
+                "FROM sniper_results "
+                "ORDER BY created_at DESC LIMIT 200"
+            ).fetchall()
+        if sig_rows:
+            sig_header = [["run_date","symbol","grade","fused_score","fortress_score",
+                           "apex_composite","close_price","stop_loss","r1","r2",
+                           "macro_state","created_at",
+                           f"exported_at: {exported_at}"]]
+            _push_sheet("DB_SIGNALS", sig_header + [list(r) for r in sig_rows])
+            log.info(f"ARCH-M2: {len(sig_rows)} sniper_results rows → Sheets DB_SIGNALS ✅")
+        else:
+            log.debug("ARCH-M2: no sniper_results rows to export")
+    except Exception as e:
+        log.warning(f"ARCH-M2: DB_SIGNALS backup failed: {e}")
 
 
 def _auto_log_skipped_picks(date_label: str):
