@@ -5176,7 +5176,7 @@ def _monte_carlo(hist: pd.DataFrame, stop_loss: float, close: float,
     # when multiple workers score simultaneously. Symbol+date hash is unique
     # per (symbol, trading_day) and reproducible for debugging.
     _today_str  = datetime.today().strftime("%Y%m%d")
-    _sym_key    = f"{hist.get("symbol", "") if hasattr(hist, "get") else ""}{_today_str}{len(hist)}"
+    _sym_key = f"{hist.get('symbol', 'unknown') if hasattr(hist, 'get') else 'unknown'}_{datetime.today().strftime('%Y%m%d')}_{len(hist) if hasattr(hist, '__len__') else 0}"
     _det_seed   = (int(hashlib.md5(_sym_key.encode()).hexdigest()[:8], 16)
                    ^ int.from_bytes(os.urandom(2), "little")) % (2**31)
     rng = np.random.default_rng(_det_seed)
