@@ -1058,7 +1058,10 @@ def _call_claude(prompt: str, max_tokens: int = None) -> Optional[str]:
 
 def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Optional[str]:
     """Call OpenAI. Returns text or None.
-    FIX-4.1-M: Per-provider circuit breaker — independent from Claude failures."""
+    FIX-4.1-M: Per-provider circuit breaker — independent from Claude failures.
+    FIX-OPENAI-PARAM: Newer OpenAI models (gpt-4.1-*, gpt-5-*) require
+    'max_completion_tokens' instead of 'max_tokens'. Use the correct param
+    based on model name; both are accepted by legacy models."""
     global _OPENAI_FAIL_COUNT, _OPENAI_CIRCUIT_OPEN
     if not _OPENAI_OK:
         return None
@@ -1066,6 +1069,11 @@ def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Opti
         if _OPENAI_CIRCUIT_OPEN:
             log.debug("OpenAI circuit OPEN — skipping call")
             return None
+    _model = model or OPENAI_MINI_MODEL
+    _tok_val = max_tokens or LLM_MAX_TOKENS
+    # Newer model families require max_completion_tokens; legacy models accept both.
+    _new_model = any(pfx in _model for pfx in ("gpt-4.1", "gpt-5", "o1", "o3", "o4"))
+    _tok_key = "max_completion_tokens" if _new_model else "max_tokens"
     try:
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -1074,8 +1082,8 @@ def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Opti
                 "Content-Type": "application/json",
             },
             json={
-                "model": model or OPENAI_MINI_MODEL,
-                "max_tokens": max_tokens or LLM_MAX_TOKENS,
+                "model": _model,
+                _tok_key: _tok_val,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=30,
@@ -1086,7 +1094,7 @@ def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Opti
             rj = resp.json()
             # CRITICAL-1: record token usage from API response
             _u = rj.get("usage", {})
-            _llm_record_usage("openai", model or OPENAI_MINI_MODEL,
+            _llm_record_usage("openai", _model,
                               _u.get("prompt_tokens", 0), _u.get("completion_tokens", 0),
                               tier="openai")
             return rj["choices"][0]["message"]["content"]
@@ -2715,7 +2723,7 @@ def _fetch_shariah_csv() -> set:
                 log.info(f"Shariah CSV loaded LIVE: {len(syms)} symbols ✅")
                 return syms
         except Exception as e:
-            log.warning(f"Shariah CSV {url}: {e}")    # H1: was debug — now visible in prod
+            log.debug(f"Shariah CSV {url}: {e}")    # Individual URL failures → debug; final error logged below
     # All three URLs failed
     log.error(
         "Shariah CSV: all 3 URLs failed — falling back to hardcoded list. "
@@ -3374,8 +3382,16 @@ def _nse_json(sess: requests.Session, url: str, params: dict = None, timeout: in
                 ValueError,
                 json.JSONDecodeError) as e:
             last_exc = e
-            log.warning(f"NSE attempt {attempt+1}/{NSE_MAX_RETRIES} failed "
-                        f"({type(e).__name__}): {e}")
+            # FIX-NSE-NOISE: When IP is already blocked, every retry will fail
+            # identically. Demote to debug to avoid log spam.
+            with _NSE_FAIL_LOCK:
+                _already_blocked = _NSE_IP_BLOCKED
+            if _already_blocked:
+                log.debug(f"NSE attempt {attempt+1}/{NSE_MAX_RETRIES} failed (IP blocked) "
+                          f"({type(e).__name__}): {e}")
+            else:
+                log.warning(f"NSE attempt {attempt+1}/{NSE_MAX_RETRIES} failed "
+                            f"({type(e).__name__}): {e}")
             # FIX-3: Rebuild session AT MOST ONCE PER RUN (not per call, not per attempt).
             # The old code rebuilt on every JSONDecodeError/ValueError — 30+ rebuilds
             # per run when the IP is blocked (each rebuild = 2 HTTP hits = ~3s).
@@ -4092,7 +4108,13 @@ def fetch_history(symbol: str, days: int = 300,
                     _set_nse_history_ok(True)
                     return _validate_no_lookahead(df)
         except Exception as e:
-            log.warning(f"NSE history {sym}: {e} — falling back to yfinance")
+            # FIX-NSE-NOISE: demote to debug when IP is already known-blocked
+            with _NSE_FAIL_LOCK:
+                _ip_blocked = _NSE_IP_BLOCKED
+            if _ip_blocked:
+                log.debug(f"NSE history {sym}: {e} — falling back to yfinance (IP blocked)")
+            else:
+                log.warning(f"NSE history {sym}: {e} — falling back to yfinance")
             _set_nse_history_ok(False)
 
     # Individual yfinance fallback (only if no cache entry)
@@ -8412,6 +8434,14 @@ def send_telegram_lanes(lane_winners: dict, projections: List[dict],
                 f"R1 ₹{r1:,.0f} | R2 ₹{r2:,.0f} | R3 ₹{r3:,.0f} | Halal: {halal_tier}",
             ])
 
+            # LLM confidence line — show when unified LLM has enriched this winner
+            llm_conf = winner.get("llm_confidence", 0)
+            llm_verdict = winner.get("llm_verdict", "")
+            if llm_conf > 0 and llm_verdict:
+                card_lines.append(f"🤖 LLM {llm_conf}% [{llm_verdict}]"
+                                  + (f" — {winner.get('llm_narrative', '')[:60]}"
+                                     if winner.get("llm_narrative") else ""))
+
             if lane_key == "FORTRESS":
                 layer1_str = "✓" if winner.get("layer1") else "✗"
                 vol_str    = "✓" if winner.get("vol_reliable", True) else "✗"
@@ -8541,11 +8571,14 @@ def send_telegram_v3(picks: list, macro: dict, fii_data: dict,
     if capacity.get("reduce_to_worth_only"):
         display_picks = [p for p in enriched if p["flag"] == "WORTH YOUR TIME"]
         if not display_picks:
-            lines.append("🔒 Capacity guard active — no WORTH YOUR TIME signals today.")
-            lines.append("Existing positions are your priority.")
+            # No high-confidence picks today — inform user clearly instead of falling back
+            open_cnt = capacity.get("open_count", 0)
+            lines.append(f"🔒 Capacity guard active ({open_cnt} open positions).")
+            lines.append("No WORTH YOUR TIME signals today — no new trades recommended.")
+            lines.append("Manage existing positions only. Bismillah 🤲")
             _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "\n".join(lines))
             return
-        lines.append(f"🔒 Showing {len(display_picks)} WORTH YOUR TIME signals only (capacity guard)")
+        lines.append(f"🔒 Showing {len(display_picks)} WORTH YOUR TIME signal(s) only (capacity guard active)")
         lines.append("")
 
     # Build pick cards
