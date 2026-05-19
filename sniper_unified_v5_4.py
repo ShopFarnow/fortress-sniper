@@ -8022,7 +8022,10 @@ def _persist_lane_results(lane_name: str, winner: Optional[dict],
                 winner.get("halal_tier", "ACCEPTABLE"),
             ))
     except Exception as e:
-        log.warning(f"_persist_lane_results {lane_name}/{winner.get('symbol')}: {e}")
+        log.error(
+            f"_persist_lane_results {lane_name}/{winner.get('symbol')}: {e}",
+            exc_info=True,
+        )
 
 
 # =====================================================================================
@@ -11832,16 +11835,36 @@ def run():
     log.info("Pushing PERFORMANCE…"); _push_performance_tab(date_label)
     # AI_INSIGHTS pushed unconditionally — shows story+conviction even without LLM API key
     log.info("Pushing AI_INSIGHTS…"); _push_ai_insights_tab(top_picks, date_label)
-    # v5.4 THREE-LANE: Route to lane-aware sender or legacy single-lane sender
+    # v5.4 THREE-LANE: Route to lane-aware sender or legacy single-lane sender.
+    # FIX-TELEGRAM-ORDER: send AFTER Step 4 (Halal AI Screen + AI Judge) so the
+    # user only sees picks that survived the veto and are actually persisted.
+    # Rebuild lane winners from the post-Step-4 top_picks so vetoed symbols are
+    # silently dropped from the Telegram cards rather than shown then disappearing.
     if THREE_LANE_ENABLED and "_three_lane_results" in dir():
         log.info("Sending Telegram (3-lane cards)…")
+        # Restrict each lane to its winner only if that winner survived Step 4.
+        _surviving_syms = {p["symbol"] for p in top_picks}
+        _final_lane_winners = {
+            lane: (winner if winner and winner["symbol"] in _surviving_syms else None)
+            for lane, winner in _three_lane_winners.items()
+        }
+        _vetoed = [
+            f"{lane.upper()}:{w['symbol']}"
+            for lane, w in _three_lane_winners.items()
+            if w and w["symbol"] not in _surviving_syms
+        ]
+        if _vetoed:
+            log.info(
+                f"FIX-TELEGRAM-ORDER: {len(_vetoed)} lane winner(s) vetoed by Step 4 "
+                f"— excluded from Telegram: {_vetoed}"
+            )
         _lane_projections = []
         try:
             _lane_projections = _run_mc_projection_engine(date_label)
         except Exception as _pe:
             log.warning(f"MC projection engine non-fatal: {_pe}")
         send_telegram_lanes(
-            _three_lane_winners,
+            _final_lane_winners,
             _lane_projections,
             macro, fii_data, date_label, data_source, capacity
         )
