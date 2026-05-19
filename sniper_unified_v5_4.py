@@ -11511,13 +11511,23 @@ def run():
                 '"filing_flag":"POSITIVE","fused_bonus":3,"rank":1}]'
             )
 
-            raw = _call_openai(prompt, model=LLM_TIER2_MODEL, max_tokens=1000) or _call_claude(prompt, max_tokens=1000)
+            raw = _call_openai(prompt, model=LLM_TIER2_MODEL, max_tokens=1000)
+            _provider = "openai"
             if not raw:
+                log.info("_unified_llm_enrich: OpenAI returned nothing — falling back to Claude")
+                raw = _call_claude(prompt, max_tokens=1000)
+                _provider = "claude"
+            if not raw:
+                log.warning("_unified_llm_enrich: both OpenAI and Claude returned nothing")
                 return {}
             try:
                 txt = raw.strip().replace("```json", "").replace("```", "")
                 items = json.loads(txt)
                 if not isinstance(items, list):
+                    log.warning(
+                        f"_unified_llm_enrich ({_provider}): expected JSON list, "
+                        f"got {type(items).__name__} | snippet: {raw[:200]}"
+                    )
                     return {}
                 out = {}
                 for item in items:
@@ -11537,9 +11547,13 @@ def run():
                         "fused_bonus":    max(0, min(8, bonus)),
                         "rank":           int(item.get("rank", 99)),
                     }
+                log.info(f"_unified_llm_enrich ({_provider}): parsed {len(out)} item(s) successfully")
                 return out
             except Exception as parse_err:
-                log.warning(f"Unified LLM parse error: {parse_err} | snippet: {raw[:120]}")
+                log.warning(
+                    f"_unified_llm_enrich ({_provider}) parse failed: {parse_err} "
+                    f"| raw snippet: {raw[:200]}"
+                )
                 return {}
 
         llm_results = _unified_llm_enrich(
