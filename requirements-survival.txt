@@ -1,0 +1,17 @@
+# ══════════════════════════════════════════════════════════════════════
+# UNIFIED HALAL SNIPER v5.4 — requirements-survival.txt
+# OPTIONAL: Survival meta-model (Stage meta-model, v5.4)
+#
+# Install on TOP of requirements.txt once ≥100 closed picks exist:
+#   pip install -r requirements.txt
+#   pip install -r requirements-survival.txt
+#
+# The engine detects presence at runtime and falls back gracefully to
+# the v5.3 binary RandomForest model when this is absent.
+# Set SURVIVAL_MODEL_ENABLED=true (already default) to activate.
+# ══════════════════════════════════════════════════════════════════════
+
+scikit-survival>=0.22.0    # GradientBoostingSurvivalAnalysis (preferred)
+                           # CoxPHSurvivalAnalysis (fallback)
+                           # Requires scikit-learn>=1.4 (in requirements.txt)
+                           # Adds ~180 MB to pip cache; ~45s install overhead
