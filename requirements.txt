@@ -28,5 +28,7 @@ scikit-learn>=1.4.0        # RandomForestClassifier, GradientBoostingClassifier
 
 # ── Google Sheets (bhavcopy fallback) ────────────────────────────────
 gspread>=6.0.0             # Google Sheets client
+
+openpyxl
 google-auth>=2.27.0        # Service account credentials
 google-auth-oauthlib>=1.2.0
