@@ -3074,26 +3074,45 @@ def halal_ai_screen(symbol: str, sector: str = "DIVERSIFIED",
     """
     sym = symbol.upper().strip()
 
-    # ── Check 7-day DB cache ─────────────────────────────────────────────────
+    # ── Check DB cache ────────────────────────────────────────────────────────
+    # FIX-ISSUE-1: Do NOT serve a blind CACHED_VETO for symbols in the
+    # renewable/known-halal whitelist — the cache may have been pre-populated
+    # by _prepopulate_halal_l1_cache() (L1_PREPOP source) or by a previous run
+    # with stricter/different logic.  For these symbols we only accept a cached
+    # result when it is NOT a veto (i.e. the symbol already passed previously),
+    # or when the cache source is a real evaluation (not L1_PREPOP).
+    # For all other symbols a cached veto is still served as-is (performance).
+    _is_renewable = sym in _RENEWABLE_SYMBOLS
     try:
         with _db_conn() as con:
             row = con.execute(
                 "SELECT score, veto, tier, debt_to_mcap, business_model, "
-                "ethical_score, llm_confidence, assessed_date "
+                "ethical_score, llm_confidence, assessed_date, source "
                 "FROM halal_ai_cache WHERE symbol=?",
                 (sym,)
             ).fetchone()
         if row:
             age = (datetime.today().date() -
                    datetime.strptime(row[7][:10], "%Y-%m-%d").date()).days
+            cached_veto   = bool(row[1])
+            cached_source = str(row[8] or "")
             if age <= HALAL_AI_TTL_DAYS:
-                return {
-                    "score": row[0], "veto": bool(row[1]), "tier": row[2],
-                    "debt_to_mcap": row[3], "business_model": row[4],
-                    "ethical_score": row[5], "llm_confidence": row[6],
-                    "veto_reason": "" if not row[1] else "CACHED_VETO",
-                    "source": "CACHE",
-                }
+                # Renewable/whitelisted symbols: skip cache when it is a veto
+                # sourced from the L1 pre-population sweep (may be stale/wrong).
+                if _is_renewable and cached_veto and cached_source in ("L1_PREPOP", "L1", "CACHE"):
+                    log.debug(
+                        f"halal_ai_screen: {sym} — skipping stale {cached_source} "
+                        f"cache veto; will re-evaluate (renewable symbol)"
+                    )
+                    # fall through to full re-evaluation below
+                else:
+                    return {
+                        "score": row[0], "veto": cached_veto, "tier": row[2],
+                        "debt_to_mcap": row[3], "business_model": row[4],
+                        "ethical_score": row[5], "llm_confidence": row[6],
+                        "veto_reason": "" if not cached_veto else "CACHED_VETO",
+                        "source": "CACHE",
+                    }
     except Exception:
         pass
 
@@ -3136,6 +3155,19 @@ def halal_ai_screen(symbol: str, sector: str = "DIVERSIFIED",
     llm = _halal_l4_llm_screen(sym, sector, business_desc)
     llm_conf  = llm.get("llm_confidence", 0.5)
     llm_model = llm.get("llm_revenue_model", "unknown")
+
+    # FIX-ISSUE-2: Renewable / government PSU symbols that are widely accepted as
+    # Shariah-compliant (NHPC, NTPC, SUZLON, SJVN, …) get a confidence floor of
+    # 0.70 so a stingy/uncertain LLM response cannot falsely veto them.
+    # The LLM often returns low confidence when no business_desc is supplied — that
+    # uncertainty should not override well-established Shariah consensus for these.
+    _L4_RENEWABLE_CONFIDENCE_FLOOR = 0.70
+    if _is_renewable and llm_conf < _L4_RENEWABLE_CONFIDENCE_FLOOR:
+        log.info(
+            f"L4 confidence floor applied for {sym} (renewable): "
+            f"{llm_conf:.0%} → {_L4_RENEWABLE_CONFIDENCE_FLOOR:.0%}"
+        )
+        llm_conf = _L4_RENEWABLE_CONFIDENCE_FLOOR
 
     if _ANTHROPIC_OK:
         llm_delta = int((llm_conf - 0.5) * 20)
@@ -6231,6 +6263,13 @@ def _prepopulate_halal_l1_cache() -> None:
             for sym in set(syms_to_check):
                 if not _halal_l1_business_veto(sym):
                     continue  # only pre-populate definite L1 vetoes
+                # FIX-ISSUE-1 (prepop guard): never write a veto for a symbol that
+                # is in the renewable/halal whitelist — their name may match a generic
+                # L1 keyword (e.g. "POWER" in GENUSPOWER) yet they are Shariah-accepted.
+                # halal_ai_screen() will skip cached L1_PREPOP vetoes for these anyway,
+                # but avoiding the write prevents confusion in the DB.
+                if sym.upper() in _RENEWABLE_SYMBOLS:
+                    continue
                 try:
                     con.execute("""
                         INSERT OR IGNORE INTO halal_ai_cache
@@ -7899,8 +7938,20 @@ def _run_halal_l4_dedup(unique_symbols: List[str], sector_map: dict) -> dict:
             log.debug(f"Halal L4 {sym}: {e}")
             results[sym] = {"veto": False, "tier": "ACCEPTABLE", "score": 50,
                             "source": "ERROR"}
-    log.info(f"L4 dedup screen: {len(unique_symbols)} unique | "
-             f"vetoed={sum(1 for r in results.values() if r.get('veto'))}")
+    passed  = [s for s, r in results.items() if not r.get("veto")]
+    vetoed  = [s for s, r in results.items() if r.get("veto")]
+    log.info(
+        f"L4 dedup screen: {len(unique_symbols)} unique | "
+        f"vetoed={len(vetoed)} | passed={len(passed)}"
+    )
+    # FIX-ISSUE-5: always log which symbols passed / failed so no winner is "invisible"
+    for s in passed:
+        r = results[s]
+        log.info(f"  L4 PASS  {s}: tier={r.get('tier','?')} score={r.get('score','?')} "
+                 f"conf={r.get('llm_confidence','?'):.0%} source={r.get('source','?')}")
+    for s in vetoed:
+        r = results[s]
+        log.info(f"  L4 VETO  {s}: {r.get('veto_reason','?')} source={r.get('source','?')}")
     return results
 
 
@@ -7916,13 +7967,17 @@ def _select_lane_winner(lane_results: List[dict], halal_map: dict,
         sym = r["symbol"]
         score = r.get(min_score_key, 0.0)
         if score < min_score:
+            # FIX-ISSUE-5: log score-gate rejections at INFO so they appear in logs
+            log.info(f"LANE {lane_name}: {sym} below score gate "
+                     f"({min_score_key}={score:.1f} < {min_score})")
             continue
         halal = halal_map.get(sym, {})
         if halal.get("veto", False):
-            log.debug(f"LANE {lane_name}: {sym} vetoed by L4 halal")
+            log.info(f"LANE {lane_name}: {sym} vetoed by L4 halal — "
+                     f"{halal.get('veto_reason','?')}")
             continue
         if LANE_REQUIRE_HALAL_PURE and halal.get("tier", "ACCEPTABLE") not in ("PURE", "ACCEPTABLE"):
-            log.debug(f"LANE {lane_name}: {sym} halal tier {halal.get('tier')} -- skipped")
+            log.info(f"LANE {lane_name}: {sym} halal tier {halal.get('tier')} -- skipped")
             continue
         # Attach halal + alpha-mine data to winner
         r["halal_tier"] = halal.get("tier", "ACCEPTABLE")
@@ -11393,9 +11448,41 @@ def run():
         take_micro = min(len(micro_picks), remaining)
         allocation.extend(micro_picks[:take_micro])
 
-    top_picks = allocation
-    seen = set()
-    top_picks = [r for r in top_picks if r["symbol"] not in seen and not seen.add(r["symbol"])]
+    # FIX-ISSUE-3/4: When THREE_LANE_ENABLED the canonical final candidates are the
+    # three-lane winners (Fortress / APEX / Fused), NOT the legacy results list.
+    # Previously both pipelines ran in parallel and the three-lane output was only
+    # used for Telegram; the legacy allocation always won the final output slot.
+    # Fix: if three-lane produced at least one winner, build top_picks from those
+    # winners instead of the bucket-allocation list.  The legacy allocation is kept
+    # as a fallback in case the three-lane block failed entirely.
+    if THREE_LANE_ENABLED and any(_three_lane_winners.get(k) for k in ("fortress", "apex", "fused")):
+        _tl_candidates = [
+            w for w in (
+                _three_lane_winners.get("fortress"),
+                _three_lane_winners.get("apex"),
+                _three_lane_winners.get("fused"),
+            )
+            if w is not None
+        ]
+        # Deduplicate while preserving lane priority order (fortress > apex > fused)
+        _seen_tl: set = set()
+        top_picks = [
+            w for w in _tl_candidates
+            if w["symbol"] not in _seen_tl and not _seen_tl.add(w["symbol"])
+        ]
+        log.info(
+            f"FIX-ISSUE-3: THREE_LANE_ENABLED — using lane winners as top_picks "
+            f"({[r['symbol'] for r in top_picks]}); legacy allocation ignored."
+        )
+    else:
+        top_picks = allocation
+        seen = set()
+        top_picks = [r for r in top_picks if r["symbol"] not in seen and not seen.add(r["symbol"])]
+        if THREE_LANE_ENABLED:
+            log.warning(
+                "FIX-ISSUE-3: THREE_LANE_ENABLED but no lane winners produced — "
+                "falling back to legacy allocation list."
+            )
 
     # ── v3.0-M: Attach meta_prob, regime-scaled confidence, setup profile ──
     meta_model_live = _load_meta_model()
