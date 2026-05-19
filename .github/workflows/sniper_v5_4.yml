@@ -24,7 +24,7 @@ env:
   SUPPRESS_HEALTH_ALERTS: "1"
   FORCE_YFINANCE:         "false"
   REPLY_TIMEOUT_MINUTES:  "30"
-  APEX_MIN_SCORE:         "48"
+  APEX_MIN_SCORE:         "40"
   APEX_TOP_N:             "5"
   CAPACITY_MAX_OPEN:      "4"
   CAPACITY_MAX_WEEK:      "6"
