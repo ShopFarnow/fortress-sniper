@@ -563,10 +563,11 @@ def process_updates() -> None:
 
         # ── TAKEN ALL / TAKE ALL — mark every today's pick as TAKEN ─────────────
         if _TAKEN_ALL.match(text):
+            log.info(f"TAKEN ALL matched for text: '{raw_text}'")
             try:
                 with _db_conn() as con:
                     rows = con.execute(
-                        "SELECT symbol, close FROM sniper_results WHERE run_date = date('now','localtime')"
+                        "SELECT symbol, close FROM sniper_results WHERE run_date = date('now')"
                     ).fetchall()
                 if not rows:
                     _send_ack(chat_id, "⚠️ No picks found for today. Nothing to mark as TAKEN.")
