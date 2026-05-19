@@ -53,6 +53,7 @@ _HELP    = re.compile(r"^(HELP|\?)$", re.I)
 
 _CONFIRM = re.compile(r"^/confirm\s+#?(\d+)$", re.I)
 _SKIP_N  = re.compile(r"^/skip\s+#?(\d+)$", re.I)
+_STATUS  = re.compile(r"^/status$", re.I)   # FIX-v5.4: real-time system health query
 
 _SKIP_RE    = re.compile(r"^SKIP(?:PED)?\s+([A-Z&\-]+)$", re.I)
 _SKIP_ALL_RE = re.compile(r"^SKIP(?:PED)?\s+ALL$", re.I)
@@ -63,7 +64,7 @@ _MAX_PRICE  = 1_000_000
 _MAX_SHARES = 100_000
 
 _HELP_TEXT = (
-    "📖 <b>SNIPER v5.0 reply commands:</b>\n"
+    "📖 <b>SNIPER v5.4 reply commands:</b>\n"
     "  <code>/confirm #1</code>                      — take today's pick #1\n"
     "  <code>/confirm #2</code>                      — take today's pick #2\n"
     "  <code>/skip #1</code>                         — skip today's pick #1\n"
@@ -72,6 +73,7 @@ _HELP_TEXT = (
     "  <code>PARTIAL SYM [@price] [shares]</code>    — log partial entry (shares default 50)\n"
     "  <code>SKIP SYM</code>                          — skip a specific symbol\n"
     "  <code>SKIP ALL</code>                          — skip ALL today's picks\n"
+    "  <code>/status</code>                          — system health &amp; open positions\n"
     "  <code>HELP</code> or <code>?</code>           — this message\n\n"
     "ℹ️ No reply = SKIPPED (auto-logged after 30 min or at EOD).\n"
     "Only reply if you TOOK or PARTIALLY took a position."
@@ -154,53 +156,70 @@ def _save_offset(offset: int) -> None:
     except Exception as e:
         log.warning(f"Failed to save offset: {e}")
 
-# ── /confirm and /skip by rank ───────────────────────────────────────────────
+# ── /confirm and /skip by rank (now checks both tables) ──────────────────────
 def _get_pick_by_rank(con: sqlite3.Connection, rank: int) -> Optional[dict]:
     if rank < 1:
         log.debug(f"_get_pick_by_rank: invalid rank={rank} (must be ≥ 1)")
         return None
-    # Use the latest run_date (not date('now')) – robust to timezone/holidays
-    latest_run = con.execute("SELECT MAX(run_date) FROM sniper_results").fetchone()[0]
+
+    # Get latest run_date from either table
+    latest_run = con.execute("""
+        SELECT MAX(run_date) FROM (
+            SELECT run_date FROM sniper_results
+            UNION
+            SELECT run_date FROM sniper_results_v54
+        )
+    """).fetchone()[0]
     if not latest_run:
         return None
-    try:
+
+    # Try sniper_results (fused picks)
+    rows = con.execute("""
+        SELECT symbol, grade, close, stop_loss, r1, fused_score
+        FROM sniper_results
+        WHERE run_date = ?
+        ORDER BY fused_score DESC
+        LIMIT ?
+    """, (latest_run, rank)).fetchall()
+    if len(rows) < rank:
+        # Fallback to sniper_results_v54 (lane winners)
         rows = con.execute("""
             SELECT symbol, grade, close, stop_loss, r1, fused_score
-            FROM sniper_results
+            FROM sniper_results_v54
             WHERE run_date = ?
             ORDER BY fused_score DESC
             LIMIT ?
         """, (latest_run, rank)).fetchall()
-        if len(rows) < rank:
-            return None
-        row = rows[rank - 1]
-        return {
-            "symbol":     row[0],
-            "grade":      row[1],
-            "close":      row[2],
-            "stop_loss":  row[3],
-            "r1":         row[4],
-            "fused":      row[5],
-        }
-    except Exception as e:
-        log.debug(f"_get_pick_by_rank({rank}): {e}")
+    if len(rows) < rank:
         return None
+    row = rows[rank - 1]
+    return {
+        "symbol":     row[0],
+        "grade":      row[1],
+        "close":      row[2],
+        "stop_loss":  row[3],
+        "r1":         row[4],
+        "fused":      row[5],
+    }
 
-# ── Auto‑expire picks with no reply after timeout ─────────────────────────────
+# ── Auto‑expire picks with no reply after timeout (checks both tables) ───────
 def _auto_expire_timeout_picks() -> None:
     today = datetime.today().strftime("%Y-%m-%d")
     cutoff = (datetime.today() - timedelta(minutes=REPLY_TIMEOUT_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
     try:
         with _db_conn() as con:
-            pending = con.execute("""
-                SELECT sr.symbol
-                FROM sniper_results sr
-                LEFT JOIN trade_decisions td
-                  ON sr.symbol = td.symbol AND sr.run_date = td.run_date
-                WHERE sr.run_date = ?
-                  AND td.symbol IS NULL
-                  AND sr.created_at <= ?
-            """, (today, cutoff)).fetchall()
+            # Combine picks from both tables
+            pending = con.execute(f"""
+                SELECT symbol FROM (
+                    SELECT symbol, created_at FROM sniper_results WHERE run_date = ?
+                    UNION ALL
+                    SELECT symbol, created_at FROM sniper_results_v54 WHERE run_date = ?
+                ) AS all_picks
+                WHERE symbol NOT IN (
+                    SELECT symbol FROM trade_decisions WHERE run_date = ?
+                )
+                AND created_at <= ?
+            """, (today, today, today, cutoff)).fetchall()
             for (sym,) in pending:
                 try:
                     con.execute("""
@@ -262,46 +281,63 @@ def _send_ack(chat_id: str, text: str) -> None:
     except Exception as e:
         log.warning(f"_send_ack failed: {e}")
 
-# ── DB helper: get signal for a symbol (uses latest run_date) ──────────────
+# ── DB helper: get signal for a symbol (checks both tables) ─────────────────
 def _get_todays_signal(con: sqlite3.Connection, symbol: str) -> dict:
-    latest_run = con.execute("SELECT MAX(run_date) FROM sniper_results").fetchone()[0]
+    # Get latest run_date from either table
+    latest_run = con.execute("""
+        SELECT MAX(run_date) FROM (
+            SELECT run_date FROM sniper_results
+            UNION
+            SELECT run_date FROM sniper_results_v54
+        )
+    """).fetchone()[0]
     if not latest_run:
         return {}
-    try:
+
+    # Try sniper_results first (fused picks)
+    row = con.execute(
+        "SELECT close, fused_score, grade FROM sniper_results WHERE symbol=? AND run_date=?",
+        (symbol.upper(), latest_run)
+    ).fetchone()
+    if not row:
+        # Try sniper_results_v54 (lane winners)
         row = con.execute(
-            "SELECT close, fused_score, grade FROM sniper_results WHERE symbol=? AND run_date=?",
+            "SELECT close, fused_score, grade FROM sniper_results_v54 WHERE symbol=? AND run_date=?",
             (symbol.upper(), latest_run)
         ).fetchone()
-        meta_prob = None
-        try:
-            meta_row = con.execute(
-                "SELECT meta_prob FROM meta_features WHERE symbol=? AND run_date=?",
-                (symbol.upper(), latest_run)
-            ).fetchone()
-            if meta_row:
-                meta_prob = meta_row[0]
-        except sqlite3.OperationalError:
-            pass
-        cal = None
-        try:
-            cal = con.execute(
-                "SELECT calibrated_confidence, position_size_tier, halal_tier FROM judged_picks WHERE symbol=? AND run_date=?",
-                (symbol.upper(), latest_run)
-            ).fetchone()
-        except Exception:
-            pass
-        return {
-            "close":                 row[0] if row else None,
-            "fused":                 row[1] if row else None,
-            "grade":                 row[2] if row else None,
-            "meta_prob":             meta_prob,
-            "calibrated_confidence": cal[0] if cal else None,
-            "position_size_tier":    cal[1] if cal else None,
-            "halal_tier":            cal[2] if cal else None,
-        }
-    except Exception as e:
-        log.warning(f"Signal lookup {symbol}: {e}")
+    if not row:
         return {}
+
+    # Safe meta_prob retrieval
+    meta_prob = None
+    try:
+        meta_row = con.execute(
+            "SELECT meta_prob FROM meta_features WHERE symbol=? AND run_date=?",
+            (symbol.upper(), latest_run)
+        ).fetchone()
+        if meta_row:
+            meta_prob = meta_row[0]
+    except sqlite3.OperationalError:
+        pass
+
+    cal = None
+    try:
+        cal = con.execute(
+            "SELECT calibrated_confidence, position_size_tier, halal_tier FROM judged_picks WHERE symbol=? AND run_date=?",
+            (symbol.upper(), latest_run)
+        ).fetchone()
+    except Exception:
+        pass
+
+    return {
+        "close":                 row[0],
+        "fused":                 row[1],
+        "grade":                 row[2],
+        "meta_prob":             meta_prob,
+        "calibrated_confidence": cal[0] if cal else None,
+        "position_size_tier":    cal[1] if cal else None,
+        "halal_tier":            cal[2] if cal else None,
+    }
 
 def _log_decision(con: sqlite3.Connection, symbol: str, decision: str,
                   entry_price: Optional[float] = None,
@@ -365,6 +401,75 @@ def process_updates() -> None:
             _send_ack(chat_id, _HELP_TEXT)
             continue
 
+        # --- /status — FIX-v5.4: real-time system health ----------------
+        if _STATUS.match(raw_text):
+            try:
+                with _db_conn() as con:
+                    open_pos = con.execute(
+                        "SELECT COUNT(*) FROM pick_outcomes WHERE status='open'"
+                    ).fetchone()[0]
+                    today_picks = con.execute(
+                        "SELECT COUNT(*) FROM sniper_results WHERE run_date=date('now')"
+                    ).fetchone()[0] + con.execute(
+                        "SELECT COUNT(*) FROM sniper_results_v54 WHERE run_date=date('now')"
+                    ).fetchone()[0]
+                    total_decisions = con.execute(
+                        "SELECT COUNT(*) FROM trade_decisions"
+                    ).fetchone()[0]
+                    total_closed = con.execute(
+                        "SELECT COUNT(*) FROM pick_outcomes WHERE status!='open'"
+                    ).fetchone()[0]
+                    wins = con.execute(
+                        "SELECT COUNT(*) FROM pick_outcomes WHERE status IN ('r1_hit','r2_hit','r3_hit')"
+                    ).fetchone()[0]
+                    last_run = con.execute("""
+                        SELECT MAX(run_date) FROM (
+                            SELECT run_date FROM sniper_results
+                            UNION
+                            SELECT run_date FROM sniper_results_v54
+                        )
+                    """).fetchone()[0] or "never"
+                    meta_trained = con.execute(
+                        "SELECT COUNT(*) FROM meta_features WHERE profitable IS NOT NULL"
+                    ).fetchone()[0]
+                    surv_rows = con.execute(
+                        "SELECT COUNT(*) FROM survival_training"
+                    ).fetchone()[0]
+
+                wr_str = (
+                    f"{wins}/{total_closed} ({wins*100//total_closed}% WR)"
+                    if total_closed > 0 else "no closed trades yet"
+                )
+                model_status = (
+                    f"trained ({meta_trained} labelled samples)"
+                    if meta_trained >= 20 else f"cold-start ({meta_trained}/20 samples)"
+                )
+                survival_status = (
+                    f"active ({surv_rows} rows)"
+                    if surv_rows >= 100 else f"dormant ({surv_rows}/100 rows)"
+                )
+
+                msg = (
+                    f"📊 <b>System Status — SNIPER v5.4</b>\n"
+                    f"🕐 <b>Last run:</b> {last_run}\n\n"
+                    f"<b>Positions</b>\n"
+                    f"  Open: <b>{open_pos}</b>\n"
+                    f"  Today's picks: <b>{today_picks}</b>\n"
+                    f"  Total decisions logged: <b>{total_decisions}</b>\n\n"
+                    f"<b>Performance</b>\n"
+                    f"  Closed trades: {wr_str}\n\n"
+                    f"<b>ML Models</b>\n"
+                    f"  Meta-labeler: {model_status}\n"
+                    f"  Survival model: {survival_status}\n\n"
+                    f"<i>Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC</i>"
+                )
+                _send_ack(chat_id, msg)
+                log.info("/status replied successfully")
+            except Exception as e:
+                log.error(f"/status DB error: {e}")
+                _send_ack(chat_id, "⚠️ Could not fetch status — DB error. Please retry.")
+            continue
+
         # --- SKIPPED redirect ---
         if _SKIPPED.match(text):
             _send_ack(chat_id, _SKIPPED_REDIRECT)
@@ -423,20 +528,30 @@ def process_updates() -> None:
             log.info(f"TAKEN ALL matched for text: '{raw_text}'")
             try:
                 with _db_conn() as con:
+                    # Check if either table exists
                     table_check = con.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='sniper_results'"
-                    ).fetchone()
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('sniper_results','sniper_results_v54')"
+                    ).fetchall()
                     if not table_check:
                         _send_ack(chat_id, "⚠️ No picks available yet – main sniper run hasn't completed.\nPlease wait a few minutes and try again.")
                         continue
-                    latest_run = con.execute("SELECT MAX(run_date) FROM sniper_results").fetchone()[0]
+                    # Get latest run_date from either table
+                    latest_run = con.execute("""
+                        SELECT MAX(run_date) FROM (
+                            SELECT run_date FROM sniper_results
+                            UNION
+                            SELECT run_date FROM sniper_results_v54
+                        )
+                    """).fetchone()[0]
                     if not latest_run:
                         _send_ack(chat_id, "⚠️ No picks found for today. Nothing to mark as TAKEN.")
                         continue
-                    rows = con.execute(
-                        "SELECT symbol, close FROM sniper_results WHERE run_date = ?",
-                        (latest_run,)
-                    ).fetchall()
+                    # Fetch from both tables, deduplicate by symbol
+                    rows = con.execute("""
+                        SELECT symbol, close FROM sniper_results WHERE run_date = ?
+                        UNION
+                        SELECT symbol, close FROM sniper_results_v54 WHERE run_date = ?
+                    """, (latest_run, latest_run)).fetchall()
                 if not rows:
                     _send_ack(chat_id, "⚠️ No picks found for today. Nothing to mark as TAKEN.")
                     continue
@@ -470,19 +585,26 @@ def process_updates() -> None:
             try:
                 with _db_conn() as con:
                     table_check = con.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='sniper_results'"
-                    ).fetchone()
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('sniper_results','sniper_results_v54')"
+                    ).fetchall()
                     if not table_check:
                         _send_ack(chat_id, "⚠️ No picks available yet – main sniper run hasn't completed.\nPlease wait a few minutes and try again.")
                         continue
-                    latest_run = con.execute("SELECT MAX(run_date) FROM sniper_results").fetchone()[0]
+                    latest_run = con.execute("""
+                        SELECT MAX(run_date) FROM (
+                            SELECT run_date FROM sniper_results
+                            UNION
+                            SELECT run_date FROM sniper_results_v54
+                        )
+                    """).fetchone()[0]
                     if not latest_run:
                         _send_ack(chat_id, "⚠️ No picks found for today. Nothing to skip.")
                         continue
-                    rows = con.execute(
-                        "SELECT symbol FROM sniper_results WHERE run_date = ?",
-                        (latest_run,)
-                    ).fetchall()
+                    rows = con.execute("""
+                        SELECT symbol FROM sniper_results WHERE run_date = ?
+                        UNION
+                        SELECT symbol FROM sniper_results_v54 WHERE run_date = ?
+                    """, (latest_run, latest_run)).fetchall()
                 if not rows:
                     _send_ack(chat_id, "⚠️ No picks found for today. Nothing to skip.")
                     continue
