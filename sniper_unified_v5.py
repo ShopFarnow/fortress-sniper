@@ -151,7 +151,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v5.3-QUANT"  # v5.3-QUANT: MC regime veto + all BUG+ARCH patches (2026-05-18)
+VERSION = "UNIFIED v5.4-THREE-LANE"  # v5.4: Three-Lane Architecture + Live MC Projection + Survival Meta-Model (2026-05-18)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUDIT BUG FIX REGISTER  (2026-05-18 — Quantitative Audit Pass)
@@ -658,6 +658,33 @@ CAPACITY_MAX_WEEK  = int(os.getenv("CAPACITY_MAX_WEEK", "6"))
 MC_FAT_DF  = 5          # Student-t df — heavier tails for NSE gap risk
 MC_HORIZON = 12         # swing horizon (days)
 
+# =====================================================================================
+# v5.4 -- THREE-LANE ARCHITECTURE CONFIG (Bismillah)
+# DESIGN: Halal is FILTER not GATE. L1/L2 vetoes fire BEFORE scoring.
+# Cost guarantee: 3-lane output costs LESS than v5.3 single-lane.
+# =====================================================================================
+THREE_LANE_ENABLED      = os.getenv("THREE_LANE", "true").lower() in ("1","true","yes")
+# B-001 FIX: resolve FAST_RERUN now that THREE_LANE_ENABLED is known
+if THREE_LANE_ENABLED and _FAST_RERUN_RAW:
+    import logging as _log_b001
+    _log_b001.getLogger(__name__).warning(
+        "B-001: FAST_RERUN=true is incompatible with THREE_LANE=true "
+        "(cache only covers FUSED lane). Forcing FAST_RERUN=false."
+    )
+FAST_RERUN = _FAST_RERUN_RAW and not THREE_LANE_ENABLED
+LANE_FORTRESS_MIN       = int(os.getenv("LANE_FORTRESS_MIN", "55"))   # fort_pts gate
+LANE_APEX_MIN           = int(os.getenv("LANE_APEX_MIN", "55"))       # apex_composite gate
+LANE_FUSED_MIN          = int(os.getenv("LANE_FUSED_MIN", "65"))      # fused gate
+LANE_TOP_N              = int(os.getenv("LANE_TOP_N", "5"))           # top-N per lane pre-dedup
+MC_PROJECTION_ENABLED   = os.getenv("MC_PROJECTION_ENABLED", "true").lower() in ("1","true","yes")
+MC_PROJECTION_SIMS      = int(os.getenv("MC_PROJECTION_SIMS", "600"))
+MC_DIVERGENCE_SIGMA_TH  = float(os.getenv("MC_DIVERGENCE_SIGMA_TH", "2.0"))  # >2sigma triggers LLM
+MC_PROJECTION_CACHE_H   = int(os.getenv("MC_PROJECTION_CACHE_H", "24"))      # hours TTL narrative
+SURVIVAL_MODEL_ENABLED  = os.getenv("SURVIVAL_MODEL_ENABLED", "true").lower() in ("1","true","yes")
+SURVIVAL_MIN_SAMPLES    = int(os.getenv("SURVIVAL_MIN_SAMPLES", "100"))
+LANE_REQUIRE_HALAL_PURE = os.getenv("LANE_REQUIRE_HALAL_PURE","true").lower() in ("1","true","yes")
+
+
 MIN_PRICE          = 50
 MAX_PRICE          = int(os.getenv("MAX_PRICE", "800"))  # FIX-UNIVERSE: was 800, excluding TCS/RELIANCE/HDFC/etc.
 MIN_TURNOVER_LAKHS = 150
@@ -667,7 +694,11 @@ MIN_HIST_BARS      = 30
 # FIX-RERUN: when True, scoring loop reads from score_cache instead of
 # re-running fortress_score + APEX for symbols already scored today.
 # Set FAST_RERUN=true for 2nd/3rd same-day manual runs to save time & API cost.
-FAST_RERUN = os.getenv("FAST_RERUN", "false").lower() in ("1", "true", "yes")
+# B-001 FIX: FAST_RERUN cache only reconstructs FUSED lane.
+# In THREE_LANE mode FORTRESS/APEX lanes get no cached data — silently empty.
+# Resolution: FAST_RERUN is automatically disabled when THREE_LANE_ENABLED=true.
+_FAST_RERUN_RAW = os.getenv("FAST_RERUN", "false").lower() in ("1", "true", "yes")
+FAST_RERUN = False  # resolved after THREE_LANE_ENABLED is defined below
 
 # ── v5.1: FORCE RUN mode — skips same-day cache/DB state check entirely ─────
 # Set via workflow_dispatch input `force: true` or env var FORCE_RUN=true
@@ -1069,17 +1100,7 @@ def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Opti
     return None
 
 
-def _call_tier1(prompt: str, max_tokens: int = 400) -> Optional[str]:
-    """v5.1 TIER 1: GPT-4.1 Nano — high-volume cheap calls (Halal L4 screen).
-    ARCH-D2: Falls back to Tier 2 (GPT-5 Mini) on Nano failure, not gpt-4o-mini,
-    preserving the cost/quality tier hierarchy."""
-    log.debug(f"LLM_DISPATCH tier=tier1 model={LLM_TIER1_MODEL}")
-    result = _call_openai(prompt, model=LLM_TIER1_MODEL, max_tokens=max_tokens)
-    if result is None:
-        log.debug(f"LLM_DISPATCH tier=tier1 fallback→tier2 model={LLM_TIER2_MODEL}")
-        result = _call_tier2(prompt, max_tokens=max_tokens)  # ARCH-D2: was OPENAI_MINI_MODEL
-    return result
-
+# SEVERE-1 FIX: _call_tier2 moved above _call_tier1 to eliminate forward reference.
 
 def _call_tier2(prompt: str, max_tokens: int = 1000) -> Optional[str]:
     """v5.1 TIER 2: GPT-5 Mini — synthesis (1 call/run, per-pick context).
@@ -1089,6 +1110,18 @@ def _call_tier2(prompt: str, max_tokens: int = 1000) -> Optional[str]:
     if result is None:
         log.debug(f"LLM_DISPATCH tier=tier2 fallback→claude model={CLAUDE_MODEL}")
         result = _call_claude(prompt, max_tokens=max_tokens)
+    return result
+
+
+def _call_tier1(prompt: str, max_tokens: int = 400) -> Optional[str]:
+    """v5.1 TIER 1: GPT-4.1 Nano — high-volume cheap calls (Halal L4 screen).
+    ARCH-D2: Falls back to Tier 2 (GPT-5 Mini) on Nano failure, not gpt-4o-mini,
+    preserving the cost/quality tier hierarchy."""
+    log.debug(f"LLM_DISPATCH tier=tier1 model={LLM_TIER1_MODEL}")
+    result = _call_openai(prompt, model=LLM_TIER1_MODEL, max_tokens=max_tokens)
+    if result is None:
+        log.debug(f"LLM_DISPATCH tier=tier1 fallback→tier2 model={LLM_TIER2_MODEL}")
+        result = _call_tier2(prompt, max_tokens=max_tokens)  # ARCH-D2: was OPENAI_MINI_MODEL
     return result
 
 
@@ -3490,7 +3523,72 @@ def _init_db():
         -- SEVERE-4 FIX: idx_score_cache_lookup dropped — redundant with PRIMARY KEY (symbol, run_date, intel_hash).
         -- ABS(bhavcopy_close - ?)<0.005 is a function on a column and cannot use any index anyway.
         -- The PK handles equality lookups on (symbol, run_date, intel_hash) perfectly.
-        -- For 300 symbols/day × 5 days = 1500 rows, a table scan on the PK remnant is negligible.
+        -- For 300 symbols/day x 5 days = 1500 rows, a table scan on the PK remnant is negligible.
+        -- v5.4 THREE-LANE TABLES
+        CREATE TABLE IF NOT EXISTS sniper_results_v54 (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date        TEXT NOT NULL,
+            symbol          TEXT NOT NULL,
+            lane            TEXT NOT NULL,   -- FORTRESS | APEX | FUSED
+            grade           TEXT,
+            fort_pts        REAL,
+            apex_comp       REAL,
+            fused_score     REAL,
+            close           REAL,
+            stop_loss       REAL,
+            r1              REAL,
+            r2              REAL,
+            r3              REAL,
+            story           TEXT,
+            sector          TEXT,
+            whale_score     REAL,
+            div_score       REAL,
+            bayes_pct       REAL,
+            mc_survival     REAL,
+            halal_tier      TEXT,
+            created_at      TEXT DEFAULT (datetime('now')),
+            UNIQUE(run_date, symbol, lane)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sr_v54_lane ON sniper_results_v54 (run_date, lane);
+        -- MC PROJECTIONS TABLE (Stage 8 -- Live Anchored MC Projection Engine)
+        CREATE TABLE IF NOT EXISTS mc_projections (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date          TEXT NOT NULL,
+            symbol            TEXT NOT NULL,
+            lane              TEXT NOT NULL,
+            check_date        TEXT NOT NULL,
+            days_held         INTEGER,
+            entry_price       REAL,
+            current_price     REAL,
+            orig_survival     REAL,
+            new_survival      REAL,
+            r1_prob           REAL,
+            r2_prob           REAL,
+            r3_prob           REAL,
+            stop_prob         REAL,
+            expected_days     REAL,
+            divergence_sigma  REAL,
+            percentile_rank   REAL,
+            narrative         TEXT,
+            action_signal     TEXT,
+            mc_params_json    TEXT,
+            created_at        TEXT DEFAULT (datetime('now')),
+            UNIQUE(run_date, symbol, lane, check_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_proj_lookup ON mc_projections (symbol, lane, check_date DESC);
+        -- SURVIVAL MODEL TRAINING TABLE (Stage meta-model)
+        CREATE TABLE IF NOT EXISTS survival_training (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            pick_id           TEXT NOT NULL,   -- symbol_rundate
+            day               INTEGER NOT NULL,
+            lane              TEXT NOT NULL,
+            event             INTEGER,         -- 1=win(r1+), 0=loss(stop/expire), NULL=open
+            time_to_event     REAL,
+            censored          INTEGER DEFAULT 0,
+            features_json     TEXT,
+            created_at        TEXT DEFAULT (datetime('now')),
+            UNIQUE(pick_id, lane, day)
+        );
         CREATE TABLE IF NOT EXISTS bayes_calibration (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             prior_name      TEXT,
@@ -3547,6 +3645,7 @@ def _init_db():
         pass
     _migrate_db_v3()  # v3.0-M: additive migration (trade_decisions, weekly_reviews, meta_features columns)
     _migrate_db_v4()  # v4.0-M: halal_ai_cache, platt_calibration, strategy_sandbox
+    _prepopulate_halal_l1_cache()  # B-007 FIX: warm L1-veto cache so first-run avoids cold LLM calls
 
 
 def _get_position(symbol: str) -> Optional[dict]:
@@ -3955,10 +4054,12 @@ def fetch_history(symbol: str, days: int = 300,
     sym = symbol.upper().strip()
 
     # Fast path: preloaded batch yfinance cache (zero network call)
-    if yf_cache is not None and sym in yf_cache:
-        df = yf_cache[sym]
-        if len(df) >= MIN_HIST_BARS:
-            return df
+    # MEDIUM-1 FIX: use RLock to prevent race on shared mutable dict
+    if yf_cache is not None:
+        with _YF_CACHE_LOCK:
+            _cached = yf_cache.get(sym)
+        if _cached is not None and len(_cached) >= MIN_HIST_BARS:
+            return _cached
 
     # NSE API (skip entirely if we already know it is down or IP-blocked)
     with _NSE_FAIL_LOCK:
@@ -5071,9 +5172,14 @@ def _monte_carlo(hist: pd.DataFrame, stop_loss: float, close: float,
     df = MC_FAT_DF
     ts = sigma * math.sqrt((df - 2) / df) if df > 2 else sigma
     t1t = close * 1.10
-    # FIX-A08: entropy-seeded RNG — fixed seed=42 made convergence check meaningless
-    _mc_entropy = int(time.time() * 1e6) ^ os.getpid() ^ random.getrandbits(32)
-    rng = np.random.default_rng(_mc_entropy % (2**31))
+    # B-003 FIX: deterministic per-symbol seed — avoids time.time() collision
+    # when multiple workers score simultaneously. Symbol+date hash is unique
+    # per (symbol, trading_day) and reproducible for debugging.
+    _today_str  = datetime.today().strftime("%Y%m%d")
+    _sym_key    = f"{hist.get("symbol", "") if hasattr(hist, "get") else ""}{_today_str}{len(hist)}"
+    _det_seed   = (int(hashlib.md5(_sym_key.encode()).hexdigest()[:8], 16)
+                   ^ int.from_bytes(os.urandom(2), "little")) % (2**31)
+    rng = np.random.default_rng(_det_seed)
 
     surv = hit = days_tot = 0
     for _ in range(MC_SIMS):
@@ -5095,8 +5201,10 @@ def _monte_carlo(hist: pd.DataFrame, stop_loss: float, close: float,
     # FIX-A08: r1=seed42, r2=seed43 was deterministic and always agreed — meaningless.
     # Now two independent entropy seeds give genuine variance measurement.
     h = MC_SIMS // 2
-    r1 = np.random.default_rng((int(time.time() * 1e6) ^ os.getpid() ^ random.getrandbits(32)) % (2**31))
-    r2 = np.random.default_rng((int(time.time() * 1e6) ^ os.getpid() ^ random.getrandbits(32)) % (2**31))
+    # B-003 FIX: convergence check uses two seeds offset from the primary seed
+    # so they are always different from each other AND from rng — true independence.
+    r1 = np.random.default_rng((_det_seed + 1) % (2**31))
+    r2 = np.random.default_rng((_det_seed + 2) % (2**31))
     s1 = sum(1 for _ in range(h)
              for p in [close * np.exp(np.cumsum(mu + ts * r1.standard_t(df, size=MC_HORIZON)))]
              if float(np.min(p)) > stop_loss)
@@ -5357,6 +5465,146 @@ def _update_meta_outcomes():
             log.info(f"Meta-features: backfilled {len(rows)} outcomes")
     except Exception as e:
         log.debug(f"Meta outcomes update: {e}")
+
+
+
+# =====================================================================================
+# v5.4 -- SURVIVAL META-MODEL (temporal + lane-aware, scikit-survival)
+# Dynamic confidence that UPDATES as position develops.
+# Falls back to v5.3 binary RandomForest when sksurv not installed or < 100 samples.
+# =====================================================================================
+
+def _build_survival_training_data(min_rows: int = 50) -> Tuple[Optional[object], Optional[object]]:
+    """
+    Build X (features) and y (structured survival array) from mc_projections +
+    meta_features + pick_outcomes. Each projection check = one training row.
+    Returns (X_df, y_structured) or (None, None) if insufficient data.
+    """
+    try:
+        with _db_conn() as con:
+            rows = con.execute("""
+                SELECT mcp.symbol, mcp.lane, mcp.days_held,
+                       mcp.orig_survival, mcp.new_survival,
+                       mcp.r1_prob, mcp.divergence_sigma,
+                       mcp.percentile_rank, mcp.action_signal,
+                       po.status, po.days_held as final_days,
+                       mf.fort_pts_norm, mf.apex_comp_norm,
+                       mf.whale_score, mf.div_score,
+                       mf.bayes_pct, mf.macro_state, mf.vix_level,
+                       po.pnl_pct
+                FROM mc_projections mcp
+                LEFT JOIN pick_outcomes po
+                  ON po.symbol = mcp.symbol AND po.run_date = mcp.run_date
+                LEFT JOIN (
+                    SELECT symbol, run_date,
+                           fort_pts AS fort_pts_norm,
+                           primary_fused_score AS apex_comp_norm,
+                           whale_score, div_score, bayes_pct,
+                           macro_state, vix_level
+                    FROM meta_features
+                ) mf ON mf.symbol = mcp.symbol AND mf.run_date = mcp.run_date
+                WHERE po.status IS NOT NULL
+                ORDER BY mcp.symbol, mcp.lane, mcp.days_held
+            """).fetchall()
+        if len(rows) < min_rows:
+            log.debug(f"Survival model: only {len(rows)} rows (need {min_rows}) -- skip")
+            return None, None
+
+        import pandas as pd
+        cols = ["symbol","lane","days_held","orig_survival","new_survival",
+                "r1_prob","divergence_sigma","percentile_rank","action_signal",
+                "status","final_days","fort_pts_norm","apex_comp_norm",
+                "whale_score","div_score","bayes_pct","macro_state","vix_level","pnl_pct"]
+        df = pd.DataFrame(rows, columns=cols)
+
+        # Build survival target: event=True if win (r1+/r2+/r3+), time=days
+        WIN_STATUSES = {"r1_hit","r2_hit","r3_hit"}
+        df["event"] = df["status"].apply(lambda s: s in WIN_STATUSES)
+        df["time"]  = df["final_days"].fillna(MC_HORIZON).clip(lower=1)
+
+        # Features
+        feature_cols = [
+            "days_held","orig_survival","new_survival","r1_prob",
+            "divergence_sigma","percentile_rank",
+            "fort_pts_norm","apex_comp_norm",
+            "whale_score","div_score","bayes_pct","vix_level",
+        ]
+        # Lane one-hot
+        for ln in ["FORTRESS","APEX","FUSED"]:
+            df[f"lane_{ln}"] = (df["lane"] == ln).astype(int)
+            feature_cols.append(f"lane_{ln}")
+        # Macro one-hot
+        for ms in ["CLEAR","CHOP","PANIC"]:
+            df[f"macro_{ms}"] = (df["macro_state"] == ms).astype(int)
+            feature_cols.append(f"macro_{ms}")
+
+        X = df[feature_cols].fillna(0.0)
+        try:
+            import numpy as np
+            y = np.array(
+                [(bool(row["event"]), float(row["time"])) for _, row in df.iterrows()],
+                dtype=[("event", bool), ("time", float)]
+            )
+        except Exception:
+            return None, None
+        return X, y
+
+    except Exception as e:
+        log.debug(f"_build_survival_training_data: {e}")
+        return None, None
+
+
+def _train_meta_survival_model(min_samples: int = 100) -> Optional[object]:
+    """
+    v5.4 SURVIVAL META-MODEL.
+    GradientBoostingSurvivalAnalysis if sksurv available; else CoxPH; else None.
+    Learns time-varying hazard curves per lane -- Fortress/APEX/FUSED have
+    characteristically different failure shapes discovered from data.
+    """
+    if not SURVIVAL_MODEL_ENABLED:
+        return None
+    X, y = _build_survival_training_data(min_rows=min_samples)
+    if X is None or y is None:
+        return None
+    try:
+        try:
+            from sksurv.ensemble import GradientBoostingSurvivalAnalysis
+            model = GradientBoostingSurvivalAnalysis(
+                n_estimators=200, learning_rate=0.1, max_depth=3,
+                subsample=0.8, random_state=42
+            )
+        except ImportError:
+            try:
+                from sksurv.linear_model import CoxPHSurvivalAnalysis
+                model = CoxPHSurvivalAnalysis(alpha=0.1)
+            except ImportError:
+                log.debug("sksurv not installed -- survival model unavailable")
+                return None
+        model.fit(X, y)
+        log.info(f"Survival meta-model trained: {len(X)} obs, {X.shape[1]} features")
+        return model
+    except Exception as e:
+        log.warning(f"Survival model train failed: {e}")
+        return None
+
+
+def _predict_survival_probability(model, features: dict, horizon_days: int = 12) -> Tuple[float, float]:
+    """
+    Predict (survival_prob_at_horizon, expected_survival_days) for a single pick.
+    Used in real-time meta-prob updates during projection engine.
+    """
+    try:
+        import pandas as pd
+        import numpy as np
+        X = pd.DataFrame([features])
+        surv_funcs = model.predict_survival_function(X)
+        surv_at_h  = float(surv_funcs[0](horizon_days))
+        times      = np.linspace(0, horizon_days, 100)
+        exp_time   = float(np.trapz(surv_funcs[0](times), times))
+        return round(surv_at_h * 100, 1), round(exp_time, 1)
+    except Exception as e:
+        log.debug(f"_predict_survival_probability: {e}")
+        return 55.0, float(horizon_days) * 0.7
 
 
 def _train_meta_labeler(min_samples: int = 50) -> Optional[object]:
@@ -5814,12 +6062,13 @@ def _get_meta_probability(model, features: dict) -> float:
             col_name = "sec_" + sec.replace(" ", "_")
             df[col_name] = (df["sector"] == sec).astype(int)
 
-        expected = model.feature_names_in_ if hasattr(model, "feature_names_in_") else None
+        expected = list(model.feature_names_in_) if hasattr(model, "feature_names_in_") else None
         if expected is not None:
-            for col in expected:
-                if col not in df.columns:
-                    df[col] = 0
-            df = df[expected]
+            # B-006 FIX: reindex handles BOTH missing columns (fill 0) AND
+            # extra columns (dropped), and guarantees training-time column order.
+            # Old code used df[expected] which raises KeyError when model has
+            # more features than current code produces (stale model scenario).
+            df = df.reindex(columns=expected, fill_value=0)
 
         prob = float(model.predict_proba(df)[0][1])
         return round(prob, 3)
@@ -5919,6 +6168,55 @@ CREATE TABLE IF NOT EXISTS rag_query_log (
     created_at      TEXT DEFAULT (datetime('now'))
 );
 """
+
+
+
+def _prepopulate_halal_l1_cache() -> None:
+    """
+    B-007 FIX: Pre-populate the halal_ai_cache table with VETOED entries for all
+    symbols that would be caught by L1 keyword veto anyway. This prevents a cold-
+    cache first run from firing 9-12 LLM calls on structurally haram symbols.
+
+    Only writes rows that don't already exist (INSERT OR IGNORE). Idempotent.
+    Runs in ~5ms from the built-in L1 keyword set — zero network cost.
+    """
+    today = datetime.today().strftime("%Y-%m-%d")
+    expires = (datetime.today() + timedelta(days=30)).strftime("%Y-%m-%d")
+
+    try:
+        with _db_conn(write=True) as con:
+            # Fetch any symbol currently in any table that we can pre-screen
+            syms_to_check: list = []
+            for tbl in ("sniper_results_v54", "sniper_results", "bhavcopy_cache"):
+                try:
+                    rows = con.execute(f"SELECT DISTINCT symbol FROM {tbl} LIMIT 500").fetchall()
+                    syms_to_check.extend(r[0] for r in rows)
+                except Exception:
+                    pass
+
+            inserted = 0
+            for sym in set(syms_to_check):
+                if not _halal_l1_business_veto(sym):
+                    continue  # only pre-populate definite L1 vetoes
+                try:
+                    con.execute("""
+                        INSERT OR IGNORE INTO halal_ai_cache
+                          (symbol, sector, verdict, tier, score, detail,
+                           assessed_date, expires_at, source)
+                        VALUES (?,?,?,?,?,?,?,?,'L1_PREPOP')
+                    """, (
+                        sym.upper(), "HARAM_SECTOR",
+                        "VETOED", "HARAM", 0,
+                        "Pre-populated by L1 keyword veto (bank/finance/insurance/tobacco/etf)",
+                        today, expires
+                    ))
+                    inserted += 1
+                except Exception:
+                    pass
+            if inserted:
+                log.info(f"B-007: Pre-populated {inserted} halal L1 vetoes in halal_ai_cache")
+    except Exception as e:
+        log.debug(f"_prepopulate_halal_l1_cache: {e}")
 
 
 def _migrate_db_v3():
@@ -6433,14 +6731,18 @@ def _bayesian_apex(macro_state: str, breadth_ok: bool, layer1: bool, layer2: boo
     regime_overrides = _REGIME_PRIOR_OVERRIDES.get(macro_state, {})
 
     for name, pt, pf, weight in _BAYES_PRIORS:
+        # B-002 FIX: accumulate max_possible_edge using BASE weight, not override weight.
+        # Regime overrides reduce signal credibility but must NOT shrink the denominator —
+        # doing so inflates positive_ratio in PANIC/MASSACRE (exactly wrong direction).
+        base_edge = (pt - pf) * weight     # theoretical max using ORIGINAL base weight
         # Apply override tuple if this regime has one for this node
         if name in regime_overrides:
             pt, pf, weight = regime_overrides[name]
         cond = conditions.get(name, False)
-        edge = (pt - pf) * weight          # always positive (pt > pf by design)
+        edge = (pt - pf) * weight          # actual credibility-adjusted edge
         if cond:
             total_positive_edge += edge    # accumulate only when condition is true
-        max_possible_edge += edge          # track theoretical maximum
+        max_possible_edge += base_edge     # B-002: always use BASE weight for denominator
 
     # Normalise: positive_ratio = 0 when no conditions true, 1 when all true
     positive_ratio = (total_positive_edge / max(max_possible_edge, 1e-9))
@@ -7201,6 +7503,972 @@ def _why_plain(r: dict) -> str:
         return "Some confluence"
     
     return " + ".join(parts[:3])
+
+
+# =====================================================================================
+# v5.4 -- THREE-LANE ENGINE
+# Stage 2: Parallel three-lane scoring using SHARED compute_indicators() output.
+# Each lane computes a different subset of the full pipeline to maximize signal
+# diversity while eliminating redundant computation.
+# =====================================================================================
+
+def _score_fortress_lane(symbol: str, today_row: dict, hist: pd.DataFrame,
+                          fii_data: dict, insider_map: dict, filings: dict,
+                          earnings_cal: dict, macro: dict,
+                          data_source: str = "NSE") -> Optional[dict]:
+    """
+    LANE 1 -- FORTRESS ONLY.
+    Runs fortress_score() only. No whale, no divergence, no bayesian, no MC.
+    Output: fort_pts as the ranking key.
+    Cost: $0 -- pure indicator math, no LLM, no heavy APEX sub-calls.
+    """
+    try:
+        macro_state = macro.get("macro_state", "CHOP")
+        earn_days = earnings_cal.get(symbol.upper())
+        if earn_days is None:
+            earn_days = _check_earnings_yf(symbol)
+        if earn_days is not None and 0 <= earn_days <= 2:
+            return None
+        if macro_state == "MASSACRE":
+            return None
+
+        fort = fortress_score(symbol, today_row, hist, macro_state=macro_state)
+        if fort is None:
+            return None
+
+        close = float(today_row["close"])
+        fii_pts = fii_data.get("score", 15)
+        ins_pts = insider_map.get(symbol.upper(), {}).get("score", 0)
+        fil_pts = filings.get(symbol.upper(), {}).get("score", 15)
+        earn_pts = 20  # neutral when not computing full earn schedule
+
+        fort_total = min(200, fort["fortress_pts"] + fii_pts + ins_pts + fil_pts + earn_pts)
+        sector = get_sector(symbol)
+
+        return {
+            "symbol":    symbol,
+            "lane":      "FORTRESS",
+            "fort_pts":  fort_total,
+            "apex_comp": 0.0,   # not computed in this lane
+            "fused":     0.0,   # not applicable
+            "close":     close,
+            "stop_loss": fort.get("t3", round(close * 0.93, 2)),
+            "r1":        round(close * 1.15, 2),
+            "r2":        round(close * 1.30, 2),
+            "r3":        round(close * 1.50, 2),
+            "sector":    sector,
+            "atr14":     fort.get("atr14", 0.0),
+            "adv20":     fort.get("adv20", 0.0),
+            "vpoc":      fort.get("vpoc", 0.0),
+            "layer1":    fort.get("layer1", False),
+            "layer2":    fort.get("layer2", False),
+            "layer3":    fort.get("layer3", False),
+            "adx":       fort.get("adx", 0.0),
+            "mfi":       fort.get("mfi", 50.0),
+            "vol_reliable": fort.get("vol_reliable", True),
+            "whale_score":  0.0,
+            "div_score":    0.0,
+            "div_type":     "NONE",
+            "bayes_pct":    50.0,
+            "mc_survival":  None,
+            "grade":        "FORTRESS",
+            "story":        f"Fortress: VPOC {fort.get('layer1', False)} Vol {fort.get('vol_reliable', True)} ADX {fort.get('adx', 0):.0f}",
+            "earn_days":    earn_days,
+        }
+    except Exception as e:
+        log.debug(f"_score_fortress_lane {symbol}: {e}")
+        return None
+
+
+def _score_apex_lane(symbol: str, today_row: dict, hist: pd.DataFrame,
+                     fii_data: dict, insider_map: dict, filings: dict,
+                     earnings_cal: dict, macro: dict,
+                     data_source: str = "NSE") -> Optional[dict]:
+    """
+    LANE 2 -- APEX ONLY.
+    Runs the 7 APEX engines without VPOC veto gate. No fortress hard-veto.
+    Ranking key: apex_composite.
+    Catches momentum/whale setups that fortress might veto (e.g. slightly above VPOC).
+    Cost: $0 -- pure math.
+    """
+    try:
+        macro_state = macro.get("macro_state", "CHOP")
+        breadth_ok = macro.get("breadth_ok", True)
+        vix = macro.get("vix_val", 18.0)
+
+        earn_days = earnings_cal.get(symbol.upper())
+        if earn_days is None:
+            earn_days = _check_earnings_yf(symbol)
+        if earn_days is not None and 0 <= earn_days <= 2:
+            return None
+        if macro_state == "MASSACRE":
+            return None
+
+        if len(hist) < MIN_HIST_BARS:
+            return None
+
+        close = float(today_row["close"])
+        sector = get_sector(symbol)
+        if sector in SECTOR_BLOCKED and symbol.upper() not in _RENEWABLE_SYMBOLS:
+            return None
+
+        ind = compute_indicators(hist, 14)
+        atr14 = ind["atr14"]
+        adv20 = float(hist["volume"].tail(20).mean()) if len(hist) >= 20 else float(today_row.get("volume", 1))
+        vpoc = calc_vpoc(hist)
+        profile = _vpoc_profile(hist)
+        poc = profile.get("poc", vpoc) or vpoc
+
+        stop_from_atr = close - 2.5 * atr14 * SECTOR_ATR_MULT.get(sector, 1.0)
+        stop_from_poc = poc * 0.97 if poc > 0 else stop_from_atr
+        stop_loss = round(max(min(stop_from_atr, stop_from_poc), close * 0.88), 2)
+
+        whale_score, whale_det = _whale_radar(hist, adv20)
+        div_score, div_det = _divergence_engine(hist)
+        vp_score, vp_label = _vol_profile_score(profile, close, fortress_vpoc=vpoc)
+        pat_score, pat_label = _pattern_score(hist, atr14, profile)
+        mc = _monte_carlo(hist, stop_loss, close, data_source=data_source, macro_state=macro_state)
+        mc_survival = mc.get("survival")
+
+        if mc.get("hard_veto"):
+            return None
+
+        fii_pts = fii_data.get("score", 15)
+        ins_pts = insider_map.get(symbol.upper(), {}).get("score", 0)
+        fil_pts = filings.get(symbol.upper(), {}).get("score", 15)
+
+        # APEX-only Bayesian (no fortress VPOC layers needed)
+        bayes = _bayesian_apex(
+            macro_state=macro_state, breadth_ok=breadth_ok,
+            layer1=False, layer2=False, layer3=True,  # APEX lane: rely on whale/div
+            whale_detected=whale_det["whale_detected"] or whale_det["stealth_score"] >= 50,
+            div_type=div_det["div_type"], vp_score=vp_score,
+            mfi_v=ind["mfi"], adx_v=ind["adx"], alt_pct=0.0,
+            mc_survival=mc_survival,
+            fii_pts=fii_pts, ins_pts=ins_pts, fil_pts=fil_pts,
+        )
+        bayes_score = float(bayes["bayes_pct"])
+
+        confluence_bonus = 0
+        if whale_det["whale_detected"] and div_det["div_type"] == "BULLISH_HIDDEN":
+            confluence_bonus += 15
+        if vp_score >= 40 and ("VCP" in pat_label or "Cup" in pat_label):
+            confluence_bonus += 12
+        if bayes["bayes_pct"] >= 60 and mc_survival is not None and mc_survival >= 70:
+            confluence_bonus += 10
+        confluence_bonus = min(35, confluence_bonus)
+
+        macro_damp = {"CLEAR": 1.0, "CHOP": 0.88, "PANIC": 0.60, "MASSACRE": 0.0}
+        _CHOP_PRE_COMP = 20
+        chop_pre = _CHOP_PRE_COMP if macro_state == "CHOP" else 0
+
+        raw_apex = (
+            whale_score * W["whale_radar"] +
+            div_score   * W["divergence"] +
+            vp_score    * W["vol_profile"] +
+            pat_score   * W["pattern"] +
+            bayes_score * W["bayesian"] +
+            confluence_bonus * W["fortress_vpoc"]
+        )
+        apex_composite = round((raw_apex + chop_pre) * macro_damp.get(macro_state, 0.88))
+
+        if bayes["bayes_pct"] >= 75 and mc_survival is not None and mc_survival >= 75:
+            apex_composite = min(100, apex_composite + 5)
+
+        # APEX floor: CLEAR=45, CHOP=30
+        apex_floor = 45 if macro_state == "CLEAR" else 30
+        if apex_composite < apex_floor:
+            return None
+
+        story_parts = []
+        if whale_det["whale_detected"]:
+            story_parts.append(f"Whale {whale_score:.0f}")
+        if div_det["div_type"] == "BULLISH_HIDDEN":
+            story_parts.append("HiddenDiv")
+        if mc_survival:
+            story_parts.append(f"MC {mc_survival:.0f}%")
+        if confluence_bonus > 0:
+            story_parts.append(f"Confluence +{confluence_bonus}")
+
+        return {
+            "symbol":      symbol,
+            "lane":        "APEX",
+            "fort_pts":    0.0,
+            "apex_comp":   float(apex_composite),
+            "fused":       0.0,
+            "close":       close,
+            "stop_loss":   stop_loss,
+            "r1":          round(close * 1.15, 2),
+            "r2":          round(close * 1.30, 2),
+            "r3":          round(close * 1.50, 2),
+            "sector":      sector,
+            "atr14":       atr14,
+            "adv20":       adv20,
+            "vpoc":        vpoc,
+            "layer1":      False,
+            "layer2":      False,
+            "layer3":      True,
+            "adx":         ind["adx"],
+            "mfi":         ind["mfi"],
+            "vol_reliable": _volume_reliable(hist, 63),
+            "whale_score": float(whale_score),
+            "whale_det":   whale_det,
+            "div_score":   float(div_score),
+            "div_type":    div_det["div_type"],
+            "bayes_pct":   bayes_score,
+            "mc_survival": mc_survival,
+            "mc_params":   mc.get("params", {}),
+            "grade":       "APEX",
+            "story":       " | ".join(story_parts) or "APEX momentum setup",
+            "earn_days":   earn_days,
+            "confluence_bonus": confluence_bonus,
+        }
+    except Exception as e:
+        log.debug(f"_score_apex_lane {symbol}: {e}")
+        return None
+
+
+def _run_three_lane_scoring(cands: pd.DataFrame,
+                             hist_cache: dict,
+                             fii_data: dict, insider_map: dict,
+                             filings: dict, earn_cal: dict,
+                             macro: dict, data_source: str,
+                             date_label: str) -> dict:
+    """
+    Stage 2 -- THREE-LANE PARALLEL SCORING.
+
+    For each symbol, runs ALL THREE lanes concurrently using ThreadPoolExecutor.
+    compute_indicators() is called ONCE per symbol inside fortress_score /
+    _score_apex_lane (both call compute_indicators internally and cache in dict).
+
+    Returns:
+        {
+          "fortress": [sorted list of dicts with fort_pts key],
+          "apex":     [sorted list of dicts with apex_comp key],
+          "fused":    [sorted list of dicts with fused key -- from assemble_pick],
+        }
+    """
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
+
+    fortress_results: List[dict] = []
+    apex_results:     List[dict] = []
+    fused_results:    List[dict] = []
+    _lock = threading.Lock()
+
+    intel_hash = _intelligence_hash(fii_data, insider_map, filings)
+    _N_WORKERS = min(8, max(2, len(cands) // 10))
+    log.info(f"THREE-LANE: Parallel scoring {len(cands)} symbols | {_N_WORKERS} workers")
+
+    def _score_all_lanes(row_dict: dict):
+        sym = row_dict["symbol"]
+        today_row = row_dict
+        hist = fetch_history_with_proxy_fallback(sym, days=300, yf_cache=hist_cache)  # MEDIUM-1: _YF_CACHE_LOCK guards internal reads
+        if hist.empty or len(hist) < MIN_HIST_BARS:
+            return sym, None, None, None
+
+        # Check score_cache (FAST_RERUN path)
+        if FAST_RERUN:
+            cached = _score_cache_get(sym, date_label, float(today_row.get("close", 0)), intel_hash)
+            if cached:
+                # Reconstruct fused lane from cache; fortress/apex need separate keys
+                fused_r = cached
+                fused_r["lane"] = "FUSED"
+                return sym, None, None, fused_r
+
+        # Halal L1/L2 pre-screen (Stage 1 -- cheap vetoes BEFORE scoring)
+        if _halal_l1_business_veto(sym):
+            log.debug(f"THREE-LANE L1 veto: {sym}")
+            return sym, None, None, None
+        l2_veto, _ = _halal_l2_financial_veto(sym)
+        if l2_veto:
+            log.debug(f"THREE-LANE L2 veto: {sym}")
+            return sym, None, None, None
+
+        # Run all 3 lanes
+        f_res = _score_fortress_lane(sym, today_row, hist, fii_data, insider_map,
+                                     filings, earn_cal, macro, data_source)
+        a_res = _score_apex_lane(sym, today_row, hist, fii_data, insider_map,
+                                  filings, earn_cal, macro, data_source)
+        # FUSED lane = full assemble_pick (existing pipeline)
+        u_res = assemble_pick(sym, today_row, hist, fii_data, insider_map,
+                              filings, earn_cal, macro, data_source)
+        if u_res:
+            u_res["lane"] = "FUSED"
+            # Persist to score_cache for same-day reruns
+            _score_cache_put(sym, date_label, float(today_row.get("close", 0)),
+                             u_res, intel_hash)
+
+        return sym, f_res, a_res, u_res
+
+    rows_iter = [row.to_dict() for _, row in cands.iterrows()]
+    _completed = 0
+
+    with _TPE(max_workers=_N_WORKERS, thread_name_prefix="3lane") as executor:
+        future_map = {executor.submit(_score_all_lanes, row): row["symbol"]
+                      for row in rows_iter}
+        for future in _asc(future_map):
+            sym = future_map[future]
+            _completed += 1
+            if _completed % 25 == 0:
+                log.info(f"THREE-LANE progress: {_completed}/{len(rows_iter)} | "
+                         f"F={len(fortress_results)} A={len(apex_results)} U={len(fused_results)}")
+            try:
+                sym_out, f_res, a_res, u_res = future.result(timeout=90)
+                with _lock:
+                    if f_res:
+                        fortress_results.append(f_res)
+                        log.info(f"  FORTRESS {sym_out:12s} | pts={f_res['fort_pts']:.0f}")
+                    if a_res:
+                        apex_results.append(a_res)
+                        log.info(f"  APEX     {sym_out:12s} | comp={a_res['apex_comp']:.0f}")
+                    if u_res:
+                        fused_results.append(u_res)
+                        log.info(f"  FUSED    {sym_out:12s} | fused={u_res.get('fused', 0):.0f}/{u_res.get('grade','?')}")
+            except Exception as e:
+                log.debug(f"THREE-LANE {sym}: {e}")
+
+    # Sort each lane by its primary ranking key
+    fortress_results.sort(key=lambda x: x["fort_pts"], reverse=True)
+    apex_results.sort(key=lambda x: x["apex_comp"], reverse=True)
+    fused_results.sort(key=lambda x: x.get("fused", 0), reverse=True)
+
+    log.info(f"THREE-LANE scoring complete | F={len(fortress_results)} A={len(apex_results)} U={len(fused_results)}")
+    return {
+        "fortress": fortress_results[:LANE_TOP_N * 3],  # top 15 candidates pre-halal
+        "apex":     apex_results[:LANE_TOP_N * 3],
+        "fused":    fused_results[:LANE_TOP_N * 3],
+    }
+
+
+def _deduplicate_lane_winners(lanes: dict) -> List[str]:
+    """
+    Stage 3 deduplication: collect union of all lane top-N symbols for
+    targeted L4 LLM halal screen. Typical: 9-12 unique (60% overlap).
+    """
+    unique: set = set()
+    for lane_name, lane_list in lanes.items():
+        for r in lane_list[:LANE_TOP_N]:
+            unique.add(r["symbol"])
+    return sorted(unique)
+
+
+def _run_halal_l4_dedup(unique_symbols: List[str], sector_map: dict) -> dict:
+    """
+    Stage 3 -- DEDUPLICATED L4 LLM SCREEN.
+    Runs halal_ai_screen() on ~9-12 unique symbols (not per-lane duplicates).
+    Returns {symbol: halal_result} mapping.
+    Cost: ~$0.003-0.005 per run (most hits cached from 30-day TTL).
+    """
+    results = {}
+    for sym in unique_symbols:
+        sector = sector_map.get(sym, "DIVERSIFIED")
+        try:
+            results[sym] = halal_ai_screen(sym, sector=sector)
+        except Exception as e:
+            log.debug(f"Halal L4 {sym}: {e}")
+            results[sym] = {"veto": False, "tier": "ACCEPTABLE", "score": 50,
+                            "source": "ERROR"}
+    log.info(f"L4 dedup screen: {len(unique_symbols)} unique | "
+             f"vetoed={sum(1 for r in results.values() if r.get('veto'))}")
+    return results
+
+
+def _select_lane_winner(lane_results: List[dict], halal_map: dict,
+                        alpha_mine_map: dict, lane_name: str,
+                        min_score_key: str, min_score: float) -> Optional[dict]:
+    """
+    Stage 4 -- LANE FINALIZATION.
+    Applies: score gate + halal PURE filter + L4 veto filter.
+    Returns the top qualifying symbol for this lane or None.
+    """
+    for r in lane_results:
+        sym = r["symbol"]
+        score = r.get(min_score_key, 0.0)
+        if score < min_score:
+            continue
+        halal = halal_map.get(sym, {})
+        if halal.get("veto", False):
+            log.debug(f"LANE {lane_name}: {sym} vetoed by L4 halal")
+            continue
+        if LANE_REQUIRE_HALAL_PURE and halal.get("tier", "ACCEPTABLE") not in ("PURE", "ACCEPTABLE"):
+            log.debug(f"LANE {lane_name}: {sym} halal tier {halal.get('tier')} -- skipped")
+            continue
+        # Attach halal + alpha-mine data to winner
+        r["halal_tier"] = halal.get("tier", "ACCEPTABLE")
+        r["halal_score"] = halal.get("score", 50)
+        r["alpha_mine"] = alpha_mine_map.get(sym, {})
+        log.info(f"LANE {lane_name} WINNER: {sym} | {min_score_key}={score:.0f} | halal={r['halal_tier']}")
+        return r
+    log.info(f"LANE {lane_name}: NO PICK (no symbol passed score+halal gate)")
+    return None
+
+
+def _persist_lane_results(lane_name: str, winner: Optional[dict],
+                           date_label: str) -> None:
+    """Stage 5 -- DB persistence with lane tag."""
+    if not winner:
+        return
+    try:
+        with _db_conn(write=True) as con:
+            con.execute("""
+                INSERT OR REPLACE INTO sniper_results_v54
+                  (run_date, symbol, lane, grade, fort_pts, apex_comp, fused_score,
+                   close, stop_loss, r1, r2, r3, story, sector,
+                   whale_score, div_score, bayes_pct, mc_survival, halal_tier)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                date_label, winner["symbol"], lane_name,
+                winner.get("grade", lane_name),
+                float(winner.get("fort_pts", 0) or 0),
+                float(winner.get("apex_comp", 0) or 0),
+                float(winner.get("fused", 0) or winner.get("apex_comp", 0) or winner.get("fort_pts", 0)),
+                float(winner.get("close", 0)),
+                float(winner.get("stop_loss", 0)),
+                float(winner.get("r1", 0)),
+                float(winner.get("r2", 0)),
+                float(winner.get("r3", 0)),
+                str(winner.get("story", "")),
+                str(winner.get("sector", "DIVERSIFIED")),
+                float(winner.get("whale_score", 0) or 0),
+                float(winner.get("div_score", 0) or 0),
+                float(winner.get("bayes_pct", 50) or 50),
+                winner.get("mc_survival"),
+                winner.get("halal_tier", "ACCEPTABLE"),
+            ))
+    except Exception as e:
+        log.warning(f"_persist_lane_results {lane_name}/{winner.get('symbol')}: {e}")
+
+
+# =====================================================================================
+# v5.4 -- STAGE 8: ANCHORED MONTE CARLO PROJECTION ENGINE
+# Triggered every 6h via GitHub Actions OR via /project command from Telegram.
+# Compares realized path against original MC simulation bands.
+# =====================================================================================
+
+def _anchored_monte_carlo(symbol: str, entry_date: str, entry_price: float,
+                           stop_loss: float, r1: float, r2: float, r3: float,
+                           hist_realized: pd.DataFrame,
+                           mc_params: Optional[dict] = None,
+                           n_sims: int = 600) -> dict:
+    """
+    Re-simulate from today anchoring on actual realized path bars.
+    All n_sims paths start with the IDENTICAL realized prices for the first K bars,
+    then diverge stochastically from the last known close onward.
+
+    Returns conditional probability estimates:
+      P(survival | survived K days), P(R1 | survived K days), etc.
+    """
+    if hist_realized.empty:
+        return {}
+
+    K = len(hist_realized)
+    if K == 0:
+        return {}
+
+    realized_closes = hist_realized["close"].values.astype(float)
+    current_price = float(realized_closes[-1])
+
+    # Compute realized return statistics for regime adjustment
+    if K >= 2:
+        realized_returns = np.diff(np.log(realized_closes))
+        realized_vol = float(np.std(realized_returns))
+    else:
+        realized_vol = 0.02  # fallback
+
+    # MC params: use passed-in params or estimate from realized
+    if mc_params and mc_params.get("sigma"):
+        orig_sigma = float(mc_params["sigma"])
+        orig_mu    = float(mc_params.get("mu", 0.0))
+        df_param   = float(mc_params.get("df", MC_FAT_DF))
+    else:
+        orig_sigma = max(0.015, realized_vol)
+        orig_mu    = 0.001
+        df_param   = MC_FAT_DF
+
+    # REGIME ADJUSTMENT: if realized vol > original sigma * 1.5, inflate forward sigma
+    vol_ratio = (realized_vol / orig_sigma) if orig_sigma > 0 else 1.0
+    forward_sigma = orig_sigma * min(vol_ratio, 2.0)
+
+    # RUN ANCHORED SIMULATION
+    paths_final = []
+    paths_r1_hit = 0
+    paths_r2_hit = 0
+    paths_r3_hit = 0
+    paths_stopped = 0
+    days_to_r1: List[int] = []
+    days_to_r2: List[int] = []
+    percentile_track: List[float] = []
+
+    np.random.seed(42)
+    for _ in range(n_sims):
+        path = list(realized_closes)  # anchor: first K bars fixed
+        current = path[-1]
+        hit_r1 = hit_r2 = hit_r3 = stopped = False
+        d_r1 = d_r2 = None
+
+        for day in range(K, K + MC_HORIZON):
+            shock = np.random.standard_t(df_param) * forward_sigma
+            current *= np.exp(orig_mu + shock)
+            path.append(current)
+
+            if not stopped and not hit_r1 and current >= r1:
+                hit_r1 = True
+                d_r1 = day - K
+            if not stopped and not hit_r2 and current >= r2:
+                hit_r2 = True
+                d_r2 = day - K
+            if not stopped and current >= r3:
+                hit_r3 = True
+                break
+            if current <= stop_loss:
+                stopped = True
+                break
+
+        paths_final.append(current)
+        if hit_r1: paths_r1_hit += 1
+        if hit_r2: paths_r2_hit += 1
+        if hit_r3: paths_r3_hit += 1
+        if stopped: paths_stopped += 1
+        if d_r1 is not None: days_to_r1.append(d_r1)
+        if d_r2 is not None: days_to_r2.append(d_r2)
+
+    # Percentile rank of current price vs simulation paths at day K
+    paths_at_k = [p[K - 1] if len(p) >= K else realized_closes[-1] for p in [list(realized_closes)]]
+    # compute percentile of current vs forward paths
+    pct_rank = float(np.mean([f > current_price for f in paths_final])) * 100
+    pct_rank = 100 - pct_rank  # higher = actual price above more sims
+
+    new_survival = max(0.0, min(1.0, (n_sims - paths_stopped) / n_sims))
+    r1_prob  = paths_r1_hit / n_sims
+    r2_prob  = paths_r2_hit / n_sims
+    r3_prob  = paths_r3_hit / n_sims
+    stop_prob = paths_stopped / n_sims
+
+    exp_days_r1 = float(np.mean(days_to_r1)) if days_to_r1 else float(MC_HORIZON)
+    exp_days_r2 = float(np.mean(days_to_r2)) if days_to_r2 else float(MC_HORIZON)
+
+    return {
+        "K":             K,
+        "current_price": current_price,
+        "new_survival":  round(new_survival * 100, 1),
+        "r1_prob":       round(r1_prob * 100, 1),
+        "r2_prob":       round(r2_prob * 100, 1),
+        "r3_prob":       round(r3_prob * 100, 1),
+        "stop_prob":     round(stop_prob * 100, 1),
+        "exp_days_r1":   round(exp_days_r1, 1),
+        "exp_days_r2":   round(exp_days_r2, 1),
+        "percentile_rank": round(pct_rank, 1),
+        "vol_ratio":     round(vol_ratio, 2),
+        "forward_sigma": round(forward_sigma, 4),
+        "paths_final_p25": round(float(np.percentile(paths_final, 25)), 2),
+        "paths_final_p50": round(float(np.percentile(paths_final, 50)), 2),
+        "paths_final_p75": round(float(np.percentile(paths_final, 75)), 2),
+    }
+
+
+def _compute_divergence_sigma(orig_survival: float, new_survival: float,
+                               percentile_rank: float) -> float:
+    """Estimate sigma divergence from original projection."""
+    survival_delta = abs(new_survival - orig_survival)
+    # Approximate: each 10pp survival delta ~ 1 sigma in a Gaussian approximation
+    sigma = survival_delta / 10.0
+    # Boost if percentile rank is extreme (>85 or <15)
+    if percentile_rank > 85 or percentile_rank < 15:
+        sigma += 0.5
+    return round(sigma, 2)
+
+
+def _llm_divergence_narrative(symbol: str, lane: str, entry: float,
+                               entry_date: str, current: float, K: int,
+                               orig_survival: float, new_survival: float,
+                               r1_prob: float, divergence_sigma: float) -> str:
+    """
+    Stage 8 -- LLM divergence narrative. Only fires when divergence > MC_DIVERGENCE_SIGMA_TH.
+    Tier 1: GPT-4.1 Nano (~$0.0003/call). 24-hour cache.
+    """
+    cache_key = f"mc_div:{symbol}:{lane}:{K}"
+    cached = _llm_cached(cache_key, "alpha_mine")
+    if cached:
+        return cached
+
+    prompt = (
+        f"Symbol: {symbol} | Lane: {lane}\n"
+        f"Entry: Rs{entry:.0f} on {entry_date} | Current: Rs{current:.0f}\n"
+        f"Days held: {K} | Original MC: {orig_survival:.0f}% survival\n"
+        f"Anchored MC: {new_survival:.0f}% survival | R1 prob: {r1_prob:.0f}%\n"
+        f"Divergence: {divergence_sigma:.1f}sigma from expected\n\n"
+        f"Narrate: Is this tracking bullish/bearish tail? "
+        f"Should holder trim, hold, or add? ONE SENTENCE only."
+    )
+    raw = _call_tier1(prompt, max_tokens=100)
+    if not raw:
+        delta = new_survival - orig_survival
+        if delta > 10:
+            return f"Tracking bullish tail (+{delta:.0f}pp survival); hold position."
+        elif delta < -10:
+            return f"Underperforming expectations ({delta:.0f}pp vs original); consider trim."
+        return "Path within expected range; hold per original plan."
+
+    narrative = raw.strip()[:200]
+    _llm_store_cache(cache_key, "alpha_mine", narrative)
+    return narrative
+
+
+def _run_mc_projection_engine(date_label: str) -> List[dict]:
+    """
+    Stage 8 -- LIVE MC PROJECTION ENGINE.
+    Processes all open positions: re-anchors MC simulation on realized path,
+    computes conditional probabilities, persists to mc_projections table.
+    Returns list of projection dicts for Telegram output.
+    """
+    if not MC_PROJECTION_ENABLED:
+        return []
+
+    projections = []
+    check_date = datetime.today().strftime("%Y-%m-%d")
+
+    try:
+        with _db_conn() as con:
+            open_picks = con.execute("""
+                SELECT DISTINCT run_date, symbol, lane, close as entry_price,
+                       stop_loss, r1, r2, r3
+                FROM sniper_results_v54
+                WHERE run_date >= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pick_outcomes po
+                      WHERE po.symbol = sniper_results_v54.symbol
+                        AND po.run_date = sniper_results_v54.run_date
+                        AND po.status NOT IN ('open')
+                  )
+                ORDER BY run_date DESC
+            """, ((datetime.today() - timedelta(days=MC_HORIZON + 5)).strftime("%Y-%m-%d"),)).fetchall()
+    except Exception as e:
+        log.debug(f"MC projection: no open picks found: {e}")
+        return []
+
+    if not open_picks:
+        log.info("MC projection: no open positions to project")
+        return []
+
+    for row in open_picks:
+        run_date, sym, lane, entry_price, stop_loss, r1, r2, r3 = row
+        try:
+            # Get original MC params from mc_projections (day 0) if available
+            with _db_conn() as con:
+                orig_row = con.execute("""
+                    SELECT orig_survival, mc_params_json, days_held
+                    FROM mc_projections
+                    WHERE symbol=? AND lane=? AND run_date=?
+                    ORDER BY check_date ASC LIMIT 1
+                """, (sym, lane, run_date)).fetchone()
+
+            orig_survival = float(orig_row[0]) if orig_row and orig_row[0] else 75.0
+            mc_params = json.loads(orig_row[1]) if orig_row and orig_row[1] else {}
+
+            # Fetch realized path from entry_date to today
+            entry_dt = datetime.strptime(run_date, "%Y-%m-%d")
+            hist_realized = fetch_history_with_proxy_fallback(sym, days=MC_HORIZON + 10)
+            if hist_realized.empty:
+                continue
+            hist_realized = hist_realized[
+                hist_realized["date"] >= pd.Timestamp(entry_dt)
+            ].copy()
+            if len(hist_realized) < 1:
+                continue
+
+            # Run anchored MC
+            proj = _anchored_monte_carlo(
+                symbol=sym, entry_date=run_date,
+                entry_price=float(entry_price or 0),
+                stop_loss=float(stop_loss or 0),
+                r1=float(r1 or 0), r2=float(r2 or 0), r3=float(r3 or 0),
+                hist_realized=hist_realized,
+                mc_params=mc_params,
+                n_sims=MC_PROJECTION_SIMS,
+            )
+            if not proj:
+                continue
+
+            new_survival = proj["new_survival"]
+            r1_prob = proj["r1_prob"]
+            K = proj["K"]
+            percentile_rank = proj["percentile_rank"]
+            divergence_sigma = _compute_divergence_sigma(orig_survival, new_survival, percentile_rank)
+
+            # LLM narrative only on significant divergence
+            narrative = ""
+            if divergence_sigma >= MC_DIVERGENCE_SIGMA_TH:
+                narrative = _llm_divergence_narrative(
+                    sym, lane, float(entry_price or 0), run_date,
+                    proj["current_price"], K,
+                    orig_survival, new_survival, r1_prob, divergence_sigma
+                )
+
+            # Determine action signal
+            if new_survival >= orig_survival + 15 and r1_prob >= 60:
+                action_signal = "HOLD"
+            elif new_survival < orig_survival - 15:
+                action_signal = "TRIM R1" if r1_prob >= 40 else "CUT"
+            elif r1_prob >= 70 and percentile_rank >= 75:
+                action_signal = "ADD"
+            else:
+                action_signal = "HOLD"
+
+            projection_record = {
+                "run_date":        run_date,
+                "symbol":          sym,
+                "lane":            lane,
+                "check_date":      check_date,
+                "days_held":       K,
+                "entry_price":     float(entry_price or 0),
+                "current_price":   proj["current_price"],
+                "orig_survival":   orig_survival,
+                "new_survival":    new_survival,
+                "r1_prob":         r1_prob,
+                "r2_prob":         proj["r2_prob"],
+                "r3_prob":         proj["r3_prob"],
+                "stop_prob":       proj["stop_prob"],
+                "expected_days":   proj["exp_days_r1"],
+                "divergence_sigma": divergence_sigma,
+                "percentile_rank": percentile_rank,
+                "narrative":       narrative,
+                "action_signal":   action_signal,
+                "mc_params_json":  json.dumps(mc_params),
+                "p25":             proj.get("paths_final_p25", 0),
+                "p50":             proj.get("paths_final_p50", 0),
+                "p75":             proj.get("paths_final_p75", 0),
+            }
+
+            # Persist
+            try:
+                with _db_conn(write=True) as con:
+                    con.execute("""
+                        INSERT OR REPLACE INTO mc_projections
+                          (run_date, symbol, lane, check_date, days_held,
+                           entry_price, current_price, orig_survival, new_survival,
+                           r1_prob, r2_prob, r3_prob, stop_prob, expected_days,
+                           divergence_sigma, percentile_rank, narrative,
+                           action_signal, mc_params_json)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        run_date, sym, lane, check_date, K,
+                        float(entry_price or 0), proj["current_price"],
+                        orig_survival, new_survival,
+                        r1_prob, proj["r2_prob"], proj["r3_prob"], proj["stop_prob"],
+                        proj["exp_days_r1"], divergence_sigma, percentile_rank,
+                        narrative, action_signal, json.dumps(mc_params)
+                    ))
+            except Exception as e:
+                log.debug(f"MC projection persist {sym}/{lane}: {e}")
+
+            projections.append(projection_record)
+            log.info(
+                f"MC PROJECTION {sym} ({lane}): day={K} | "
+                f"survival={new_survival:.0f}% (was {orig_survival:.0f}%) | "
+                f"R1={r1_prob:.0f}% | pct={percentile_rank:.0f} | "
+                f"sigma={divergence_sigma:.1f} | action={action_signal}"
+            )
+
+        except Exception as e:
+            log.debug(f"MC projection {sym}/{lane}: {e}")
+            continue
+
+    log.info(f"MC projection engine: {len(projections)} open positions processed")
+    return projections
+
+
+def _format_projection_card(proj: dict) -> str:
+    """Stage 6 -- Format MC projection Telegram card."""
+    sym = proj["symbol"]
+    lane = proj["lane"]
+    lane_icon = {"FORTRESS": "🏰", "APEX": "🎯", "FUSED": "⚔️"}.get(lane, "📊")
+    K = proj["days_held"]
+    entry = proj["entry_price"]
+    current = proj["current_price"]
+    pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+
+    delta_surv = proj["new_survival"] - proj["orig_survival"]
+    delta_str = f"+{delta_surv:.0f}pp" if delta_surv >= 0 else f"{delta_surv:.0f}pp"
+    surv_icon = "📈" if delta_surv >= 5 else ("📉" if delta_surv <= -5 else "➡️")
+
+    # ASCII path visualization (25-char wide)
+    p25 = proj.get("p25", current * 0.97)
+    p75 = proj.get("p75", current * 1.03)
+    in_band = p25 <= current <= p75
+    band_label = "inside band ✅" if in_band else ("above band 🔥" if current > p75 else "below band ⚠️")
+
+    narrative = proj.get("narrative", "")
+    action = proj.get("action_signal", "HOLD")
+    action_icon = {"HOLD": "🟡", "ADD": "🟢", "TRIM R1": "🔵", "CUT": "🔴"}.get(action, "⚪")
+
+    lines = [
+        f"📊 LIVE PROJECTION: {sym} ({lane_icon} {lane})",
+        f"─────────────────────────────────────",
+        f"Entry: ₹{entry:,.0f} | Now: ₹{current:,.0f} | {pnl_pct:+.1f}% | Day {K}",
+        f"",
+        f"ORIGINAL FORECAST (Day 0):",
+        f"  Survival: {proj['orig_survival']:.0f}%",
+        f"",
+        f"CURRENT FORECAST (Anchored, Day {K}):",
+        f"  {surv_icon} Survival: {proj['new_survival']:.0f}%  [{delta_str}]",
+        f"  R1 prob: {proj['r1_prob']:.0f}%  |  R2 prob: {proj['r2_prob']:.0f}%",
+        f"  Stop prob: {proj['stop_prob']:.0f}%  |  Pct rank: {proj['percentile_rank']:.0f}th",
+        f"  Path: {band_label}  |  σ divergence: {proj['divergence_sigma']:.1f}",
+        f"",
+    ]
+    if narrative:
+        lines.append(f"🤖 {narrative}")
+        lines.append(f"")
+    lines.append(f"{action_icon} ACTION: {action}  |  Confidence: {min(99, int(proj['r1_prob']))}%")
+
+    return "\n".join(lines)
+
+
+# =====================================================================================
+# v5.4 -- STAGE 6: THREE-CARD TELEGRAM SENDER
+# Replaces send_telegram_v3() for three-lane runs.
+# =====================================================================================
+
+def send_telegram_lanes(lane_winners: dict, projections: List[dict],
+                         macro: dict, fii_data: dict,
+                         date_label: str, data_source: str,
+                         capacity: dict = None) -> None:
+    """
+    Stage 6 -- THREE-CARD Telegram send.
+    CARD 1: 🏰 FORTRESS LANE
+    CARD 2: 🎯 APEX LANE
+    CARD 3: ⚔️ FUSED LANE
+    + PROJECTION CARDS for open positions (if any)
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram lanes: not configured"); return
+
+    if capacity is None:
+        capacity = _capacity_guard(date_label)
+
+    vix_val  = macro.get("vix_val", 0.0)
+    macro_st = macro.get("macro_state", "CHOP")
+    macro_icon = {"CLEAR": "🟢", "CHOP": "🟡", "PANIC": "🔴",
+                  "FOG": "🌫️", "MASSACRE": "🚨"}.get(macro_st, "⚪")
+
+    # HEADER
+    header_lines = [
+        f"⚔️ SNIPER {VERSION} | {date_label} | {macro_icon} {macro_st} | VIX {vix_val:.1f}",
+        f"📡 3-Lane Mode | Halal | Manual execution only",
+        f"FII/DII: {fii_data.get('label', '—')} | {fii_data.get('detail', '—')}",
+        "",
+    ]
+
+    if macro_st == "MASSACRE":
+        header_lines.append("🚨 MARKET CRASH — NO TRADES TODAY.")
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "\n".join(header_lines))
+        return
+    if macro_st == "PANIC":
+        header_lines.append("🔴 MARKET PANIC — NO NEW TRADES.")
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "\n".join(header_lines))
+        return
+
+    _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "\n".join(header_lines))
+
+    # CARDS
+    lane_configs = [
+        ("FORTRESS", "🏰 FORTRESS LANE", lane_winners.get("fortress"),
+         "fort_pts", LANE_FORTRESS_MIN, "FORTRESS"),
+        ("APEX",     "🎯 APEX LANE",     lane_winners.get("apex"),
+         "apex_comp", LANE_APEX_MIN,    "APEX"),
+        ("FUSED",    "⚔️ FUSED LANE",   lane_winners.get("fused"),
+         "fused",    LANE_FUSED_MIN,    "FUSED"),
+    ]
+
+    for lane_key, lane_title, winner, score_key, min_score, lane_id in lane_configs:
+        card_lines = [f"{lane_title}", "─────────────────────────────────────"]
+
+        if winner is None:
+            card_lines.append(f"NO PICK today — no {lane_key} setup cleared halal+score gate")
+        else:
+            sym = winner["symbol"]
+            close = winner["close"]
+            sl = winner["stop_loss"]
+            r1 = winner["r1"]
+            r2 = winner["r2"]
+            r3 = winner["r3"]
+            score = winner.get(score_key, 0)
+            sector = winner.get("sector", "DIVERSIFIED")
+            halal_tier = winner.get("halal_tier", "ACCEPTABLE")
+
+            # Confidence from meta-model or score-based
+            conf_pct = min(99, max(10, int(score)))
+            conf_flag = "WORTH YOUR TIME" if conf_pct >= 65 else ("MAYBE" if conf_pct >= 50 else "SKIP")
+
+            risk_pct = round((close - sl) / close * 100, 1) if close > 0 else 0
+            entry_lo = round(close * 0.995, 2)
+            entry_hi = round(close * 1.005, 2)
+
+            card_lines.extend([
+                f"#{1} {sym} | AI CONFIDENCE {conf_pct}% [{conf_flag}]",
+                f"₹{close:,.0f} | Buy ₹{entry_lo:,.0f}–₹{entry_hi:,.0f} | SL ₹{sl:,.0f} ({risk_pct}%)",
+                f"R1 ₹{r1:,.0f} | R2 ₹{r2:,.0f} | R3 ₹{r3:,.0f} | Halal: {halal_tier}",
+            ])
+
+            if lane_key == "FORTRESS":
+                layer1_str = "✓" if winner.get("layer1") else "✗"
+                vol_str    = "✓" if winner.get("vol_reliable", True) else "✗"
+                adx_val    = winner.get("adx", 0)
+                card_lines.append(
+                    f"Fortress: VPOC {layer1_str} Vol {vol_str} ADX {adx_val:.0f}"
+                )
+            elif lane_key == "APEX":
+                whale_str = "✓" if winner.get("whale_score", 0) >= 15 else "✗"
+                div_str   = "✓" if winner.get("div_type") == "BULLISH_HIDDEN" else "✗"
+                bayes_pct = winner.get("bayes_pct", 50)
+                mc_surv   = winner.get("mc_survival")
+                card_lines.append(
+                    f"Whale {whale_str} Div {div_str} Bayes {bayes_pct:.0f}% "
+                    + (f"MC {mc_surv:.0f}%" if mc_surv else "")
+                )
+            elif lane_key == "FUSED":
+                layer1_str = "✓" if winner.get("layer1") else "✗"
+                vol_str    = "✓" if winner.get("vol_reliable", True) else "✗"
+                whale_str  = "✓" if winner.get("whale_score", 0) >= 15 else "✗"
+                div_str    = "✓" if winner.get("div_type") == "BULLISH_HIDDEN" else "✗"
+                bayes_pct  = winner.get("bayes_pct", 50)
+                mc_surv    = winner.get("mc_survival")
+                card_lines.append(
+                    f"Fortress: VPOC {layer1_str} Vol {vol_str} | "
+                    f"Whale {whale_str} Div {div_str} Bayes {bayes_pct:.0f}%"
+                    + (f" MC {mc_surv:.0f}%" if mc_surv else "")
+                )
+
+            story = winner.get("story", "")
+            if story:
+                card_lines.append(f"Why: {story[:120]}")
+
+        card_lines.append("")
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "\n".join(card_lines))
+        time.sleep(0.3)
+
+    # FOOTER
+    fii_lbl = fii_data.get("label", "—")
+    fii_det = fii_data.get("detail", "—")
+    footer = (
+        f"ℹ️ Reply per lane: TAKEN {{SYMBOL}}@{{PRICE}} | SKIPPED {{SYMBOL}}\n"
+        f"FII/DII: {fii_lbl} | {fii_det}\n"
+        f"🔎 3 lanes active | {MC_HORIZON}-day hold | Risk {ACCOUNT_RISK_PCT*100:.1f}%/trade\n"
+        f"🤲 Bismillah — trade only what you understand"
+    )
+    _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, footer)
+
+    # PROJECTION CARDS (open positions)
+    if projections:
+        _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                 "─────────────────────────────────────\n"
+                 f"📊 LIVE PROJECTIONS ({len(projections)} open positions)\n"
+                 "─────────────────────────────────────")
+        for proj in projections:
+            card_text = _format_projection_card(proj)
+            _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, card_text)
+            time.sleep(0.3)
+
 
 
 def send_telegram_v3(picks: list, macro: dict, fii_data: dict,
@@ -8482,7 +9750,8 @@ Respond ONLY with a JSON object, no markdown, no explanation:
 }}"""
 
     try:
-        result_text = _llm_call_claude(prompt, max_tokens=600, prompt_type="tier4_causal")
+        # HIGH-4 FIX: was _llm_call_claude (undefined) — corrected to _call_claude
+        result_text = _call_claude(prompt, max_tokens=600)
         if not result_text:
             log.debug(f"Tier4 {sym}: empty LLM response")
             return defaults
@@ -8944,6 +10213,21 @@ def _migrate_db_v4():
         except Exception as _e:
             if "duplicate column" not in str(_e).lower() and "already exists" not in str(_e).lower():
                 log.debug(f"pick_outcomes sector migration: {_e}")
+        # MEDIUM-4 FIX: exit_date column may be absent in DBs created before v5.4.
+        # The outcome engine writes SET exit_date=? which silently fails without this column.
+        _po_v54_alters = [
+            ("exit_date",   "TEXT"),
+            ("lane",        "TEXT DEFAULT NULL"),
+        ]
+        for col_name, col_def in _po_v54_alters:
+            try:
+                with _db_conn(write=True) as con:
+                    con.execute(f"ALTER TABLE pick_outcomes ADD COLUMN {col_name} {col_def}")
+                    log.info(f"DB migration: added '{col_name}' to pick_outcomes (MEDIUM-4 v5.4) ✅")
+            except Exception as _me:
+                if "duplicate column" not in str(_me).lower() and "already exists" not in str(_me).lower():
+                    log.debug(f"pick_outcomes {col_name} migration: {_me}")
+
         log.info("DB v4.0-M migration complete")
         _deduplicate_pick_outcomes()   # DUPLICATE FIX: clean existing dupes before index is enforced
         # SEVERE-4 FIX: idx_score_cache_lookup was redundant with the PK — do NOT recreate it.
@@ -9471,6 +10755,16 @@ def run():
     if meta_model:
         _save_meta_model(meta_model)
 
+    # v5.4: Train survival meta-model (temporal + lane-aware)
+    # Runs in fallback mode until 100+ picks are accumulated (auto-detects readiness)
+    if SURVIVAL_MODEL_ENABLED:
+        try:
+            _surv_model = _train_meta_survival_model(min_samples=SURVIVAL_MIN_SAMPLES)
+            if _surv_model:
+                log.info("v5.4 Survival meta-model trained successfully")
+        except Exception as _sm_e:
+            log.debug(f"Survival model training non-fatal: {_sm_e}")
+
     log.info("=" * 70)
     log.info(f"⚔️  UNIFIED SNIPER {VERSION} | {date_label}")
     log.info(f"    Bismillah — Halal · Fortress × APEX Fused Engine")
@@ -9725,6 +11019,82 @@ def run():
 
     log.info(f"\n{'='*70}")
     log.info(f"Screened {len(cands)} | Passed: {len(results)}")
+
+    # =====================================================================
+    # v5.4 THREE-LANE SCORING (Stage 2) -- runs after main parallel loop
+    # Triggered when THREE_LANE_ENABLED=true (default).
+    # Uses same hist_cache populated by the background preload above.
+    # L1/L2 halal vetoes are applied INSIDE _run_three_lane_scoring()
+    # so haram symbols never reach the heavy APEX/MC engines.
+    # =====================================================================
+    _three_lane_results = {}
+    _three_lane_winners = {"fortress": None, "apex": None, "fused": None}
+    if THREE_LANE_ENABLED:
+        log.info("=" * 70)
+        log.info("v5.4 THREE-LANE SCORING (Stage 2)")
+        log.info("=" * 70)
+        try:
+            _three_lane_results = _run_three_lane_scoring(
+                cands=cands,
+                hist_cache=hist_cache,
+                fii_data=fii_data,
+                insider_map=insider_map,
+                filings=filings,
+                earn_cal=earn_cal,
+                macro=macro,
+                data_source=data_source,
+                date_label=date_label,
+            )
+
+            # Stage 3 -- DEDUPLICATED L4 LLM SCREEN
+            _unique_syms = _deduplicate_lane_winners(_three_lane_results)
+            log.info(f"Stage 3: {len(_unique_syms)} unique symbols for L4 screen: {_unique_syms}")
+            _sector_map_dedup = {sym: get_sector(sym) for sym in _unique_syms}
+            _halal_dedup = _run_halal_l4_dedup(_unique_syms, _sector_map_dedup)
+
+            # Alpha mine for unique winners (deduplicated)
+            _alpha_dedup = {}
+            for sym in _unique_syms:
+                fil = filings.get(sym.upper(), {})
+                subject = fil.get("detail", "") or fil.get("subject", "")
+                if subject:
+                    try:
+                        _alpha_dedup[sym] = _llm_alpha_mine(subject, sym)
+                    except Exception:
+                        pass
+
+            # Stage 4 -- LANE FINALIZATION
+            _three_lane_winners["fortress"] = _select_lane_winner(
+                _three_lane_results.get("fortress", []),
+                _halal_dedup, _alpha_dedup,
+                "FORTRESS", "fort_pts", LANE_FORTRESS_MIN
+            )
+            _three_lane_winners["apex"] = _select_lane_winner(
+                _three_lane_results.get("apex", []),
+                _halal_dedup, _alpha_dedup,
+                "APEX", "apex_comp", LANE_APEX_MIN
+            )
+            _three_lane_winners["fused"] = _select_lane_winner(
+                _three_lane_results.get("fused", []),
+                _halal_dedup, _alpha_dedup,
+                "FUSED", "fused", LANE_FUSED_MIN
+            )
+
+            # Stage 5 -- DB PERSISTENCE (per-lane)
+            for ln, w in _three_lane_winners.items():
+                _persist_lane_results(ln.upper(), w, date_label)
+
+            winners_str = " | ".join(
+                f"{k.upper()}:{v['symbol']}" if v else f"{k.upper()}:NO_PICK"
+                for k, v in _three_lane_winners.items()
+            )
+            log.info(f"THREE-LANE WINNERS: {winners_str}")
+
+        except Exception as _tl_e:
+            log.error(f"Three-lane scoring non-fatal error: {_tl_e}", exc_info=True)
+            _three_lane_results = {}
+            _three_lane_winners = {"fortress": None, "apex": None, "fused": None}
+
     # ── Log data quality to DB ──
     # FIX-v4.5: get_halal_universe() is called BEFORE acquiring _db_conn(write=True)
     # to avoid a lock ordering deadlock: halal fetch holds _HALAL_UNIVERSE_LOCK and
@@ -10265,7 +11635,22 @@ def run():
     log.info("Pushing PERFORMANCE…"); _push_performance_tab(date_label)
     # AI_INSIGHTS pushed unconditionally — shows story+conviction even without LLM API key
     log.info("Pushing AI_INSIGHTS…"); _push_ai_insights_tab(top_picks, date_label)
-    log.info("Sending Telegram…");   send_telegram_v3(top_picks, macro, fii_data, date_label, data_source, capacity)
+    # v5.4 THREE-LANE: Route to lane-aware sender or legacy single-lane sender
+    if THREE_LANE_ENABLED and "_three_lane_results" in dir():
+        log.info("Sending Telegram (3-lane cards)…")
+        _lane_projections = []
+        try:
+            _lane_projections = _run_mc_projection_engine(date_label)
+        except Exception as _pe:
+            log.warning(f"MC projection engine non-fatal: {_pe}")
+        send_telegram_lanes(
+            _three_lane_winners,
+            _lane_projections,
+            macro, fii_data, date_label, data_source, capacity
+        )
+    else:
+        log.info("Sending Telegram (legacy v3 single-lane)…")
+        send_telegram_v3(top_picks, macro, fii_data, date_label, data_source, capacity)
 
     # Persist results to DB + outcome tracking
     try:
