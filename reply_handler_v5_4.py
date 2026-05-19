@@ -98,17 +98,19 @@ if not TELEGRAM_CHAT_ID:
 
 # ── Patterns (case-insensitive) ───────────────────────────────────────────────
 # FIX-10: \s*[@:]?\s* before price captures compact notation "TAKEN TCS@3445"
+# Symbol charset extended to include hyphen for symbols like M&M-BE etc.
 _TAKEN   = re.compile(
     # BUG-1 FIX: allow @ or : immediately after symbol with no whitespace
     # Original: r"^TAKEN\s+([A-Z&]+)(?:\s+\s*[@:]?\s*([\d.]+))?"  — failed on "TAKEN TCS@3445"
     # Fixed:    (?:[\s@:]+\s*...) captures price whether space, @, or : separates it.
-    r"^TAKEN\s+([A-Z&]+)(?:[\s@:]+\s*([\d.]+))?",
+    r"^TAKEN\s+([A-Z&\-]+)(?:[\s@:]+\s*([\d.]+))?",
     re.I
 )
+_TAKEN_ALL = re.compile(r"^TAKEN?\s+ALL$", re.I)   # matches "TAKEN ALL" and "TAKE ALL"
 _SKIPPED = re.compile(r"^SKIPPED(?:\s+.*)?$", re.I)
-# FIX-11: PARTIAL — price and shares both explicitly preceded by space
+# FIX-11: PARTIAL — price optional (auto-fills from signal close); shares optional (defaults to 50)
 _PARTIAL = re.compile(
-    r"^PARTIAL\s+([A-Z&]+)(?:\s+[@:]?\s*([\d.]+)(?:\s+(\d+))?)?",
+    r"^PARTIAL\s+([A-Z&\-]+)(?:\s+[@:]?\s*([\d.]+)(?:\s+(\d+))?)?",
     re.I
 )
 _HELP    = re.compile(r"^(HELP|\?)$", re.I)
@@ -117,8 +119,12 @@ _HELP    = re.compile(r"^(HELP|\?)$", re.I)
 _CONFIRM = re.compile(r"^/confirm\s+#?(\d+)$", re.I)
 _SKIP_N  = re.compile(r"^/skip\s+#?(\d+)$", re.I)
 
-# H4: Strict symbol validator
-_SYMBOL_RE = re.compile(r"^[A-Z&]{1,20}$")
+# Symbol-level SKIP and bulk SKIP ALL
+_SKIP_RE    = re.compile(r"^SKIP(?:PED)?\s+([A-Z&\-]+)$", re.I)
+_SKIP_ALL_RE = re.compile(r"^SKIP(?:PED)?\s+ALL$", re.I)
+
+# H4: Strict symbol validator (hyphen allowed for e.g. M&M-BE)
+_SYMBOL_RE = re.compile(r"^[A-Z&\-]{1,20}$")
 
 # Price and shares limits
 _MAX_PRICE  = 1_000_000   # ₹10 lakh — no NSE stock trades above this
@@ -126,12 +132,15 @@ _MAX_SHARES = 100_000     # sanity cap
 
 _HELP_TEXT = (
     "📖 <b>SNIPER v5.0 reply commands:</b>\n"
-    "  <code>/confirm #1</code>                  — take today's pick #1\n"
-    "  <code>/confirm #2</code>                  — take today's pick #2\n"
-    "  <code>/skip #1</code>                     — skip today's pick #1\n"
-    "  <code>TAKEN SYM [@price]</code>           — log a trade entry by symbol\n"
-    "  <code>PARTIAL SYM [@price] [shares]</code>— log partial entry\n"
-    "  <code>HELP</code> or <code>?</code>                       — this message\n\n"
+    "  <code>/confirm #1</code>                      — take today's pick #1\n"
+    "  <code>/confirm #2</code>                      — take today's pick #2\n"
+    "  <code>/skip #1</code>                         — skip today's pick #1\n"
+    "  <code>TAKEN SYM [@price]</code>               — log entry (price optional, auto-fills)\n"
+    "  <code>TAKEN ALL</code>                         — log ALL today's picks as TAKEN\n"
+    "  <code>PARTIAL SYM [@price] [shares]</code>    — log partial entry (shares default 50)\n"
+    "  <code>SKIP SYM</code>                          — skip a specific symbol\n"
+    "  <code>SKIP ALL</code>                          — skip ALL today's picks\n"
+    "  <code>HELP</code> or <code>?</code>                           — this message\n\n"
     "ℹ️ No reply = SKIPPED (auto-logged after 30 min or at EOD).\n"
     "Only reply if you TOOK or PARTIALLY took a position."
 )
@@ -191,10 +200,12 @@ def _validate_price(raw_price: Optional[str], sym: str) -> Optional[float]:
     return price
 
 
-def _validate_shares(raw_shares: Optional[str], sym: str) -> int:
-    """FIX-5: Reject shares < 1 or > _MAX_SHARES."""
+def _validate_shares(raw_shares: Optional[str], sym: str, default: int = 50) -> int:
+    """FIX-5: Reject shares < 1 or > _MAX_SHARES.
+    If raw_shares is None, returns `default` (50) — per spec, omitting share count
+    defaults to 50 shares rather than logging 0 with a warning."""
     if raw_shares is None:
-        return 0
+        return default
     try:
         shares = int(raw_shares)
     except ValueError:
@@ -550,6 +561,92 @@ def process_updates() -> None:
             _send_ack(chat_id, f"📝 <b>/skip #{rank} — {sym} logged as SKIPPED.</b>")
             continue
 
+        # ── TAKEN ALL / TAKE ALL — mark every today's pick as TAKEN ─────────────
+        if _TAKEN_ALL.match(text):
+            try:
+                with _db_conn() as con:
+                    rows = con.execute(
+                        "SELECT symbol, close FROM sniper_results WHERE run_date = date('now','localtime')"
+                    ).fetchall()
+                if not rows:
+                    _send_ack(chat_id, "⚠️ No picks found for today. Nothing to mark as TAKEN.")
+                    continue
+                taken_syms = []
+                blocked_syms = []
+                with _db_conn() as con:
+                    for sym, price in rows:
+                        allowed, reason = _check_earnings_gate(sym)
+                        if not allowed:
+                            blocked_syms.append(f"{sym} ({reason})")
+                            continue
+                        entry_price = float(price or 0)
+                        _log_decision(con, sym, "TAKEN", entry_price=entry_price)
+                        taken_syms.append(f"{sym} @ ₹{entry_price:,.0f}")
+                ack_lines = []
+                if taken_syms:
+                    ack_lines.append(f"✅ <b>{len(taken_syms)} pick(s) marked as TAKEN:</b>")
+                    ack_lines += [f"  • {s}" for s in taken_syms]
+                    ack_lines.append("Bismillah 🤲 — trade with discipline.")
+                if blocked_syms:
+                    ack_lines.append(f"\n⛔ <b>{len(blocked_syms)} blocked (earnings gate):</b>")
+                    ack_lines += [f"  • {s}" for s in blocked_syms]
+                _send_ack(chat_id, "\n".join(ack_lines))
+                log.info(f"TAKEN ALL: {len(taken_syms)} logged, {len(blocked_syms)} blocked")
+            except Exception as e:
+                log.error(f"TAKEN ALL DB error: {e}")
+                _send_ack(chat_id, "⚠️ TAKEN ALL failed — DB error. Please retry.")
+            continue
+
+        # ── SKIP ALL — mark every today's pick as SKIPPED ────────────────────
+        if _SKIP_ALL_RE.match(text):
+            try:
+                today = datetime.today().strftime("%Y-%m-%d")
+                with _db_conn() as con:
+                    rows = con.execute(
+                        "SELECT symbol FROM sniper_results WHERE run_date = ?",
+                        (today,)
+                    ).fetchall()
+                if not rows:
+                    _send_ack(chat_id, "⚠️ No picks found for today. Nothing to skip.")
+                    continue
+                with _db_conn() as con:
+                    skipped_syms = []
+                    for (sym,) in rows:
+                        _log_decision(con, sym, "SKIPPED", skip_reason="manual_all")
+                        skipped_syms.append(sym)
+                ack = f"📝 <b>{len(skipped_syms)} pick(s) marked as SKIPPED:</b>\n"
+                ack += "\n".join(f"  • {s}" for s in skipped_syms)
+                _send_ack(chat_id, ack)
+                log.info(f"SKIP ALL: {len(skipped_syms)} picks marked SKIPPED")
+            except Exception as e:
+                log.error(f"SKIP ALL DB error: {e}")
+                _send_ack(chat_id, "⚠️ SKIP ALL failed — DB error. Please retry.")
+            continue
+
+        # ── SKIP SYMBOL — skip a single named symbol ──────────────────────────
+        m_skip_sym = _SKIP_RE.match(text)
+        if m_skip_sym:
+            try:
+                sym = _sanitize_symbol(m_skip_sym.group(1))
+            except ValueError as ve:
+                _send_ack(chat_id, f"⚠️ {ve}")
+                continue
+            try:
+                with _db_conn() as con:
+                    sig = _get_todays_signal(con, sym)
+                    if sig.get("close") is None:
+                        _send_ack(chat_id,
+                            f"⚠️ <code>{sym}</code> not in today's picks — "
+                            "check ticker and try again.")
+                        continue
+                    _log_decision(con, sym, "SKIPPED", skip_reason="manual_reply")
+            except Exception as e:
+                log.error(f"SKIP {sym} DB error: {e}")
+                _send_ack(chat_id, f"⚠️ Could not log SKIP {sym} — DB error. Please retry.")
+                continue
+            _send_ack(chat_id, f"📝 <b>{sym}</b> logged as SKIPPED.")
+            continue
+
         # ── TAKEN & PARTIAL — share one DB connection ─────────────────────────
         m_taken   = _TAKEN.match(text)
         m_partial = _PARTIAL.match(text)
@@ -643,10 +740,7 @@ def process_updates() -> None:
             if shares:
                 ack += f" | <b>{shares:,} shares</b>"
             else:
-                ack += (
-                    f"\n⚠️ No share count given. "
-                    f"Reply <code>PARTIAL {sym} @{price:.0f} [shares]</code> to correct."
-                )
+                ack += f" | <b>50 shares</b> (default — reply <code>PARTIAL {sym} @{price:.0f} [shares]</code> to correct)"
             if sig.get("position_size_tier"):
                 ack += f"\n   Recommended size tier: {sig['position_size_tier']}"
             _send_ack(chat_id, ack)
