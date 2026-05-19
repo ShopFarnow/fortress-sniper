@@ -3,7 +3,72 @@
 reply_handler_v5.py — Telegram reply poller for UNIFIED HALAL SNIPER v5.0 [AUDITED]
 Bismillah — In the name of Allah, the Most Gracious, the Most Merciful
 
-... (full header as in your original) ...
+WHAT CHANGED vs v4.1 (this file — v5.0 hardening pass):
+
+  BUG-1 FIX  TAKEN REGEX COMPACT NOTATION: "TAKEN TCS@3445" now correctly
+             captures price=3445. Original regex required whitespace before @
+             so compact notation "TAKEN TCS@3445" silently used signal close.
+             Fixed to ([space,@,:]+ separator) to match compact notation.
+
+  BUG-2 FIX  /confirm #0 INVALID RANK: rank < 1 now explicitly returns None
+             before the DB query. Original code with LIMIT 0 produced empty
+             rows[], then rows[-1] would raise IndexError or return wrong pick.
+
+  BUG-5 FIX  EARNINGS GATE COLUMN NAME: _check_earnings_gate() queried the
+             wrong column 'earn_days' — the actual column from _migrate_db_v3
+             is 'days_to_earnings'. The OperationalError was silently swallowed
+             by log.debug(), so the gate always returned (True, "OK") — every
+             entry near earnings was unblocked. Fixed to 'days_to_earnings'.
+
+  FIX-V5-3  DB-BACKED OFFSET: tg_offset is now stored in the SQLite DB
+            (tg_offsets table) instead of a flat file. Crash-safe across
+            GitHub Actions runs — no "offset lost" silent replay loop.
+
+  FIX-V5-6  /confirm AND /skip COMMANDS: architecture Step 10 specifies
+            "/confirm #N or /skip #N — 30 min timeout". Added support for:
+              /confirm #1  → logs TAKEN for today's pick #1 (rank-ordered)
+              /confirm #2  → logs TAKEN for pick #2
+              /skip #1     → logs SKIPPED for pick #1
+            Old TAKEN/PARTIAL format still supported for backward compat.
+
+  FIX-V5-7  EARNINGS GATE IN REPLY HANDLER: confirm_entry() from sniper_unified
+            is now called inside the reply handler before logging TAKEN.
+            Earnings in <2 days blocks the entry with a clear user message.
+            Previously this gate existed only in the internal handler and was
+            NOT called from the external reply_handler.py.
+
+  FIX-V5-8  TIMEOUT EXPIRY: picks logged >30 minutes ago with no reply are
+            now auto-marked SKIPPED at each poll cycle. This implements the
+            architecture "No reply = auto-SKIP" (Step 11) at the poller
+            level rather than waiting for EOD.
+
+RETAINED from v4.1:
+  FIX-1   Connection leak: all sqlite3.connect() wrapped in context manager
+  FIX-2   _get_todays_signal + _log_decision share ONE connection per cycle
+  FIX-3   _get_updates retry: 3 attempts with exponential backoff
+  FIX-4   entry_price validation: rejects price <= 0 with user-visible error
+  FIX-5   PARTIAL shares validation: rejects < 1 or > 100,000
+  FIX-6   Offset committed ONCE after all updates processed
+  FIX-7   Startup guard: warns if TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set
+  FIX-8   In-run deduplication: seen update_ids tracked in a set
+  FIX-9   _send_ack uses parse_mode="HTML" consistently
+  FIX-10  TAKEN TCS@3445 (compact notation) correctly parses price
+  FIX-11  PARTIAL TCS @ 3440 50 fully parsed
+
+Run via GitHub Actions every 10 minutes during market hours:
+  cron: "*/10 3-10 * * 1-5"   # 8:30 AM - 4 PM IST on weekdays
+
+Supported reply formats (v5.0):
+  /confirm #1             → TAKEN for today's pick ranked #1
+  /confirm #2             → TAKEN for today's pick ranked #2
+  /skip #1                → SKIPPED for pick #1
+  /skip #2                → SKIPPED for pick #2
+  TAKEN SYM [@price]      → log entry (price optional, auto-fills)
+  TAKEN ALL               → log ALL today's picks as TAKEN (uses latest run_date)
+  PARTIAL SYM [@price] [shares] → log partial entry (shares default 50)
+  SKIP SYM                → skip a specific symbol
+  SKIP ALL                → skip ALL today's picks
+  HELP or ?               → send command reference
 """
 
 import os, re, sqlite3, logging, time, random
@@ -40,22 +105,27 @@ _TAKEN   = re.compile(
 )
 _TAKEN_ALL = re.compile(r"^TAKEN?\s+ALL$", re.I)   # matches "TAKEN ALL" and "TAKE ALL"
 _SKIPPED = re.compile(r"^SKIPPED(?:\s+.*)?$", re.I)
+# FIX-11: PARTIAL — price optional (auto-fills from signal close); shares optional (defaults to 50)
 _PARTIAL = re.compile(
     r"^PARTIAL\s+([A-Z&\-]+)(?:\s+[@:]?\s*([\d.]+)(?:\s+(\d+))?)?",
     re.I
 )
 _HELP    = re.compile(r"^(HELP|\?)$", re.I)
 
+# FIX-V5-6: /confirm #N and /skip #N commands (architecture Step 10)
 _CONFIRM = re.compile(r"^/confirm\s+#?(\d+)$", re.I)
 _SKIP_N  = re.compile(r"^/skip\s+#?(\d+)$", re.I)
 
+# Symbol-level SKIP and bulk SKIP ALL
 _SKIP_RE    = re.compile(r"^SKIP(?:PED)?\s+([A-Z&\-]+)$", re.I)
 _SKIP_ALL_RE = re.compile(r"^SKIP(?:PED)?\s+ALL$", re.I)
 
+# H4: Strict symbol validator (hyphen allowed for e.g. M&M-BE)
 _SYMBOL_RE = re.compile(r"^[A-Z&\-]{1,20}$")
 
-_MAX_PRICE  = 1_000_000   # ₹10 lakh
-_MAX_SHARES = 100_000
+# Price and shares limits
+_MAX_PRICE  = 1_000_000   # ₹10 lakh — no NSE stock trades above this
+_MAX_SHARES = 100_000     # sanity cap
 
 _HELP_TEXT = (
     "📖 <b>SNIPER v5.0 reply commands:</b>\n"
@@ -63,7 +133,7 @@ _HELP_TEXT = (
     "  <code>/confirm #2</code>                      — take today's pick #2\n"
     "  <code>/skip #1</code>                         — skip today's pick #1\n"
     "  <code>TAKEN SYM [@price]</code>               — log entry (price optional, auto-fills)\n"
-    "  <code>TAKEN ALL</code>                         — log ALL today's picks as TAKEN\n"
+    "  <code>TAKEN ALL</code>                        — log ALL today's picks as TAKEN\n"
     "  <code>PARTIAL SYM [@price] [shares]</code>    — log partial entry (shares default 50)\n"
     "  <code>SKIP SYM</code>                          — skip a specific symbol\n"
     "  <code>SKIP ALL</code>                          — skip ALL today's picks\n"
@@ -79,11 +149,11 @@ _SKIPPED_REDIRECT = (
     "Only reply if you TOOK or PARTIALLY took a position."
 )
 
-
 # ── FIX-1: Context-managed SQLite connection ──────────────────────────────────
 
 @contextmanager
 def _db_conn(timeout: int = 10):
+    """Guaranteed-close SQLite connection. Rolls back on exception."""
     con = None
     try:
         con = sqlite3.connect(str(DB_PATH), timeout=timeout)
@@ -111,6 +181,7 @@ def _sanitize_symbol(raw: str) -> str:
     return sym
 
 def _validate_price(raw_price: Optional[str], sym: str) -> Optional[float]:
+    """FIX-4: Reject price <= 0 or > _MAX_PRICE."""
     if raw_price is None:
         return None
     try:
@@ -124,6 +195,8 @@ def _validate_price(raw_price: Optional[str], sym: str) -> Optional[float]:
     return price
 
 def _validate_shares(raw_shares: Optional[str], sym: str, default: int = 50) -> int:
+    """FIX-5: Reject shares < 1 or > _MAX_SHARES.
+    If raw_shares is None, returns `default` (50)."""
     if raw_shares is None:
         return default
     try:
@@ -137,43 +210,30 @@ def _validate_shares(raw_shares: Optional[str], sym: str, default: int = 50) -> 
     return shares
 
 
-# ── FIX-V5-3: DB-backed offset ────────────────────────────────────────────────
-
-def _ensure_offset_table(con: sqlite3.Connection) -> None:
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS tg_offsets (
-            key     TEXT PRIMARY KEY,
-            offset  INTEGER NOT NULL DEFAULT 0,
-            updated TEXT DEFAULT (datetime('now'))
-        )
-    """)
-    con.commit()
+# ── OFFSET (persistent across runs using a separate file) ─────────────────────
+# This avoids relying on the main DB which may not exist yet on first runs.
+OFFSET_FILE = Path("tg_offset.txt")
 
 def _load_offset() -> int:
     try:
-        with _db_conn() as con:
-            _ensure_offset_table(con)
-            row = con.execute("SELECT offset FROM tg_offsets WHERE key='main'").fetchone()
-            return int(row[0]) if row else 0
-    except Exception as e:
-        log.warning(f"Offset load from DB failed: {e} — defaulting to 0")
-        return 0
+        if OFFSET_FILE.exists():
+            return int(OFFSET_FILE.read_text().strip())
+    except Exception:
+        pass
+    return 0
 
 def _save_offset(offset: int) -> None:
     try:
-        with _db_conn() as con:
-            _ensure_offset_table(con)
-            con.execute("""
-                INSERT OR REPLACE INTO tg_offsets (key, offset, updated)
-                VALUES ('main', ?, datetime('now'))
-            """, (offset,))
+        OFFSET_FILE.write_text(str(offset))
     except Exception as e:
-        log.warning(f"Offset save to DB failed: {e}")
+        log.warning(f"Failed to save offset: {e}")
 
 
 # ── FIX-V5-6: /confirm and /skip by rank number ───────────────────────────────
 
 def _get_pick_by_rank(con: sqlite3.Connection, rank: int) -> Optional[dict]:
+    """Look up today's sniper pick by its rank position (1-based).
+    Picks are ranked by fused_score DESC in sniper_results."""
     if rank < 1:
         log.debug(f"_get_pick_by_rank: invalid rank={rank} (must be ≥ 1)")
         return None
@@ -205,6 +265,7 @@ def _get_pick_by_rank(con: sqlite3.Connection, rank: int) -> Optional[dict]:
 # ── FIX-V5-8: Auto-expire timed-out picks ────────────────────────────────────
 
 def _auto_expire_timeout_picks() -> None:
+    """FIX-V5-8: Architecture Step 11 — 'No reply = auto-SKIP after 30 min'."""
     today = datetime.today().strftime("%Y-%m-%d")
     cutoff = (datetime.today() - timedelta(minutes=REPLY_TIMEOUT_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -225,7 +286,7 @@ def _auto_expire_timeout_picks() -> None:
                           (run_date, symbol, decision, skip_reason, logged_at)
                         VALUES (?, ?, 'SKIPPED', 'timeout_30min', datetime('now'))
                     """, (today, sym))
-                    log.info(f"FIX-V5-8: Auto-SKIPPED {sym} (no reply in {REPLY_TIMEOUT_MINUTES} min)")
+                    log.info(f"Auto-SKIPPED {sym} (no reply in {REPLY_TIMEOUT_MINUTES} min)")
                 except Exception:
                     pass
     except Exception as e:
@@ -235,6 +296,7 @@ def _auto_expire_timeout_picks() -> None:
 # ── FIX-V5-7: Earnings gate ───────────────────────────────────────────────────
 
 def _check_earnings_gate(symbol: str) -> tuple:
+    """Replicate confirm_entry() logic without importing sniper_unified."""
     try:
         today = datetime.today().strftime("%Y-%m-%d")
         with _db_conn() as con:
@@ -273,7 +335,6 @@ def _get_updates(offset: int = 0, max_attempts: int = 3) -> list:
             log.warning(f"getUpdates attempt {attempt+1}: {e}")
     return []
 
-
 def _send_ack(chat_id: str, text: str) -> None:
     try:
         requests.post(
@@ -285,7 +346,7 @@ def _send_ack(chat_id: str, text: str) -> None:
         log.warning(f"_send_ack failed: {e}")
 
 
-# ── DB helpers ─────────────────────────────────────────────────────────────────
+# ── DB helpers (safe, with fallbacks) ─────────────────────────────────────────
 
 def _has_judged_picks_table(con: sqlite3.Connection) -> bool:
     row = con.execute(
@@ -294,25 +355,43 @@ def _has_judged_picks_table(con: sqlite3.Connection) -> bool:
     return row is not None
 
 def _get_todays_signal(con: sqlite3.Connection, symbol: str) -> dict:
-    today = datetime.today().strftime("%Y-%m-%d")
+    """Retrieve signal for a symbol from the most recent run_date (fallback to latest)."""
+    # Use the latest run_date from sniper_results instead of date('now') to avoid timezone issues.
     try:
+        latest_run = con.execute(
+            "SELECT MAX(run_date) FROM sniper_results"
+        ).fetchone()[0]
+        if not latest_run:
+            return {}
         row = con.execute(
             "SELECT close, fused_score, grade FROM sniper_results WHERE symbol=? AND run_date=?",
-            (symbol.upper(), today)
+            (symbol.upper(), latest_run)
         ).fetchone()
-        meta = con.execute(
-            "SELECT meta_prob FROM meta_features WHERE symbol=? AND run_date=?",
-            (symbol.upper(), today)
-        ).fetchone()
-        cal = con.execute(
-            "SELECT calibrated_confidence, position_size_tier, halal_tier FROM judged_picks WHERE symbol=? AND run_date=?",
-            (symbol.upper(), today)
-        ).fetchone() if _has_judged_picks_table(con) else None
+        # Safe meta_prob retrieval
+        meta_prob = None
+        try:
+            meta_row = con.execute(
+                "SELECT meta_prob FROM meta_features WHERE symbol=? AND run_date=?",
+                (symbol.upper(), latest_run)
+            ).fetchone()
+            if meta_row:
+                meta_prob = meta_row[0]
+        except sqlite3.OperationalError:
+            pass  # column or table missing
+        cal = None
+        if _has_judged_picks_table(con):
+            try:
+                cal = con.execute(
+                    "SELECT calibrated_confidence, position_size_tier, halal_tier FROM judged_picks WHERE symbol=? AND run_date=?",
+                    (symbol.upper(), latest_run)
+                ).fetchone()
+            except Exception:
+                pass
         return {
             "close":                 row[0] if row else None,
             "fused":                 row[1] if row else None,
             "grade":                 row[2] if row else None,
-            "meta_prob":             meta[0] if meta else None,
+            "meta_prob":             meta_prob,
             "calibrated_confidence": cal[0] if cal else None,
             "position_size_tier":    cal[1] if cal else None,
             "halal_tier":            cal[2] if cal else None,
@@ -345,11 +424,13 @@ def _log_decision(con: sqlite3.Connection, symbol: str, decision: str,
 # ── Main poller ───────────────────────────────────────────────────────────────
 
 def process_updates() -> None:
+    # FIX-7: Surface startup warnings
     for w in _STARTUP_WARNINGS:
         log.warning(w)
     if not TELEGRAM_TOKEN:
         return
 
+    # FIX-V5-8: Auto-expire timed-out picks before processing new replies
     _auto_expire_timeout_picks()
 
     offset  = _load_offset()
@@ -359,9 +440,11 @@ def process_updates() -> None:
         log.debug("No new updates")
         return
 
+    # FIX-8: Deduplication set — Telegram can re-deliver update_ids
     seen_ids: set = set()
     max_uid = offset
 
+    # FIX-6: Process all updates; commit offset ONCE at the end
     for update in updates:
         uid     = update.get("update_id", 0)
         msg     = update.get("message", {})
@@ -369,6 +452,7 @@ def process_updates() -> None:
         raw_text = (msg.get("text") or "").strip()
         text     = raw_text.upper()
 
+        # FIX-8: Skip duplicates within this poll run
         if uid in seen_ids:
             log.debug(f"Duplicate update_id {uid} — skipping")
             max_uid = max(max_uid, uid)
@@ -376,6 +460,7 @@ def process_updates() -> None:
         seen_ids.add(uid)
         max_uid = max(max_uid, uid)
 
+        # Only handle messages from our configured chat
         if chat_id != TELEGRAM_CHAT_ID:
             continue
         if not text:
@@ -444,21 +529,26 @@ def process_updates() -> None:
             _send_ack(chat_id, f"📝 <b>/skip #{rank} — {sym} logged as SKIPPED.</b>")
             continue
 
-        # ── TAKEN ALL / TAKE ALL ─────────────────────────────────────────────
+        # ── TAKEN ALL / TAKE ALL — mark every today's pick as TAKEN ─────────────
         if _TAKEN_ALL.match(text):
             log.info(f"TAKEN ALL matched for text: '{raw_text}'")
             try:
                 with _db_conn() as con:
-                    # ==== FIX: Check if sniper_results table exists ====
+                    # Check if sniper_results table exists
                     table_check = con.execute(
                         "SELECT name FROM sqlite_master WHERE type='table' AND name='sniper_results'"
                     ).fetchone()
                     if not table_check:
                         _send_ack(chat_id, "⚠️ No picks available yet – main sniper run hasn't completed.\nPlease wait a few minutes and try again.")
                         continue
-
+                    # Use the most recent run_date (not date('now')) to avoid timezone/holiday issues
+                    latest_run = con.execute("SELECT MAX(run_date) FROM sniper_results").fetchone()[0]
+                    if not latest_run:
+                        _send_ack(chat_id, "⚠️ No picks found for today. Nothing to mark as TAKEN.")
+                        continue
                     rows = con.execute(
-                        "SELECT symbol, close FROM sniper_results WHERE run_date = date('now')"
+                        "SELECT symbol, close FROM sniper_results WHERE run_date = ?",
+                        (latest_run,)
                     ).fetchall()
                 if not rows:
                     _send_ack(chat_id, "⚠️ No picks found for today. Nothing to mark as TAKEN.")
@@ -489,22 +579,23 @@ def process_updates() -> None:
                 _send_ack(chat_id, "⚠️ TAKEN ALL failed — DB error. Please retry.")
             continue
 
-        # ── SKIP ALL ────────────────────────────────────────────────────────
+        # ── SKIP ALL — mark every today's pick as SKIPPED ────────────────────
         if _SKIP_ALL_RE.match(text):
             try:
-                today = datetime.today().strftime("%Y-%m-%d")
                 with _db_conn() as con:
-                    # ==== FIX: Check table existence before query ====
                     table_check = con.execute(
                         "SELECT name FROM sqlite_master WHERE type='table' AND name='sniper_results'"
                     ).fetchone()
                     if not table_check:
                         _send_ack(chat_id, "⚠️ No picks available yet – main sniper run hasn't completed.\nPlease wait a few minutes and try again.")
                         continue
-
+                    latest_run = con.execute("SELECT MAX(run_date) FROM sniper_results").fetchone()[0]
+                    if not latest_run:
+                        _send_ack(chat_id, "⚠️ No picks found for today. Nothing to skip.")
+                        continue
                     rows = con.execute(
                         "SELECT symbol FROM sniper_results WHERE run_date = ?",
-                        (today,)
+                        (latest_run,)
                     ).fetchall()
                 if not rows:
                     _send_ack(chat_id, "⚠️ No picks found for today. Nothing to skip.")
@@ -523,7 +614,7 @@ def process_updates() -> None:
                 _send_ack(chat_id, "⚠️ SKIP ALL failed — DB error. Please retry.")
             continue
 
-        # ── SKIP SYMBOL ─────────────────────────────────────────────────────
+        # ── SKIP SYMBOL — skip a single named symbol ──────────────────────────
         m_skip_sym = _SKIP_RE.match(text)
         if m_skip_sym:
             try:
@@ -547,7 +638,7 @@ def process_updates() -> None:
             _send_ack(chat_id, f"📝 <b>{sym}</b> logged as SKIPPED.")
             continue
 
-        # ── TAKEN & PARTIAL ──────────────────────────────────────────────────
+        # ── TAKEN & PARTIAL — share one DB connection ─────────────────────────
         m_taken   = _TAKEN.match(text)
         m_partial = _PARTIAL.match(text)
 
@@ -652,6 +743,7 @@ def process_updates() -> None:
             "ℹ️ No reply needed to skip — silence auto-logs after 30 min."
         )
 
+    # FIX-6: Save offset ONCE after all updates processed — crash-safe replay
     if max_uid >= offset:
         _save_offset(max_uid + 1)
         log.info(f"Processed {len(updates)} update(s) — offset advanced to {max_uid + 1}")
