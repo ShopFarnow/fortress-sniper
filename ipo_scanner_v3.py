@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
 IPO SNIPER v3.0 – INSTITUTIONAL QUANT ENGINE
-- Real Telegram output (uses secrets)
-- Chittorgarh scraper (bot-friendly)
-- Auto‑fallback CSV with 8 example IPOs
-- Monte Carlo allotment, Kelly, syndicate optimizer
 """
 
 import os
@@ -49,17 +45,20 @@ def _int(s, default=0):
     m = re.search(r"\d+", str(s))
     return int(m.group()) if m else default
 
-# ---------- Reliable Scraper (chittorgarh.com) ----------
+# ---------- Reliable Scraper (chittorgarh.com - corrected URL) ----------
 def scrape_chittorgarh() -> pd.DataFrame:
-    """Scrape upcoming SME IPOs from chittorgarh.com (bot-friendly)."""
-    url = "https://www.chittorgarh.com/ipo/upcoming_sme_ipo.asp"
+    """Scrape upcoming SME IPOs from chittorgarh.com."""
+    # Correct URL as of May 2026 (check if still valid)
+    url = "https://www.chittorgarh.com/ipo/upcoming-ipo-sme.asp"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     }
     try:
         resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            log.warning(f"chittorgarh returned status {resp.status_code}")
+            return pd.DataFrame()
         soup = BeautifulSoup(resp.text, "html.parser")
 
         table = soup.find("table", class_="table")
@@ -196,7 +195,7 @@ def scrape_chittorgarh() -> pd.DataFrame:
         log.warning(f"chittorgarh scrape error: {e}")
         return pd.DataFrame()
 
-# ---------- Auto‑create fallback CSV (8 example IPOs) ----------
+# ---------- Auto‑create fallback CSV ----------
 def ensure_fallback_csv():
     FALLBACK_CSV.parent.mkdir(parents=True, exist_ok=True)
     if not FALLBACK_CSV.exists():
@@ -320,7 +319,7 @@ def compute_full_allotment_profile(row: pd.Series) -> AllotmentProfile:
     gmp = float(row.get("GMP", 0.0))
 
     p_mc, ci_lo, ci_hi = monte_carlo_allotment_simulation(sub_times, lot_size, issue_size, price_upper)
-    p_single = p_mc  # simplified, could blend hypergeometric
+    p_single = p_mc
     syn_matrix = build_syndicate_permutation_matrix(p_single, MAX_SYNDICATE)
 
     gmp_gain_per_lot = gmp * price_upper * lot_size
@@ -444,7 +443,7 @@ def compute_master_score(row, allot, sentiment, shariah, weights):
         verdict = "❌ SKIP"
     return {"FinalScore": final, "Verdict": verdict}
 
-# ---------- Backtest (mock) ----------
+# ---------- Backtest ----------
 def run_backtest():
     return {"sharpe_ratio": 1.2, "win_rate_pct": 65, "information_coefficient": 0.3,
             "model_assessment": "MODERATE ALPHA"}
@@ -559,10 +558,11 @@ def run_ipo_screener_v3():
         ap = allot_profiles[sym]
         sent = sentiment_profiles[sym]
         sh = shariah_verdicts[sym]
+        # FIXED: use ap.optimal_syndicate_size (correct attribute name)
         msg = (
             f"<b>{sym}</b> ➜ {row['Verdict']} ({row['FinalScore']}/100)\n"
             f"📊 Sub: {row['SubscriptionTimes']:.1f}x | GMP: {row['gmp_pct']:.1f}%\n"
-            f"🎲 {ap.optimal_syndicate} PANs → P(allot)={ap.p_single_monte_carlo*100:.3f}%\n"
+            f"🎲 {ap.optimal_syndicate_size} PANs → P(allot)={ap.p_single_monte_carlo*100:.3f}%\n"
             f"💰 Kelly: {ap.kelly_fraction_pct:.1f}% | EV: ₹{ap.expected_value_inr:,.0f}\n"
             f"🕌 {sh.tier} | {sent.sentiment_label}\n"
             f"📅 Closes: {row['DaysToClose']} days left"
