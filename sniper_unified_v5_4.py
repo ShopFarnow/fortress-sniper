@@ -8271,67 +8271,85 @@ def _select_lane_winner(lane_results, halal_map, alpha_mine_map, lane_name,
         r["halal_score"] = halal.get("score", 50)
         r["alpha_mine"] = alpha_mine_map.get(sym, {})
 
-        # ---- Add lane metadata & derived fields ----
+        # ---- Add lane metadata & derived fields (INDENTED INSIDE LOOP) ----
         r["lane"] = lane_name
 
         if lane_name == "FORTRESS":
-            # fort_pts is out of 200 (FORT_TOTAL_MAX)
-            r["fort_pts"] = r.get("fort_pts", 0)
-            r["fort_pct"] = (r["fort_pts"] / 200) * 100   # 0-100
-            r["apex_composite"] = 0.0                     # not used for FORTRESS lane
-            # grade based on fort_pct (or could be based on fused)
-            fort_pct_val = r["fort_pct"]
-            if fort_pct_val >= 82:
-                r["grade"] = "APEX"
-            elif fort_pct_val >= 72:
-                r["grade"] = "PRISTINE"
-            elif fort_pct_val >= 60:
-                r["grade"] = "GOOD"
-            else:
-                r["grade"] = "PROBE"
-            # fused already computed (fort_pts/200*100)
+            # fort_pts out of 200
+            r["fort_pct"] = (r.get("fort_pts", 0) / 200) * 100
+            r["apex_composite"] = 0.0
             r["fused"] = r["fort_pct"]
+            # Grade based on fort_pct
+            fp = r["fort_pct"]
+            if fp >= 82:   r["grade"] = "APEX"
+            elif fp >= 72: r["grade"] = "PRISTINE"
+            elif fp >= 60: r["grade"] = "GOOD"
+            else:          r["grade"] = "PROBE"
+
+            # Add missing trade plan fields
+            close = r.get("close", 0)
+            stop = r.get("stop_loss", close * 0.95)
+            r["buy_lo"] = round(close * 0.995, 2)
+            r["buy_hi"] = round(close * 1.005, 2)
+            r["risk_pct"] = round((close - stop) / close * 100, 2) if close > 0 else 0
+
+            # Ensure other common fields exist (use defaults if missing)
+            r.setdefault("vol_reliable", True)
+            r.setdefault("layer1", False)
+            r.setdefault("layer2", False)
+            r.setdefault("layer3", False)
+            r.setdefault("mfi", 50)
+            r.setdefault("adx", 0)
+            r.setdefault("rsi", 50)
+            r.setdefault("whale_score", 0)
+            r.setdefault("div_score", 0)
+            r.setdefault("bayes_pct", 50)
+            r.setdefault("mc_survival", 0)
 
         elif lane_name == "APEX":
             r["apex_composite"] = r.get("apex_comp", 0)
-            r["fort_pct"] = 0.0                     # not used for APEX lane
-            # grade based on apex_composite
-            apex_val = r["apex_composite"]
-            if apex_val >= 82:
-                r["grade"] = "APEX"
-            elif apex_val >= 72:
-                r["grade"] = "PRISTINE"
-            elif apex_val >= 60:
-                r["grade"] = "GOOD"
-            else:
-                r["grade"] = "PROBE"
-            # fused = apex_composite (since only APEX score matters)
-            r["fused"] = apex_val
+            r["fort_pct"] = 0.0
+            r["fused"] = r["apex_composite"]
+            # Grade based on apex_composite
+            ap = r["apex_composite"]
+            if ap >= 82:   r["grade"] = "APEX"
+            elif ap >= 72: r["grade"] = "PRISTINE"
+            elif ap >= 60: r["grade"] = "GOOD"
+            else:          r["grade"] = "PROBE"
+
+            close = r.get("close", 0)
+            stop = r.get("stop_loss", close * 0.95)
+            r["buy_lo"] = round(close * 0.995, 2)
+            r["buy_hi"] = round(close * 1.005, 2)
+            r["risk_pct"] = round((close - stop) / close * 100, 2) if close > 0 else 0
+
+            # Set defaults for other fields
+            r.setdefault("vol_reliable", True)
+            r.setdefault("layer1", False)
+            r.setdefault("layer2", False)
+            r.setdefault("layer3", False)
+            r.setdefault("mfi", 50)
+            r.setdefault("adx", 0)
+            r.setdefault("rsi", 50)
+            r.setdefault("whale_score", 0)
+            r.setdefault("div_score", 0)
+            r.setdefault("bayes_pct", 50)
+            r.setdefault("mc_survival", 0)
 
         elif lane_name == "FUSED":
-            # fused already exists (from assemble_pick)
-            # ensure fort_pct and apex_composite are present (if missing, set sensible defaults)
-            if "fort_pct" not in r:
-                r["fort_pct"] = r.get("fort_pct", 0.0)
-            if "apex_composite" not in r:
-                r["apex_composite"] = r.get("apex_composite", 0.0)
-            if "grade" not in r:
-                r["grade"] = r.get("grade", "PROBE")
-            # fused already there
+            # Already has most fields; just ensure defaults for missing ones
+            r.setdefault("buy_lo", r.get("close", 0) * 0.995)
+            r.setdefault("buy_hi", r.get("close", 0) * 1.005)
+            r.setdefault("risk_pct", 0)
 
-        # Also add other common fields that might be used in logging later
+        # Add story if missing (fortress_score already provides one)
         if "story" not in r:
             r["story"] = f"{lane_name} lane selection"
-        if "vol_reliable" not in r:
-            r["vol_reliable"] = True
-        if "layer1" not in r:
-            r["layer1"] = False
-        # ... add any other keys the logging expects (see the error line context)
 
         log.info(f"LANE {lane_name} WINNER: {sym} | {min_score_key}={score:.0f} | halal={r['halal_tier']}")
         return r
 
-    log.info(f"LANE {lane_name}: NO PICK ...")
+    log.info(f"LANE {lane_name}: NO PICK (no symbol passed score+halal gate)")
     return None
                             
 def _persist_lane_results(lane_name: str, winner: Optional[dict],
