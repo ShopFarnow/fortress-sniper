@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SME IPO SNIPER – Halal IPO Screener with Time‑to‑Close Dynamics
-Reuses halal_ai_screen() from sniper_unified_v5_5.py.
+Reuses halal_ai_screen() from sniper_unified_v5_4.py.
 """
 
 import os
@@ -20,7 +20,7 @@ import requests
 from bs4 import BeautifulSoup
 
 # Import your existing halal engine (ensure the file is in the same directory)
-from sniper_unified_v5_5 import (
+from sniper_unified_v5_4 import (
     halal_ai_screen,
     _tg_post,
     _db_conn,
@@ -400,7 +400,7 @@ def send_ipo_telegram(df: pd.DataFrame, macro_state: str, vix: float, date_label
     lines.append(f"🤲 Bismillah – trade only what you understand")
     full_msg = "\n".join(lines)
     # Split if needed (reuse _split_msg from sniper)
-    from sniper_unified_v5_5 import _split_msg
+    from sniper_unified_v5_4 import _split_msg
     for chunk in _split_msg(full_msg, 4000):
         _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, chunk)
 
@@ -416,7 +416,7 @@ def run_ipo_screener():
     init_ipo_db()
 
     # Fetch macro regime from your sniper (reuse function)
-    from sniper_unified_v5_5 import fetch_macro_regime, _get_macro
+    from sniper_unified_v5_4 import fetch_macro_regime, _get_macro
     macro = _get_macro()
     macro_state = macro.get("macro_state", "CHOP")
     vix = macro.get("vix_val", 18.0)
