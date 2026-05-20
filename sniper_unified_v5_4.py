@@ -8271,13 +8271,62 @@ def _select_lane_winner(lane_results, halal_map, alpha_mine_map, lane_name,
         r["halal_score"] = halal.get("score", 50)
         r["alpha_mine"] = alpha_mine_map.get(sym, {})
 
-        # 👇 ADD THIS BLOCK 👇
+        # ---- Add lane metadata & derived fields ----
         r["lane"] = lane_name
+
         if lane_name == "FORTRESS":
-            r["fused"] = (r.get("fort_pts", 0) / 200) * 100
+            # fort_pts is out of 200 (FORT_TOTAL_MAX)
+            r["fort_pts"] = r.get("fort_pts", 0)
+            r["fort_pct"] = (r["fort_pts"] / 200) * 100   # 0-100
+            r["apex_composite"] = 0.0                     # not used for FORTRESS lane
+            # grade based on fort_pct (or could be based on fused)
+            fort_pct_val = r["fort_pct"]
+            if fort_pct_val >= 82:
+                r["grade"] = "APEX"
+            elif fort_pct_val >= 72:
+                r["grade"] = "PRISTINE"
+            elif fort_pct_val >= 60:
+                r["grade"] = "GOOD"
+            else:
+                r["grade"] = "PROBE"
+            # fused already computed (fort_pts/200*100)
+            r["fused"] = r["fort_pct"]
+
         elif lane_name == "APEX":
-            r["fused"] = r.get("apex_comp", 0)
-        # For FUSED lane, r["fused"] already exists
+            r["apex_composite"] = r.get("apex_comp", 0)
+            r["fort_pct"] = 0.0                     # not used for APEX lane
+            # grade based on apex_composite
+            apex_val = r["apex_composite"]
+            if apex_val >= 82:
+                r["grade"] = "APEX"
+            elif apex_val >= 72:
+                r["grade"] = "PRISTINE"
+            elif apex_val >= 60:
+                r["grade"] = "GOOD"
+            else:
+                r["grade"] = "PROBE"
+            # fused = apex_composite (since only APEX score matters)
+            r["fused"] = apex_val
+
+        elif lane_name == "FUSED":
+            # fused already exists (from assemble_pick)
+            # ensure fort_pct and apex_composite are present (if missing, set sensible defaults)
+            if "fort_pct" not in r:
+                r["fort_pct"] = r.get("fort_pct", 0.0)
+            if "apex_composite" not in r:
+                r["apex_composite"] = r.get("apex_composite", 0.0)
+            if "grade" not in r:
+                r["grade"] = r.get("grade", "PROBE")
+            # fused already there
+
+        # Also add other common fields that might be used in logging later
+        if "story" not in r:
+            r["story"] = f"{lane_name} lane selection"
+        if "vol_reliable" not in r:
+            r["vol_reliable"] = True
+        if "layer1" not in r:
+            r["layer1"] = False
+        # ... add any other keys the logging expects (see the error line context)
 
         log.info(f"LANE {lane_name} WINNER: {sym} | {min_score_key}={score:.0f} | halal={r['halal_tier']}")
         return r
