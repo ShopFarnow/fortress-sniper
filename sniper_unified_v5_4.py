@@ -8305,6 +8305,18 @@ def _select_lane_winner(lane_results, halal_map, alpha_mine_map, lane_name,
             r.setdefault("div_score", 0)
             r.setdefault("bayes_pct", 50)
             r.setdefault("mc_survival", 0)
+            r.setdefault("score_fortress", r.get("fort_pts", 0))
+            r.setdefault("score_fii", 0)
+            r.setdefault("score_insider", 0)
+            r.setdefault("score_filing", 0)
+            r.setdefault("score_earnings", 0)
+            r.setdefault("vp_score", 0)
+            r.setdefault("pat_score", 0)
+            r.setdefault("trail_stop", r.get("stop_loss", 0))
+            r.setdefault("poc", r.get("vpoc", 0))
+            r.setdefault("ma200", 0)
+            r.setdefault("atr14", 0.0)
+            r.setdefault("data_quality", "FORTRESS_LANE")
 
         elif lane_name == "APEX":
             r["apex_composite"] = r.get("apex_comp", 0)
@@ -8335,12 +8347,36 @@ def _select_lane_winner(lane_results, halal_map, alpha_mine_map, lane_name,
             r.setdefault("div_score", 0)
             r.setdefault("bayes_pct", 50)
             r.setdefault("mc_survival", 0)
+            r.setdefault("score_fortress", 0)
+            r.setdefault("score_fii", 0)
+            r.setdefault("score_insider", 0)
+            r.setdefault("score_filing", 0)
+            r.setdefault("score_earnings", 0)
+            r.setdefault("vp_score", 0)
+            r.setdefault("pat_score", 0)
+            r.setdefault("trail_stop", r.get("stop_loss", 0))
+            r.setdefault("poc", r.get("vpoc", 0))
+            r.setdefault("ma200", 0)
+            r.setdefault("atr14", 0.0)
+            r.setdefault("data_quality", "APEX_LANE")
 
         elif lane_name == "FUSED":
             # Already has most fields; just ensure defaults for missing ones
             r.setdefault("buy_lo", r.get("close", 0) * 0.995)
             r.setdefault("buy_hi", r.get("close", 0) * 1.005)
             r.setdefault("risk_pct", 0)
+            r.setdefault("score_fortress", r.get("fort_pct", 0))
+            r.setdefault("score_fii", 0)
+            r.setdefault("score_insider", 0)
+            r.setdefault("score_filing", 0)
+            r.setdefault("score_earnings", 0)
+            r.setdefault("vp_score", 0)
+            r.setdefault("pat_score", 0)
+            r.setdefault("trail_stop", r.get("stop_loss", 0))
+            r.setdefault("poc", r.get("vpoc", 0))
+            r.setdefault("ma200", 0)
+            r.setdefault("atr14", 0.0)
+            r.setdefault("data_quality", "FUSED_LANE")
 
         # Add story if missing (fortress_score already provides one)
         if "story" not in r:
@@ -9210,18 +9246,37 @@ def save_html(picks: list, fii_data: dict, date_label: str):
         for i,r in enumerate(picks,1):
             layers="".join("✓" if r.get(f"layer{n}") else "✗" for n in range(1,4))
             vol_warn='' if r.get("vol_reliable",True) else '<span style="color:#dc2626;font-size:10px"> ⚠️ No Volume</span>'
+            _fused      = r.get('fused', r.get('fort_pts', 0))
+            _fort_pct   = float(r.get('fort_pct', 0))
+            _apex       = r.get('apex_composite', r.get('apex_comp', 0))
+            _grade      = r.get('grade', '—')
+            _buy_lo     = r.get('buy_lo', r.get('close', 0))
+            _buy_hi     = r.get('buy_hi', r.get('close', 0))
+            _stop_loss  = r.get('stop_loss', 0)
+            _r1         = r.get('r1', 0)
+            _r2         = r.get('r2', 0)
+            _r3         = r.get('r3', 0)
+            _whale      = float(r.get('whale_score', 0))
+            _div        = float(r.get('div_score', 0))
+            _vp         = float(r.get('vp_score', 0))
+            _pat        = float(r.get('pat_score', 0))
+            _bayes      = r.get('bayes_pct', 50)
+            _mc         = r.get('mc_survival', '—')
+            _rsi        = r.get('rsi', 0)
+            _mfi        = r.get('mfi', 50)
+            _adx        = r.get('adx', 0)
             rows+=f"""<tr>
               <td>{i}</td>
-              <td><b>{r['symbol']}</b><br><small>{r.get('sector','—')}</small>{vol_warn}</td>
-              <td>{r['fused']}/100<br>
-                  <small style="color:#6b7280">Fort {r['fort_pct']:.0f}% · APEX {r['apex_composite']}</small><br>
-                  <small style="color:#7c3aed">{r['grade']}</small></td>
-              <td><small>Buy ₹{r['buy_lo']}–{r['buy_hi']}<br>SL ₹{r['stop_loss']}<br>R1 ₹{r['r1']} / R2 ₹{r['r2']} / R3 ₹{r['r3']}</small></td>
+              <td><b>{r.get('symbol','—')}</b><br><small>{r.get('sector','—')}</small>{vol_warn}</td>
+              <td>{_fused}/100<br>
+                  <small style="color:#6b7280">Fort {_fort_pct:.0f}% · APEX {_apex}</small><br>
+                  <small style="color:#7c3aed">{_grade}</small></td>
+              <td><small>Buy ₹{_buy_lo}–{_buy_hi}<br>SL ₹{_stop_loss}<br>R1 ₹{_r1} / R2 ₹{_r2} / R3 ₹{_r3}</small></td>
               <td><small>
-                <b>Whale</b> {r['whale_score']:.0f} · <b>Div</b> {r['div_score']:.0f} · <b>VP</b> {r['vp_score']:.0f}<br>
-                <b>Pat</b> {r['pat_score']:.0f} · <b>Bayes</b> {r['bayes_pct']}% · <b>MC</b> {r['mc_survival']}%<br>
+                <b>Whale</b> {_whale:.0f} · <b>Div</b> {_div:.0f} · <b>VP</b> {_vp:.0f}<br>
+                <b>Pat</b> {_pat:.0f} · <b>Bayes</b> {_bayes}% · <b>MC</b> {_mc}%<br>
                 VPOC {layers} | {r.get('regime','—')} | {r.get('vcp_coil','—')[:5]}<br>
-                RSI {r['rsi']} | MFI {r['mfi']} | ADX {r['adx']}
+                RSI {_rsi} | MFI {_mfi} | ADX {_adx}
               </small></td>
               <td><small style="color:#555;font-style:italic">{r.get('story','—')}</small></td>
             </tr>"""
@@ -9412,19 +9467,36 @@ def push_gsheets(picks: list, date_label: str):
     ]
     rows = [headers]
     for r in picks:
+        # Use .get() with safe defaults — fortress/apex lane picks do not carry
+        # every field that fused picks have (score_fortress, vp_score, etc.)
         rows.append([
-            date_label, r["symbol"], r.get("sector","—"), r.get("grade","—"),
-            r["fused"], r["fort_pct"], r["apex_composite"],
-            r["score_fortress"], r["score_fii"], r["score_insider"],
-            r["score_filing"], r["score_earnings"],
-            r["whale_score"], r["div_score"], r["vp_score"], r["pat_score"],
-            r["bayes_pct"], r.get("mc_survival","—"),
-            r["buy_lo"], r["buy_hi"], r["stop_loss"],
-            r["r1"], r["r2"], r["r3"], r["trail_stop"],
-            int(r["layer1"]), int(r["layer2"]), int(r["layer3"]),  # ← FIXED: bool → int (1/0)
+            date_label, r.get("symbol","—"), r.get("sector","—"), r.get("grade","—"),
+            r.get("fused", r.get("fort_pts", 0)),
+            r.get("fort_pct", r.get("fort_pts", 0)),
+            r.get("apex_composite", r.get("apex_comp", 0)),
+            r.get("score_fortress", r.get("fort_pts", 0)),
+            r.get("score_fii", 0),
+            r.get("score_insider", 0),
+            r.get("score_filing", 0),
+            r.get("score_earnings", 0),
+            r.get("whale_score", 0),
+            r.get("div_score", 0),
+            r.get("vp_score", 0),
+            r.get("pat_score", 0),
+            r.get("bayes_pct", 50.0),
+            r.get("mc_survival", "—"),
+            r.get("buy_lo", r.get("close", 0)),
+            r.get("buy_hi", r.get("close", 0)),
+            r.get("stop_loss", 0),
+            r.get("r1", 0), r.get("r2", 0), r.get("r3", 0),
+            r.get("trail_stop", r.get("stop_loss", 0)),
+            int(r.get("layer1", False)),
+            int(r.get("layer2", False)),
+            int(r.get("layer3", False)),
             r.get("vcp_coil","—"), r.get("regime","—"),
-            r["rsi"], r["mfi"], r["adx"], r["atr14"], r["poc"], r["ma200"],
-            r.get("data_quality","—"), int(r.get("vol_reliable",True)),  # ← FIXED: bool → int
+            r.get("rsi", 0), r.get("mfi", 50.0), r.get("adx", 0),
+            r.get("atr14", 0), r.get("poc", r.get("vpoc", 0)), r.get("ma200", 0),
+            r.get("data_quality","—"), int(r.get("vol_reliable", True)),
             r.get("story","—"),
         ])
     _push_sheet("SCREENER", rows)
@@ -12444,14 +12516,14 @@ def run():
     _cold_label = "" if _meta_model_trained else " (COLD)"
     for rank, r in enumerate(top_picks, 1):
         vn = "" if r.get("vol_reliable",True) else " [NO-VOL]"
-        log.info(f"  #{rank} {r['symbol']:12s} | Fused {r['fused']}/100 | Fort {r['fort_pct']:.0f}% "
-                 f"| APEX {r['apex_composite']}/100 | {r['grade']}{vn} "
+        log.info(f"  #{rank} {r.get('symbol','?'):12s} | Fused {r.get('fused', r.get('fort_pts',0))}/100 | Fort {float(r.get('fort_pct',0)):.0f}% "
+                 f"| APEX {r.get('apex_composite', r.get('apex_comp',0))}/100 | {r.get('grade','—')}{vn} "
                  f"| AI {round(r.get('meta_prob',0.55)*100)}% [{r.get('worth_flag','—')}] "
                  f"| Halal: {r.get('halal_detail',{}).get('tier','?')}/{r.get('halal_detail',{}).get('score','?')}"
                  f"| Cal: {r.get('calibrated_confidence',r.get('meta_prob',0)):.0%}{_cold_label} | Size: {r.get('position_size_tier','?')}")
-        log.info(f"       Buy ₹{r['buy_lo']}-{r['buy_hi']} | SL ₹{r['stop_loss']} | "
-                 f"R1 ₹{r['r1']} | R2 ₹{r['r2']} | MC {r['mc_survival']}%")
-        log.info(f"       {r['story'][:80]}")
+        log.info(f"       Buy ₹{r.get('buy_lo', r.get('close',0))}-{r.get('buy_hi', r.get('close',0))} | SL ₹{r.get('stop_loss',0)} | "
+                 f"R1 ₹{r.get('r1',0)} | R2 ₹{r.get('r2',0)} | MC {r.get('mc_survival','—')}%")
+        log.info(f"       {str(r.get('story','—'))[:80]}")
     # 8. Outputs  (Performance sheet is now written inside save_excel)
     # FIX-EXCEL: pass top_picks (post-judge) as BOTH positional args so the
     # "Top Picks" sheet contains calibrated_confidence, position_size_tier,
@@ -12524,8 +12596,8 @@ def run():
                 con.execute(
                     "INSERT OR IGNORE INTO sniper_results (run_date,symbol,grade,fused_score,close,stop_loss,r1,r2,r3,story,sector) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (date_label,r["symbol"],r["grade"],r["fused"],r["close"],
-                     r["stop_loss"],r["r1"],r["r2"],r["r3"],r["story"],r.get("sector","DIVERSIFIED"))
+                    (date_label,r.get("symbol"),r.get("grade"),r.get("fused",r.get("fort_pts",0)),r.get("close",0),
+                     r.get("stop_loss",0),r.get("r1",0),r.get("r2",0),r.get("r3",0),r.get("story",""),r.get("sector","DIVERSIFIED"))
                 )
                 # outcome tracking (initial state)
                 # FIX-PERF: include sector so _push_performance_tab can query
@@ -12534,8 +12606,8 @@ def run():
                 con.execute(
                     "INSERT OR IGNORE INTO pick_outcomes (run_date,symbol,entry_price,stop_loss,r1,r2,r3,grade,fused_score,sector,story,status) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (date_label,r["symbol"],r["close"],r["stop_loss"],r["r1"],r["r2"],r["r3"],
-                     r["grade"],r["fused"],r.get("sector","DIVERSIFIED"),r["story"],"open")
+                    (date_label,r.get("symbol"),r.get("close",0),r.get("stop_loss",0),r.get("r1",0),r.get("r2",0),r.get("r3",0),
+                     r.get("grade",""),r.get("fused",r.get("fort_pts",0)),r.get("sector","DIVERSIFIED"),r.get("story",""),"open")
                 )
                 # v3.0-M: store setup_profile in meta_features for personalized learning
                 try:
