@@ -255,22 +255,35 @@ def ensure_fallback_csv():
         log.info(f"Created fallback CSV with {len(df)} real IPOs at {FALLBACK_CSV}")
 
 def fetch_unified_calendar() -> pd.DataFrame:
-    """Fetch live data from Chittorgarh (SME + Mainboard) using hybrid scraper."""
-    # CORRECT URLs from your screenshots
-    sme_url = "https://www.chittorgarh.com/ipo/sme-ipo-2026.asp"
-    mainboard_url = "https://www.chittorgarh.com/ipo/mainboard-ipo-2026.asp"
+    """
+    Orchestrates ingestion routines across updated Chittorgarh paths.
+    Patched to support deep logging visibility and defensive asset structure checks.
+    """
+    # FIXED ENDPOINTS: Active directory paths for DRHP Filed reports
+    sme_url = "https://www.chittorgarh.com/report/sme-ipo-drhp-filed-status/158/"
+    mainboard_url = "https://www.chittorgarh.com/report/ipo-drhp-filed-status/158/"
 
-    log.info("Connecting to Chittorgarh Data feeds...")
+    # Use INFO level so these critical parameters trace safely to GitHub Actions consoles
+    log.info(f"Initiating connection to target data streams...")
+    log.info(f"📡 Channels: SME -> {sme_url} | Mainboard -> {mainboard_url}")
+    
     sme_df = scrape_chittorgarh_table(sme_url, "SME")
+    log.info(f"📊 Live data parsed: SME Vector -> [{len(sme_df)} assets]")
+    
     main_df = scrape_chittorgarh_table(mainboard_url, "Mainboard")
+    log.info(f"📊 Live data parsed: Mainboard Vector -> [{len(main_df)} assets]")
     
     combined = pd.concat([sme_df, main_df], ignore_index=True)
 
     if not combined.empty:
-        log.info(f"🎯 Execution Engine Synchronized: Parsed {len(combined)} active operational entries.")
-        return combined
+        # DEFENSIVE CHECK: Verify core identity keys exist before allowing calculation execution
+        if "Symbol" in combined.columns:
+            log.info(f"🎯 Execution Engine Synchronized: Parsed {len(combined)} active operational entries.")
+            return combined
+        else:
+            log.warning("⚠️ Critical Identity key 'Symbol' missing from extracted array. Deploying fallback.")
 
-    # Fallback Execution Protocol
+    # Fallback Overrides Protocol
     ensure_fallback_csv()
     if FALLBACK_CSV.exists():
         try:
