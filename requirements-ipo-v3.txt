@@ -3,7 +3,4 @@ beautifulsoup4>=4.12.0
 pandas>=2.1.0
 numpy>=1.26.0
 lxml>=4.9.0
-vaderSentiment>=3.3.2
-pytrends>=4.9.0
 scipy>=1.11.0
-aiohttp>=3.8.0
