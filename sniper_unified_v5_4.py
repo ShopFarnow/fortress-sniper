@@ -8251,17 +8251,14 @@ def _select_lane_winner(lane_results, halal_map, alpha_mine_map, lane_name,
         sym = r["symbol"]
         score = r.get(min_score_key, 0.0)
         if score < min_score:
-            log.info(f"LANE {lane_name}: {sym} below score gate "
-                     f"({min_score_key}={score:.1f} < {min_score})")
+            log.info(f"LANE {lane_name}: {sym} below score gate ...")
             continue
 
         halal = halal_map.get(sym, {})
         if halal.get("veto", False):
-            log.info(f"LANE {lane_name}: {sym} vetoed by L4 halal — "
-                     f"{halal.get('veto_reason','?')}")
+            log.info(f"LANE {lane_name}: {sym} vetoed by L4 halal ...")
             continue
 
-        # Halal score must be ≥60 (same as calibrated_ai_judge)
         if halal.get("score", 0) < 60:
             log.info(f"LANE {lane_name}: {sym} halal score {halal.get('score')} < 60 -- skipped")
             continue
@@ -8273,12 +8270,21 @@ def _select_lane_winner(lane_results, halal_map, alpha_mine_map, lane_name,
         r["halal_tier"] = halal.get("tier", "ACCEPTABLE")
         r["halal_score"] = halal.get("score", 50)
         r["alpha_mine"] = alpha_mine_map.get(sym, {})
+
+        # 👇 ADD THIS BLOCK 👇
+        r["lane"] = lane_name
+        if lane_name == "FORTRESS":
+            r["fused"] = (r.get("fort_pts", 0) / 200) * 100
+        elif lane_name == "APEX":
+            r["fused"] = r.get("apex_comp", 0)
+        # For FUSED lane, r["fused"] already exists
+
         log.info(f"LANE {lane_name} WINNER: {sym} | {min_score_key}={score:.0f} | halal={r['halal_tier']}")
         return r
 
-    log.info(f"LANE {lane_name}: NO PICK (no symbol passed score+halal gate)")
+    log.info(f"LANE {lane_name}: NO PICK ...")
     return None
-
+                            
 def _persist_lane_results(lane_name: str, winner: Optional[dict],
                            date_label: str) -> None:
     """Stage 5 -- DB persistence with lane tag."""
