@@ -308,8 +308,8 @@ def _parse_chitt_table(table, ipo_type: str) -> pd.DataFrame:
         size  = _flt(_c("size", "50"), 50.0)
         lo, hi = _parse_price_band(_c("price", "100"))
         lot   = _int(_c("lot", "1000")) or (1000 if sector == "SME" else 50)
-        close_dt = _parse_date(_c("close", "")) or (TODAY + timedelta(days=10))
-
+        # DRHP entries have no close date; give them 30 days to stay visible
+close_dt = _parse_date(_c("close", "")) or (TODAY + timedelta(days=30))
         gmp_raw = _flt(_c("gmp", "0"), 0.0)
         gmp = gmp_raw / 100 if gmp_raw > 1 else gmp_raw
 
