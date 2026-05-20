@@ -1,4 +1,4 @@
-name: SME IPO Snapshot
+name: SME IPO Snapshot v3.0
 
 on:
   schedule:
@@ -9,7 +9,7 @@ on:
 jobs:
   ipo-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -24,37 +24,40 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-ipo-${{ hashFiles('requirements-ipo.txt') }}
-          restore-keys: ${{ runner.os }}-pip-ipo-
+          key: ${{ runner.os }}-pip-ipo-v3-${{ hashFiles('requirements-ipo-v3.txt') }}
+          restore-keys: ${{ runner.os }}-pip-ipo-v3-
 
       - name: Install dependencies
         run: |
-          pip install -r requirements-ipo.txt
-          # Also install sentence-transformers if not present (optional for RAG, but we keep minimal)
-          pip install sentence-transformers>=2.2.2
+          pip install --upgrade pip
+          pip install -r requirements-ipo-v3.txt
 
-      - name: Restore DB cache (halal cache & IPO DB)
+      - name: Restore DB cache (IPO v3 DB)
         uses: actions/cache@v4
         with:
-          path: outputs
-          key: sniper-db-ipo-${{ github.run_id }}
-          restore-keys: sniper-db-ipo-
+          path: data
+          key: sniper-db-ipo-v3-${{ github.run_id }}
+          restore-keys: sniper-db-ipo-v3-
 
-      - name: Run IPO Screener
+      - name: Run IPO Screener v3
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          # IPO specific (optional)
-          IPO_FALLBACK_CSV: data/ipo_fallback.csv
-        run: python ipo_scanner.py
+          # Optional for Google Trends (create a dedicated Gmail account)
+          GOOGLE_USERNAME: ${{ secrets.GOOGLE_USERNAME }}
+          GOOGLE_PASSWORD: ${{ secrets.GOOGLE_PASSWORD }}
+        run: python ipo_scanner_v3.py
 
       - name: Upload IPO DB as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ipo-db
-          path: outputs/ipo_cache.db
+          name: ipo-sniper-v3-db
+          path: data/ipo_sniper_v3.db
+          retention-days: 7
+
+      - name: Upload backtest results
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: data/backtest/*.json
           retention-days: 7
