@@ -255,6 +255,28 @@ def fetch_unified_calendar() -> pd.DataFrame:
             
     return pd.DataFrame()
 
+# ---------- MISSING DATACLASS DEFINITIONS (ADDED) ----------
+@dataclass
+class SentimentProfile:
+    symbol: str
+    vader_score: float
+    trends_velocity: float
+    trends_peak: float
+    forum_buzz_score: float
+    composite_sentiment: float
+    sentiment_label: str
+
+@dataclass
+class ShariahVerdict:
+    symbol: str
+    tier: str
+    barakah_index: float
+    najash_alert: bool
+    qabda_mandate: str
+    deferred_issues: List[str]
+    composite_halal_score: float
+    fatwa_reference: str
+
 # ---------- Allotment Probability Engine ----------
 @dataclass
 class AllotmentProfile:
@@ -467,6 +489,8 @@ def send_telegram(message: str):
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
         resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code != 200:
+            log.error(f"Telegram API error: {resp.text}")
     except Exception as e:
         log.error(f"Telegram execution exception: {e}")
 
