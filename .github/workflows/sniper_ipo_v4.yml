@@ -1,8 +1,8 @@
-name: SME IPO Snapshot v3.0
+name: IPO Sniper v4.0
 
 on:
   schedule:
-    - cron: '30 4 * * *'
+    - cron: '30 4 * * *'   # daily 10:00 AM IST
   workflow_dispatch:
 
 jobs:
@@ -23,30 +23,31 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-ipo-v3-${{ hashFiles('requirements-ipo-v3.txt') }}
-          restore-keys: ${{ runner.os }}-pip-ipo-v3-
+          key: ${{ runner.os }}-pip-ipo-v4-${{ hashFiles('requirements-v4.txt') }}
+          restore-keys: ${{ runner.os }}-pip-ipo-v4-
 
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements-ipo-v3.txt
+          pip install -r requirements-v4.txt
+          playwright install --with-deps chromium
 
       - name: Restore DB cache
         uses: actions/cache@v4
         with:
           path: data
-          key: sniper-db-ipo-v3-${{ github.run_id }}
-          restore-keys: sniper-db-ipo-v3-
+          key: sniper-db-ipo-v4-${{ github.run_id }}
+          restore-keys: sniper-db-ipo-v4-
 
-      - name: Run IPO Screener v3
+      - name: Run IPO Sniper v4
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python ipo_scanner_v3.py
+        run: python ipo_scanner_v4.py
 
       - name: Upload DB artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ipo-sniper-v3-db
-          path: data/ipo_sniper_v3.db
+          name: ipo-sniper-v4-db
+          path: data/ipo_sniper_v4.db
           retention-days: 7
