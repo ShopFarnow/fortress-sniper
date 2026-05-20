@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IPO SNIPER v3.0 – INSTITUTIONAL QUANT ENGINE (Mainboard + SME)
+IPO SNIPER v3.0 – INSTITUTIONAL QUANT ENGINE (Mainboard + SME) - UPDATED SCRAPER
 """
 
 import os
@@ -45,7 +45,7 @@ def _int(s, default=0):
     m = re.search(r"\d+", str(s))
     return int(m.group()) if m else default
 
-# ---------- Scraper for ONE table (works for both SME and Mainboard) ----------
+# ---------- UPDATED SCRAPER ----------
 def scrape_chittorgarh_table(url: str, ipo_type: str) -> pd.DataFrame:
     """Scrape IPO table from a given chittorgarh URL."""
     headers = {
@@ -59,9 +59,19 @@ def scrape_chittorgarh_table(url: str, ipo_type: str) -> pd.DataFrame:
             return pd.DataFrame()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        table = soup.find("table", class_="table")
+        # Updated to find the table in the new report page structure
+        table = soup.find("table", class_="chitt-table")
         if not table:
-            table = soup.find("table", {"id": "ipoTable"})
+            # Fallback to other common table classes
+            table = soup.find("table", class_="table")
+        if not table:
+            table = soup.find("table", class_="dataTable")
+        if not table:
+            # Try to find any table with at least 2 rows
+            for tbl in soup.find_all("table"):
+                if len(tbl.find_all("tr")) > 1:
+                    table = tbl
+                    break
         if not table:
             log.warning(f"No table found for {ipo_type}")
             return pd.DataFrame()
@@ -70,22 +80,38 @@ def scrape_chittorgarh_table(url: str, ipo_type: str) -> pd.DataFrame:
         if len(rows) < 2:
             return pd.DataFrame()
 
-        # Headers
+        # Headers - check first row for th or td
         header_row = rows[0]
-        headers = [th.get_text(strip=True).lower() for th in header_row.find_all("th")]
+        headers = []
+        for cell in header_row.find_all(["th", "td"]):
+            text = cell.get_text(strip=True).lower()
+            if text and text != "compare":  # Skip "Compare" button column
+                headers.append(text)
+
+        # If no headers found, use column indices
+        if not headers:
+            headers = [f"col_{i}" for i in range(len(rows[0].find_all(["th", "td"])))]
+
         col_map = {}
         for i, h in enumerate(headers):
-            if "company" in h:
+            if "company" in h or "name" in h:
                 col_map["symbol"] = i
-            elif "issue price" in h or "price" in h:
-                col_map["price"] = i
-            elif "total issue amount" in h or "issue size" in h:
+            elif "offer type" in h:
+                col_map["offer_type"] = i
+            elif "sale type" in h:
+                col_map["sale_type"] = i
+            elif "drhp filing date" in h or "filing date" in h:
+                col_map["filing_date"] = i
+            elif "sebi approval date" in h or "approval date" in h:
+                col_map["approval_date"] = i
+            elif "estimated issue size" in h or "issue size" in h:
                 col_map["issue_size"] = i
-            elif "closing date" in h or "close" in h:
-                col_map["close_date"] = i
-            elif "opening date" in h:
-                col_map["open_date"] = i
+            elif "exchange" in h:
+                col_map["exchange"] = i
+            elif "industry" in h:
+                col_map["industry"] = i
 
+        # If no column mapping found, use first column as symbol
         if "symbol" not in col_map:
             col_map["symbol"] = 0
 
@@ -97,54 +123,108 @@ def scrape_chittorgarh_table(url: str, ipo_type: str) -> pd.DataFrame:
             if len(cols) < 4:
                 continue
 
-            symbol = cols[col_map["symbol"]].get_text(strip=True)
-            if not symbol or symbol.lower() in ("company", "name"):
+            # Get symbol from the cell
+            symbol_cell = cols[col_map["symbol"]]
+            symbol_text = symbol_cell.get_text(strip=True)
+            # If there's a link inside, get the text
+            link = symbol_cell.find("a")
+            if link:
+                symbol = link.get_text(strip=True)
+            else:
+                symbol = symbol_text
+
+            if not symbol or symbol.lower() in ("company", "name", "compare"):
                 continue
 
-            # Price (Issue Price)
-            price_text = cols[col_map.get("price", 1)].get_text(strip=True) if "price" in col_map else ""
-            price_lower = price_upper = 0.0
-            if "to" in price_text.lower():
-                parts = re.split(r'\sto\s', price_text, flags=re.IGNORECASE)
-                if len(parts) == 2:
-                    try:
-                        price_lower = float(parts[0].strip())
-                        price_upper = float(parts[1].strip())
-                    except: pass
-            else:
-                try:
-                    price_upper = float(price_text)
-                    price_lower = price_upper
-                except: pass
-
-            # Issue Size (in Crore)
-            issue_text = cols[col_map.get("issue_size", 2)].get_text(strip=True) if "issue_size" in col_map else ""
+            # Extract issue size (Estimated Issue Size column)
             issue_size = 0.0
-            match = re.search(r"[\d,.]+", issue_text)
-            if match:
-                issue_size = float(match.group().replace(",", ""))
-                if "cr" not in issue_text.lower():
-                    issue_size = issue_size / 100.0
+            if "issue_size" in col_map and len(cols) > col_map["issue_size"]:
+                issue_text = cols[col_map["issue_size"]].get_text(strip=True)
+                match = re.search(r"[\d,.]+", issue_text)
+                if match:
+                    issue_size = float(match.group().replace(",", ""))
+                    # If no "cr" indicator, might be in lakhs
+                    if "cr" not in issue_text.lower() and "crore" not in issue_text.lower():
+                        issue_size = issue_size / 100.0
 
-            # Closing Date
-            close_text = cols[col_map.get("close_date", 5)].get_text(strip=True) if "close_date" in col_map else ""
-            close_date = today + timedelta(days=5)
-            if close_text:
-                for fmt in ("%d-%b-%Y", "%d %b %Y", "%d/%m/%Y", "%Y-%m-%d"):
-                    try:
-                        close_date = datetime.strptime(close_text, fmt).date()
-                        break
-                    except: pass
-            days_left = (close_date - today).days
+            # Extract exchange
+            exchange = "BSE, NSE"  # default
+            if "exchange" in col_map and len(cols) > col_map["exchange"]:
+                exchange = cols[col_map["exchange"]].get_text(strip=True)
 
-            # Defaults for missing GMP/Subscription (can be enriched later)
+            # Extract industry/sector
+            sector = "Mainboard" if ipo_type == "Mainboard" else "SME"
+            if "industry" in col_map and len(cols) > col_map["industry"]:
+                sector = cols[col_map["industry"]].get_text(strip=True) or sector
+
+            # For SME IPOs, try to get price band from the IPO detail page link
+            price_lower, price_upper = 0.0, 0.0
+
+            # If there's a link to IPO detail page, fetch price band
+            if link and link.get("href"):
+                detail_url = link.get("href")
+                if not detail_url.startswith("http"):
+                    detail_url = f"https://www.chittorgarh.com{detail_url}"
+                try:
+                    detail_resp = requests.get(detail_url, headers=headers, timeout=10)
+                    if detail_resp.status_code == 200:
+                        detail_soup = BeautifulSoup(detail_resp.text, "html.parser")
+                        # Look for price band information
+                        price_text = ""
+                        price_elem = detail_soup.find(string=re.compile(r"Price Band", re.I))
+                        if price_elem:
+                            parent = price_elem.find_parent()
+                            if parent:
+                                price_text = parent.get_text()
+                        if not price_text:
+                            # Try alternative location
+                            price_elem = detail_soup.find(string=re.compile(r"Issue Price", re.I))
+                            if price_elem:
+                                parent = price_elem.find_parent()
+                                if parent:
+                                    price_text = parent.get_text()
+                        if price_text:
+                            price_match = re.search(r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)", price_text)
+                            if price_match:
+                                price_lower = float(price_match.group(1))
+                                price_upper = float(price_match.group(2))
+                            else:
+                                single_match = re.search(r"(\d+\.?\d*)", price_text)
+                                if single_match:
+                                    price_upper = float(single_match.group(1))
+                                    price_lower = price_upper
+                except Exception as e:
+                    log.debug(f"Could not fetch price band for {symbol}: {e}")
+
+            # For rows where price band couldn't be fetched, set defaults
+            if price_upper == 0.0:
+                # Default price band for SMEs (reasonable estimate)
+                price_upper = 100.0
+                price_lower = 95.0
+
+            # Default values
             gmp = 0.0
             sub_times = 0.0
             lot_size = 1000
 
+            # Calculate closing date (approximate: DRHP filing + 30-60 days)
+            close_date = today + timedelta(days=30)
+            if "filing_date" in col_map and len(cols) > col_map["filing_date"]:
+                filing_text = cols[col_map["filing_date"]].get_text(strip=True)
+                if filing_text:
+                    for fmt in ("%d-%b-%Y", "%d %b %Y", "%d/%m/%Y", "%Y-%m-%d"):
+                        try:
+                            filing_date = datetime.strptime(filing_text, fmt).date()
+                            # Assume IPO closes ~30-60 days after filing
+                            close_date = filing_date + timedelta(days=45)
+                            break
+                        except:
+                            continue
+            days_left = (close_date - today).days
+
             data.append({
                 "Symbol": symbol,
-                "Sector": "Mainboard" if ipo_type == "Mainboard" else "SME",
+                "Sector": sector,
                 "IssueSizeCr": issue_size,
                 "PriceBandLower": price_lower,
                 "PriceBandUpper": price_upper,
@@ -167,7 +247,7 @@ def scrape_chittorgarh_table(url: str, ipo_type: str) -> pd.DataFrame:
         log.warning(f"{ipo_type} scraper error: {e}")
         return pd.DataFrame()
 
-# ---------- Fallback CSV with REAL IPO names (from your screenshots) ----------
+# ---------- Fallback CSV with REAL IPO names ----------
 def ensure_fallback_csv():
     """Create fallback CSV using the real IPO data from your screenshots."""
     FALLBACK_CSV.parent.mkdir(parents=True, exist_ok=True)
@@ -200,8 +280,9 @@ def ensure_fallback_csv():
 
 def fetch_unified_calendar() -> pd.DataFrame:
     """Fetch both Mainboard and SME IPOs, combine, then fallback to CSV if needed."""
-    sme_url = "https://www.chittorgarh.com/ipo/sme-ipo-2026.asp"
-    mainboard_url = "https://www.chittorgarh.com/ipo/mainboard-ipo-2026.asp"
+    # Updated URLs based on your provided link
+    sme_url = "https://www.chittorgarh.com/report/upcoming-ipos-drhp-filed/158/sme/"
+    mainboard_url = "https://www.chittorgarh.com/report/upcoming-ipos-drhp-filed/158/"
 
     sme_df = scrape_chittorgarh_table(sme_url, "SME")
     main_df = scrape_chittorgarh_table(mainboard_url, "Mainboard")
