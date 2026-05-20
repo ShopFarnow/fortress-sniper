@@ -58,95 +58,141 @@ W_HALAL = 0.15
 TIME_FACTOR_START = 0.40   # first day weight for subscription
 TIME_FACTOR_END   = 1.00   # last day weight
 
-# Sources
-IPO_SOURCES = {
-    "ipowatch": "https://ipowatch.in/upcoming-sme-ipo/",
-    "chittorgarh": "https://www.chittorgarh.com/ipo/upcoming_sme_ipo.asp",
-    "investorgain": "https://investorgain.com/ipo/upcoming-ipo"
-}
-
-# Static fallback dataset (create a CSV with at least columns: Symbol, IssueSizeCr, PriceBandLower, PriceBandUpper, LotSize, CloseDate)
+# Static fallback dataset (create a CSV with at least columns: Symbol, IssueSizeCr, PriceBandLower, PriceBandUpper, LotSize, CloseDate, GMP, SubscriptionTimes)
 FALLBACK_CSV = Path("data/ipo_fallback.csv")
 
 # ----------------------------------------------------------------------
-# 1. Data fetching with fallback
+# 1. Source‑specific scraping functions
 # ----------------------------------------------------------------------
 
-def fetch_ipo_calendar() -> pd.DataFrame:
-    """Primary: scrape IPO Watch for live SME IPO data.
-       Returns DataFrame with columns:
-       Symbol, IssueSizeCr, PriceBandLower, PriceBandUpper, LotSize,
-       GMP, SubscriptionTimes, CloseDate, DaysToClose, Source.
-    """
+def scrape_ipowatch() -> pd.DataFrame:
+    """Scrape ipowatch.in for SME IPOs."""
+    url = "https://ipowatch.in/upcoming-sme-ipo/"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
-        url = IPO_SOURCES["ipowatch"]
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         resp = requests.get(url, headers=headers, timeout=20)
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Find the main IPO table (adjust selector after inspecting site)
-        table = soup.find("table", class_="table table-striped")
+        # Try different possible table classes
+        table = soup.find("table", class_="wp-block-table")
         if not table:
-            log.warning("IPO table not found on ipowatch.in")
+            table = soup.find("table", class_="tablepress")
+        if not table:
+            table = soup.find("table")
+        if not table:
+            log.warning("No table found on ipowatch.in")
             return pd.DataFrame()
 
-        rows = table.find_all("tr")[1:]  # skip header
+        # Extract headers
+        headers_row = table.find("tr")
+        if not headers_row:
+            return pd.DataFrame()
+        headers = [th.get_text(strip=True) for th in headers_row.find_all(["th", "td"])]
+        # Expected headers: "Company Name", "Price Band", "Lot Size", "Issue Size", "GMP", "Close Date"
+        # Map to standard names
+        col_map = {}
+        for i, h in enumerate(headers):
+            h_lower = h.lower()
+            if "company" in h_lower or "name" in h_lower:
+                col_map["Symbol"] = i
+            elif "price" in h_lower:
+                col_map["PriceBand"] = i
+            elif "lot" in h_lower:
+                col_map["LotSize"] = i
+            elif "issue" in h_lower and "size" in h_lower:
+                col_map["IssueSize"] = i
+            elif "gmp" in h_lower:
+                col_map["GMP"] = i
+            elif "close" in h_lower or "end" in h_lower:
+                col_map["CloseDate"] = i
+
+        if "Symbol" not in col_map:
+            log.warning("Could not identify company name column on ipowatch.in")
+            return pd.DataFrame()
+
+        rows = table.find_all("tr")[1:]  # skip header row
         data = []
         today = datetime.today().date()
 
         for row in rows:
-            cols = row.find_all("td")
-            if len(cols) < 6:
+            cols = row.find_all(["td", "th"])
+            if len(cols) < max(col_map.values(), default=5):
                 continue
-            # Extract fields (these class names are examples – adapt to actual site)
-            symbol = cols[0].get_text(strip=True)
-            price_band_text = cols[1].get_text(strip=True)
-            issue_size_text = cols[2].get_text(strip=True).replace("₹", "").replace(" Cr", "")
-            gmp_text = cols[3].get_text(strip=True).replace("%", "").replace("~", "")
-            sub_text = cols[4].get_text(strip=True).replace("x", "").replace("times", "")
-            close_date_text = cols[5].get_text(strip=True)
 
-            # Parse price band
-            price_band_lower, price_band_upper = 0, 0
+            symbol = cols[col_map["Symbol"]].get_text(strip=True)
+            if not symbol or symbol.lower() == "company name":
+                continue
+
+            # Price band
+            price_band_text = cols[col_map.get("PriceBand", 1)].get_text(strip=True) if "PriceBand" in col_map else ""
+            price_lower = price_upper = 0
             if "-" in price_band_text:
                 parts = price_band_text.split("-")
-                price_band_lower = float(parts[0].strip())
-                price_band_upper = float(parts[1].strip())
-            else:
-                price_band_lower = price_band_upper = float(price_band_text)
+                try:
+                    price_lower = float(parts[0].strip())
+                    price_upper = float(parts[1].strip())
+                except:
+                    pass
+            elif price_band_text.replace(".", "").isdigit():
+                price_lower = price_upper = float(price_band_text)
 
-            # Parse issue size (in crore)
-            try:
-                issue_size = float(issue_size_text)
-            except:
-                issue_size = 0.0
+            # Issue size (in crore)
+            issue_text = cols[col_map.get("IssueSize", 2)].get_text(strip=True) if "IssueSize" in col_map else ""
+            issue_size = 0.0
+            match = re.search(r"[\d,.]+", issue_text)
+            if match:
+                issue_size = float(match.group().replace(",", ""))
+                if "cr" not in issue_text.lower() and "crore" not in issue_text.lower():
+                    issue_size = issue_size / 100  # assume lakh if no crore indicator? fallback safe
 
             # GMP (as percentage of upper price band)
-            try:
-                gmp = float(gmp_text) / 100.0 if gmp_text else 0.0
-            except:
-                gmp = 0.0
+            gmp_text = cols[col_map.get("GMP", 3)].get_text(strip=True) if "GMP" in col_map else ""
+            gmp = 0.0
+            gmp_match = re.search(r"[\d,.]+", gmp_text)
+            if gmp_match:
+                gmp_raw = float(gmp_match.group().replace(",", ""))
+                # If GMP is absolute (₹), convert to % of upper price band
+                if "₹" in gmp_text or "Rs" in gmp_text:
+                    if price_upper > 0:
+                        gmp = gmp_raw / price_upper
+                    else:
+                        gmp = min(0.50, gmp_raw / 100)  # fallback assume premium %?
+                else:
+                    gmp = gmp_raw / 100.0   # already percentage
+            gmp = min(0.50, gmp)  # cap at 50%
 
-            # Subscription (times subscribed)
-            try:
-                sub_times = float(sub_text)
-            except:
-                sub_times = 0.0
+            # Lot size
+            lot_text = cols[col_map.get("LotSize", 2)].get_text(strip=True) if "LotSize" in col_map else ""
+            lot_size = 0
+            lot_match = re.search(r"\d+", lot_text)
+            if lot_match:
+                lot_size = int(lot_match.group())
+
+            # Subscription (not always present on ipowatch for SME – use 0)
+            sub_times = 0.0
 
             # Close date
+            close_text = cols[col_map.get("CloseDate", 5)].get_text(strip=True) if "CloseDate" in col_map else ""
+            close_date = today + timedelta(days=5)
             try:
-                close_date = datetime.strptime(close_date_text, "%d-%b-%Y").date()
+                # Try multiple date formats
+                for fmt in ("%d-%b-%Y", "%d %b %Y", "%d/%m/%Y", "%Y-%m-%d"):
+                    try:
+                        close_date = datetime.strptime(close_text, fmt).date()
+                        break
+                    except:
+                        continue
             except:
-                close_date = today + timedelta(days=5)  # fallback
+                pass
 
             days_to_close = (close_date - today).days
 
             data.append({
                 "Symbol": symbol,
                 "IssueSizeCr": issue_size,
-                "PriceBandLower": price_band_lower,
-                "PriceBandUpper": price_band_upper,
-                "LotSize": 0,   # not always available, can be added
+                "PriceBandLower": price_lower,
+                "PriceBandUpper": price_upper,
+                "LotSize": lot_size,
                 "GMP": gmp,
                 "SubscriptionTimes": sub_times,
                 "CloseDate": close_date.strftime("%Y-%m-%d"),
@@ -157,17 +203,301 @@ def fetch_ipo_calendar() -> pd.DataFrame:
         df = pd.DataFrame(data)
         if not df.empty:
             log.info(f"✅ Fetched {len(df)} IPOs from ipowatch.in")
-            return df
+        return df
 
     except Exception as e:
         log.warning(f"ipowatch.in scrape failed: {e}")
+        return pd.DataFrame()
+
+
+def scrape_chittorgarh() -> pd.DataFrame:
+    """Scrape chittorgarh.com for SME IPOs."""
+    url = "https://www.chittorgarh.com/ipo/upcoming_sme_ipo.asp"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = soup.find("table", class_="table")
+        if not table:
+            log.warning("No table found on chittorgarh.com")
+            return pd.DataFrame()
+
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            return pd.DataFrame()
+
+        # Find header row (usually first <tr> with <th>)
+        header_row = None
+        for row in rows:
+            if row.find("th"):
+                header_row = row
+                break
+        if not header_row:
+            header_row = rows[0]
+        headers = [th.get_text(strip=True).lower() for th in header_row.find_all(["th", "td"])]
+
+        col_map = {}
+        for i, h in enumerate(headers):
+            if "name" in h:
+                col_map["Symbol"] = i
+            elif "price" in h:
+                col_map["PriceBand"] = i
+            elif "lot" in h:
+                col_map["LotSize"] = i
+            elif "size" in h:
+                col_map["IssueSize"] = i
+            elif "gmp" in h:
+                col_map["GMP"] = i
+            elif "sub" in h or "subscription" in h:
+                col_map["Subscription"] = i
+            elif "close" in h or "end" in h:
+                col_map["CloseDate"] = i
+
+        data = []
+        today = datetime.today().date()
+        for row in rows[1:]:
+            cols = row.find_all("td")
+            if len(cols) < 6:
+                continue
+
+            symbol = cols[col_map.get("Symbol", 0)].get_text(strip=True)
+            if not symbol:
+                continue
+
+            # Price band
+            price_text = cols[col_map.get("PriceBand", 1)].get_text(strip=True) if "PriceBand" in col_map else ""
+            price_lower = price_upper = 0
+            if "-" in price_text:
+                parts = price_text.split("-")
+                try:
+                    price_lower = float(parts[0].strip())
+                    price_upper = float(parts[1].strip())
+                except:
+                    pass
+            else:
+                price_match = re.search(r"[\d,.]+", price_text)
+                if price_match:
+                    price_lower = price_upper = float(price_match.group().replace(",", ""))
+
+            # Issue size
+            issue_text = cols[col_map.get("IssueSize", 2)].get_text(strip=True) if "IssueSize" in col_map else ""
+            issue_size = 0.0
+            match = re.search(r"[\d,.]+", issue_text)
+            if match:
+                issue_size = float(match.group().replace(",", ""))
+                if "cr" not in issue_text.lower():
+                    issue_size = issue_size / 100
+
+            # GMP (as %)
+            gmp_text = cols[col_map.get("GMP", 3)].get_text(strip=True) if "GMP" in col_map else ""
+            gmp = 0.0
+            gmp_match = re.search(r"[\d,.]+", gmp_text)
+            if gmp_match:
+                gmp = float(gmp_match.group().replace(",", "")) / 100.0
+            gmp = min(0.50, gmp)
+
+            # Subscription times
+            sub_text = cols[col_map.get("Subscription", 4)].get_text(strip=True) if "Subscription" in col_map else "0"
+            sub_times = 0.0
+            sub_match = re.search(r"[\d,.]+", sub_text)
+            if sub_match:
+                sub_times = float(sub_match.group().replace(",", ""))
+
+            # Lot size
+            lot_text = cols[col_map.get("LotSize", 2)].get_text(strip=True) if "LotSize" in col_map else ""
+            lot_size = 0
+            lot_match = re.search(r"\d+", lot_text)
+            if lot_match:
+                lot_size = int(lot_match.group())
+
+            # Close date
+            close_text = cols[col_map.get("CloseDate", 5)].get_text(strip=True) if "CloseDate" in col_map else ""
+            close_date = today + timedelta(days=5)
+            try:
+                for fmt in ("%d-%b-%Y", "%d %b %Y", "%d/%m/%Y", "%Y-%m-%d"):
+                    try:
+                        close_date = datetime.strptime(close_text, fmt).date()
+                        break
+                    except:
+                        continue
+            except:
+                pass
+            days_to_close = (close_date - today).days
+
+            data.append({
+                "Symbol": symbol,
+                "IssueSizeCr": issue_size,
+                "PriceBandLower": price_lower,
+                "PriceBandUpper": price_upper,
+                "LotSize": lot_size,
+                "GMP": gmp,
+                "SubscriptionTimes": sub_times,
+                "CloseDate": close_date.strftime("%Y-%m-%d"),
+                "DaysToClose": days_to_close,
+                "Source": "chittorgarh"
+            })
+
+        df = pd.DataFrame(data)
+        if not df.empty:
+            log.info(f"✅ Fetched {len(df)} IPOs from chittorgarh.com")
+        return df
+
+    except Exception as e:
+        log.warning(f"chittorgarh.com scrape failed: {e}")
+        return pd.DataFrame()
+
+
+def scrape_investorgain() -> pd.DataFrame:
+    """Scrape investorgain.com for SME IPOs."""
+    url = "https://investorgain.com/ipo/upcoming-ipo"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Investorgain often uses <div> with class 'table-responsive' and <table class='table'>
+        table = soup.find("table", class_="table")
+        if not table:
+            log.warning("No table found on investorgain.com")
+            return pd.DataFrame()
+
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            return pd.DataFrame()
+
+        # Header is first row
+        headers = [th.get_text(strip=True).lower() for th in rows[0].find_all("th")]
+        col_map = {}
+        for i, h in enumerate(headers):
+            if "name" in h:
+                col_map["Symbol"] = i
+            elif "price" in h:
+                col_map["PriceBand"] = i
+            elif "lot" in h:
+                col_map["LotSize"] = i
+            elif "size" in h:
+                col_map["IssueSize"] = i
+            elif "gmp" in h:
+                col_map["GMP"] = i
+            elif "subscription" in h:
+                col_map["Subscription"] = i
+            elif "close" in h or "end" in h:
+                col_map["CloseDate"] = i
+
+        data = []
+        today = datetime.today().date()
+        for row in rows[1:]:
+            cols = row.find_all("td")
+            if len(cols) < 6:
+                continue
+
+            symbol = cols[col_map.get("Symbol", 0)].get_text(strip=True)
+            if not symbol:
+                continue
+
+            price_text = cols[col_map.get("PriceBand", 1)].get_text(strip=True) if "PriceBand" in col_map else ""
+            price_lower = price_upper = 0
+            if "-" in price_text:
+                parts = price_text.split("-")
+                try:
+                    price_lower = float(parts[0].strip())
+                    price_upper = float(parts[1].strip())
+                except:
+                    pass
+            else:
+                price_match = re.search(r"[\d,.]+", price_text)
+                if price_match:
+                    price_lower = price_upper = float(price_match.group().replace(",", ""))
+
+            issue_text = cols[col_map.get("IssueSize", 2)].get_text(strip=True) if "IssueSize" in col_map else ""
+            issue_size = 0.0
+            match = re.search(r"[\d,.]+", issue_text)
+            if match:
+                issue_size = float(match.group().replace(",", ""))
+                if "cr" not in issue_text.lower():
+                    issue_size = issue_size / 100
+
+            gmp_text = cols[col_map.get("GMP", 3)].get_text(strip=True) if "GMP" in col_map else ""
+            gmp = 0.0
+            gmp_match = re.search(r"[\d,.]+", gmp_text)
+            if gmp_match:
+                gmp = float(gmp_match.group().replace(",", "")) / 100.0
+            gmp = min(0.50, gmp)
+
+            sub_text = cols[col_map.get("Subscription", 4)].get_text(strip=True) if "Subscription" in col_map else "0"
+            sub_times = 0.0
+            sub_match = re.search(r"[\d,.]+", sub_text)
+            if sub_match:
+                sub_times = float(sub_match.group().replace(",", ""))
+
+            lot_text = cols[col_map.get("LotSize", 2)].get_text(strip=True) if "LotSize" in col_map else ""
+            lot_size = 0
+            lot_match = re.search(r"\d+", lot_text)
+            if lot_match:
+                lot_size = int(lot_match.group())
+
+            close_text = cols[col_map.get("CloseDate", 5)].get_text(strip=True) if "CloseDate" in col_map else ""
+            close_date = today + timedelta(days=5)
+            try:
+                for fmt in ("%d-%b-%Y", "%d %b %Y", "%d/%m/%Y", "%Y-%m-%d"):
+                    try:
+                        close_date = datetime.strptime(close_text, fmt).date()
+                        break
+                    except:
+                        continue
+            except:
+                pass
+            days_to_close = (close_date - today).days
+
+            data.append({
+                "Symbol": symbol,
+                "IssueSizeCr": issue_size,
+                "PriceBandLower": price_lower,
+                "PriceBandUpper": price_upper,
+                "LotSize": lot_size,
+                "GMP": gmp,
+                "SubscriptionTimes": sub_times,
+                "CloseDate": close_date.strftime("%Y-%m-%d"),
+                "DaysToClose": days_to_close,
+                "Source": "investorgain"
+            })
+
+        df = pd.DataFrame(data)
+        if not df.empty:
+            log.info(f"✅ Fetched {len(df)} IPOs from investorgain.com")
+        return df
+
+    except Exception as e:
+        log.warning(f"investorgain.com scrape failed: {e}")
+        return pd.DataFrame()
+
+
+def fetch_ipo_calendar() -> pd.DataFrame:
+    """Try multiple sources sequentially. Return first non-empty DataFrame."""
+    sources = [
+        ("ipowatch", scrape_ipowatch),
+        ("chittorgarh", scrape_chittorgarh),
+        ("investorgain", scrape_investorgain)
+    ]
+    for name, func in sources:
+        try:
+            df = func()
+            if not df.empty:
+                log.info(f"Using IPO data from {name}")
+                return df
+        except Exception as e:
+            log.warning(f"Source {name} failed: {e}")
 
     # Fallback to static CSV
     if FALLBACK_CSV.exists():
         df = pd.read_csv(FALLBACK_CSV)
-        # Add DaysToClose if not present
+        # Ensure required columns exist
+        required_cols = ["Symbol", "IssueSizeCr", "PriceBandLower", "PriceBandUpper", "LotSize", "GMP", "SubscriptionTimes", "CloseDate"]
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            log.error(f"Fallback CSV missing columns: {missing}")
+            return pd.DataFrame()
+        today = datetime.today().date()
         if "DaysToClose" not in df.columns:
-            today = datetime.today().date()
             df["DaysToClose"] = df["CloseDate"].apply(
                 lambda x: (datetime.strptime(x, "%Y-%m-%d").date() - today).days
             )
@@ -179,7 +509,7 @@ def fetch_ipo_calendar() -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------
-# 2. Scoring engine with time‑dependent subscription weight
+# 2. Scoring engine with time‑dependent subscription weight (unchanged)
 # ----------------------------------------------------------------------
 
 def compute_ipo_score(row: pd.Series) -> Dict:
