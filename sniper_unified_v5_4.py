@@ -8240,39 +8240,44 @@ def _run_halal_l4_dedup(unique_symbols: List[str], sector_map: dict) -> dict:
     return results
 
 
-def _select_lane_winner(lane_results: List[dict], halal_map: dict,
-                        alpha_mine_map: dict, lane_name: str,
-                        min_score_key: str, min_score: float) -> Optional[dict]:
+def _select_lane_winner(lane_results, halal_map, alpha_mine_map, lane_name,
+                        min_score_key, min_score):
     """
     Stage 4 -- LANE FINALIZATION.
-    Applies: score gate + halal PURE filter + L4 veto filter.
+    Applies: score gate + halal PURE filter + L4 veto filter + halal score ≥60.
     Returns the top qualifying symbol for this lane or None.
     """
     for r in lane_results:
         sym = r["symbol"]
         score = r.get(min_score_key, 0.0)
         if score < min_score:
-            # FIX-ISSUE-5: log score-gate rejections at INFO so they appear in logs
             log.info(f"LANE {lane_name}: {sym} below score gate "
                      f"({min_score_key}={score:.1f} < {min_score})")
             continue
+
         halal = halal_map.get(sym, {})
         if halal.get("veto", False):
             log.info(f"LANE {lane_name}: {sym} vetoed by L4 halal — "
                      f"{halal.get('veto_reason','?')}")
             continue
+
+        # Halal score must be ≥60 (same as calibrated_ai_judge)
+        if halal.get("score", 0) < 60:
+            log.info(f"LANE {lane_name}: {sym} halal score {halal.get('score')} < 60 -- skipped")
+            continue
+
         if LANE_REQUIRE_HALAL_PURE and halal.get("tier", "ACCEPTABLE") not in ("PURE", "ACCEPTABLE"):
             log.info(f"LANE {lane_name}: {sym} halal tier {halal.get('tier')} -- skipped")
             continue
-        # Attach halal + alpha-mine data to winner
+
         r["halal_tier"] = halal.get("tier", "ACCEPTABLE")
         r["halal_score"] = halal.get("score", 50)
         r["alpha_mine"] = alpha_mine_map.get(sym, {})
         log.info(f"LANE {lane_name} WINNER: {sym} | {min_score_key}={score:.0f} | halal={r['halal_tier']}")
         return r
+
     log.info(f"LANE {lane_name}: NO PICK (no symbol passed score+halal gate)")
     return None
-
 
 def _persist_lane_results(lane_name: str, winner: Optional[dict],
                            date_label: str) -> None:
