@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-IPO Data Fetcher – final with fixed Chittorgarh, IndiaTrade dedup, and date‑range parsing.
+IPO Data Fetcher – FINAL VERSION
+- Chittorgarh (robust table detection)
+- Investorgain (cloudscraper)
+- Screener.in (Playwright)
+- Groww (API intercept)
+- IndiaTrade (dedup + name cleaning)
+- Status: Open / Upcoming / Closed / Listed / Unknown
 """
 
 import json
 import re
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Optional, List, Dict
 
@@ -28,30 +34,25 @@ CHROME_HEADERS = {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Improved date parsing (handles "05 - 07 May")
+# Date parsing (handles "05 - 07 May" ranges)
 # ──────────────────────────────────────────────────────────────────────────────
 def parse_date(date_str: str) -> Optional[datetime]:
-    """Parse dates like '20 May 2026', '05 - 07 May', 'To be announced'."""
     if not date_str or date_str.lower() in ("to be announced", "tba", ""):
         return None
     date_str = date_str.strip()
-    # Handle range like "05 - 07 May" -> return the first day (05 May of current year)
-    range_match = re.match(r"(\d{1,2})\s*-\s*(\d{1,2})\s+([A-Za-z]+)", date_str)
+    # Range like "05 - 07 May" -> return first day
+    range_match = re.match(r"(\d{1,2})\s*-\s*\d{1,2}\s+([A-Za-z]+)", date_str)
     if range_match:
         day = int(range_match.group(1))
-        month_str = range_match.group(3)
-        # Assume current year (or try to extract if present)
+        month_str = range_match.group(2)
         year = datetime.now().year
-        # If year is given later, we'll catch it below; for now use current year
-        full_str = f"{day} {month_str} {year}"
         try:
-            return datetime.strptime(full_str, "%d %b %Y")
+            return datetime.strptime(f"{day} {month_str} {year}", "%d %b %Y")
         except:
             try:
-                return datetime.strptime(full_str, "%d %B %Y")
+                return datetime.strptime(f"{day} {month_str} {year}", "%d %B %Y")
             except:
                 return None
-    # Standard formats
     for fmt in ("%d %b %Y", "%Y-%m-%d", "%d-%m-%Y", "%d %B %Y", "%b %d %Y"):
         try:
             return datetime.strptime(date_str, fmt)
@@ -62,11 +63,9 @@ def parse_date(date_str: str) -> Optional[datetime]:
 def compute_status(ipo: dict, today: datetime = None) -> str:
     if today is None:
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-
     open_dt = parse_date(ipo.get("open_date", ""))
     close_dt = parse_date(ipo.get("close_date", ""))
     listing_dt = parse_date(ipo.get("listing_date", ""))
-
     if listing_dt and listing_dt < today:
         return "Listed"
     if close_dt and close_dt < today:
@@ -84,58 +83,73 @@ def compute_status(ipo: dict, today: datetime = None) -> str:
     return "Unknown"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SOURCE A – Chittorgarh (fixed: separate name from date range)
+# SOURCE A – Chittorgarh (revised robust parser)
 # ──────────────────────────────────────────────────────────────────────────────
 def fetch_chittorgarh() -> List[Dict]:
-    log.info("━━ SOURCE A: Chittorgarh ━━")
+    log.info("━━ SOURCE A: Chittorgarh (robust) ━━")
     results = []
     try:
         import cloudscraper
         scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows"})
         r = scraper.get("https://www.chittorgarh.com/ipo/ipo_dashboard.asp", headers=CHROME_HEADERS, timeout=20)
         if r.status_code != 200:
+            log.warning(f"  Chittorgarh HTTP {r.status_code}")
             return results
         soup = BeautifulSoup(r.text, "lxml")
-        table = soup.find("table", class_=re.compile(r"table"))
-        if not table:
+        # Find table containing "Company Name" in first row
+        target_table = None
+        for table in soup.find_all("table"):
+            first_row = table.find("tr")
+            if first_row:
+                first_row_text = first_row.get_text(strip=True).lower()
+                if "company name" in first_row_text or "ipo name" in first_row_text:
+                    target_table = table
+                    break
+        if not target_table:
+            # Fallback: first table with at least 3 rows
+            for table in soup.find_all("table"):
+                if len(table.find_all("tr")) > 2:
+                    target_table = table
+                    break
+        if not target_table:
+            log.warning("  Chittorgarh: no IPO table found")
             return results
-        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-        # Identify columns
-        col_idx = {"name": 0, "open": 1, "close": 2, "price": 3, "lot": 4, "size": 5}
+
+        header_row = target_table.find("tr")
+        headers = [th.get_text(strip=True).lower() for th in header_row.find_all(["th", "td"])]
+        col_map = {"name": -1, "open": -1, "close": -1, "price": -1, "lot": -1}
         for i, h in enumerate(headers):
             if "company" in h or "name" in h:
-                col_idx["name"] = i
+                col_map["name"] = i
             elif "open" in h:
-                col_idx["open"] = i
+                col_map["open"] = i
             elif "close" in h:
-                col_idx["close"] = i
+                col_map["close"] = i
             elif "price" in h:
-                col_idx["price"] = i
+                col_map["price"] = i
             elif "lot" in h:
-                col_idx["lot"] = i
-            elif "size" in h or "amount" in h:
-                col_idx["size"] = i
+                col_map["lot"] = i
+        if col_map["name"] == -1:
+            col_map["name"] = 0
 
-        for row in table.find_all("tr")[1:]:
+        for row in target_table.find_all("tr")[1:]:
             cols = [td.get_text(strip=True) for td in row.find_all("td")]
-            if len(cols) <= max(col_idx.values()):
+            if len(cols) <= col_map["name"]:
                 continue
-            name = cols[col_idx["name"]]
-            # Remove any trailing date range that might have been appended (defensive)
+            name = cols[col_map["name"]]
+            # Remove trailing date range (e.g., "05 - 07 May")
             name = re.sub(r"\s+\d{1,2}\s*-\s*\d{1,2}\s+[A-Za-z]+\s*$", "", name).strip()
             if not name:
                 continue
             entry = {"source": "Chittorgarh", "name": name}
-            if col_idx["open"] < len(cols):
-                entry["open_date"] = cols[col_idx["open"]]
-            if col_idx["close"] < len(cols):
-                entry["close_date"] = cols[col_idx["close"]]
-            if col_idx["price"] < len(cols):
-                entry["issue_price"] = cols[col_idx["price"]]
-            if col_idx["lot"] < len(cols):
-                entry["lot_size"] = cols[col_idx["lot"]]
-            if col_idx["size"] < len(cols):
-                entry["issue_size"] = cols[col_idx["size"]]
+            if col_map["open"] != -1 and col_map["open"] < len(cols):
+                entry["open_date"] = cols[col_map["open"]]
+            if col_map["close"] != -1 and col_map["close"] < len(cols):
+                entry["close_date"] = cols[col_map["close"]]
+            if col_map["price"] != -1 and col_map["price"] < len(cols):
+                entry["issue_price"] = cols[col_map["price"]]
+            if col_map["lot"] != -1 and col_map["lot"] < len(cols):
+                entry["lot_size"] = cols[col_map["lot"]]
             results.append(entry)
         log.info(f"  ✓ Chittorgarh: {len(results)} IPOs")
     except Exception as e:
@@ -143,7 +157,7 @@ def fetch_chittorgarh() -> List[Dict]:
     return results
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SOURCE B – Investorgain (unchanged)
+# SOURCE B – Investorgain
 # ──────────────────────────────────────────────────────────────────────────────
 def fetch_investorgain() -> List[Dict]:
     log.info("━━ SOURCE B: Investorgain ━━")
@@ -183,7 +197,7 @@ def fetch_investorgain() -> List[Dict]:
 # SOURCE C – Screener.in
 # ──────────────────────────────────────────────────────────────────────────────
 def fetch_screener() -> List[Dict]:
-    log.info("━━ SOURCE D: Screener.in ━━")
+    log.info("━━ SOURCE C: Screener.in ━━")
     results = []
     try:
         from playwright.sync_api import sync_playwright
@@ -205,7 +219,7 @@ def fetch_screener() -> List[Dict]:
 # SOURCE D – Groww (API intercept)
 # ──────────────────────────────────────────────────────────────────────────────
 def fetch_groww() -> List[Dict]:
-    log.info("━━ SOURCE E: Groww (API intercept) ━━")
+    log.info("━━ SOURCE D: Groww (API intercept) ━━")
     results = []
     try:
         from playwright.sync_api import sync_playwright
@@ -258,10 +272,10 @@ def _parse_groww_json(data) -> List[Dict]:
     return items
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SOURCE E – IndiaTrade (strong intra‑source dedup)
+# SOURCE E – IndiaTrade (dedup + name cleaning)
 # ──────────────────────────────────────────────────────────────────────────────
 def fetch_indiatrade() -> List[Dict]:
-    log.info("━━ SOURCE F: IndiaTrade ━━")
+    log.info("━━ SOURCE E: IndiaTrade ━━")
     results = []
     try:
         import cloudscraper
@@ -274,14 +288,16 @@ def fetch_indiatrade() -> List[Dict]:
                 cols = [td.get_text(strip=True) for td in row.find_all("td")]
                 if len(cols) >= 2:
                     name = cols[0]
-                    # Clean name thoroughly for dedup key
-                    clean_name = re.sub(r"\s*\(?SME\s+IPO\)?\s*", "", name, flags=re.I)
-                    clean_name = re.sub(r"\b(limited|ltd|private|public|pvt|co\.?|inc)\b", "", clean_name, flags=re.I)
-                    clean_name = re.sub(r"[^\w\s]", "", clean_name)
-                    clean_name = re.sub(r"\s+", " ", clean_name).strip().lower()
-                    if clean_name and clean_name not in seen:
-                        seen.add(clean_name)
-                        entry = {"source": "IndiaTrade", "name": name}
+                    # Clean name for dedup key and display
+                    clean_key = re.sub(r"\s*\(?SME\s+IPO\)?\s*", "", name, flags=re.I)
+                    clean_key = re.sub(r"\b(limited|ltd|private|public|pvt|co\.?|inc)\b", "", clean_key, flags=re.I)
+                    clean_key = re.sub(r"[^\w\s]", "", clean_key)
+                    clean_key = re.sub(r"\s+", " ", clean_key).strip().lower()
+                    if clean_key and clean_key not in seen:
+                        seen.add(clean_key)
+                        # Also clean display name
+                        display_name = re.sub(r"\s*\(?SME\s+IPO\)?\s*", "", name, flags=re.I).strip()
+                        entry = {"source": "IndiaTrade", "name": display_name}
                         for i, col in enumerate(cols[1:], start=1):
                             col_lower = col.lower()
                             if "price" in col_lower or "₹" in col:
@@ -351,7 +367,7 @@ def _fetch_generic_playwright(url: str, source: str, wait_ms: int = 5000) -> Lis
         return []
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Deduplication (across sources)
+# Deduplication across sources
 # ──────────────────────────────────────────────────────────────────────────────
 def normalise_name(name: str) -> str:
     if not name:
@@ -378,7 +394,7 @@ def are_same_ipo(a: Dict, b: Dict) -> bool:
     return False
 
 def deduplicate(all_results: List[Dict]) -> List[Dict]:
-    # First, exact duplicates within same source
+    # Exact duplicates within same source
     unique_by_source = {}
     for item in all_results:
         src = item["source"]
@@ -387,7 +403,7 @@ def deduplicate(all_results: List[Dict]) -> List[Dict]:
         if key not in unique_by_source or len(item) > len(unique_by_source[key]):
             unique_by_source[key] = item
     unique_list = list(unique_by_source.values())
-    # Then merge across sources
+    # Merge across sources
     merged = []
     for item in unique_list:
         found = False
@@ -410,20 +426,16 @@ def print_results(results: List[Dict]):
     if not results:
         print("\n⚠️  No IPO data collected.\n")
         return
-
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     for ipo in results:
         ipo["status"] = compute_status(ipo, today)
-
     groups = {"Open": [], "Upcoming": [], "Closed": [], "Listed": [], "Unknown": []}
     for ipo in results:
         groups[ipo["status"]].append(ipo)
-
     print(f"\n{'═'*70}")
     print(f"  IPO DATA  —  fetched {datetime.now().strftime('%d %b %Y %H:%M')}")
     print(f"  Total unique IPOs: {len(results)}")
     print(f"{'═'*70}\n")
-
     for status, items in groups.items():
         if not items:
             continue
@@ -455,11 +467,10 @@ def main():
     all_results = []
     all_results += fetch_chittorgarh()
     all_results += fetch_investorgain()
-    # all_results += fetch_nse()   # NSE skipped – uncomment if needed
+    # NSE is skipped – unreliable in most sandboxes
     all_results += fetch_screener()
     all_results += fetch_groww()
     all_results += fetch_indiatrade()
-
     merged = deduplicate(all_results)
     print_results(merged)
     save_json(merged)
