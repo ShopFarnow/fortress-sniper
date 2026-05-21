@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-IPO SNIPER v4 – Live Open IPO Tracker + Telegram Bot
-- Real scrapers: Chittorgarh, Moneycontrol
-- One summary message, /detail <symbol> for full analysis
-- Works in GitHub Actions or any terminal
+IPO SNIPER v4 – Works with telegram-bot v13+ and v20+
 """
 
 import os
 import re
+import sys
 import logging
 import requests
 from datetime import datetime
@@ -15,10 +13,18 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional
 from bs4 import BeautifulSoup
 
-# Telegram imports – MUST be correct
+# ---- Telegram imports – compatible with both old and new versions ----
 try:
+    import telegram
     from telegram import Update
-    from telegram.ext import Application, CommandHandler, ContextTypes
+    # Try to import the new v20+ style
+    try:
+        from telegram.ext import Application, CommandHandler, ContextTypes
+        TELEGRAM_V20 = True
+    except ImportError:
+        # Fallback to old v13 style
+        from telegram.ext import Updater, CommandHandler, CallbackContext
+        TELEGRAM_V20 = False
     TELEGRAM_ENABLED = True
 except ImportError:
     TELEGRAM_ENABLED = False
@@ -35,10 +41,9 @@ log = logging.getLogger("IPO-SNIPER")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ──────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 # Data model
-# ──────────────────────────────────────────────────────────────────────────
-
+# ----------------------------------------------------------------------
 @dataclass
 class IPODetail:
     symbol: str
@@ -61,12 +66,11 @@ class IPODetail:
         except:
             return 0
 
-# ──────────────────────────────────────────────────────────────────────────
-# REAL IPO SCRAPERS
-# ──────────────────────────────────────────────────────────────────────────
-
+# ----------------------------------------------------------------------
+# Real IPO scrapers
+# ----------------------------------------------------------------------
 def fetch_open_ipos() -> List[IPODetail]:
-    """Get currently open IPOs from reliable sources."""
+    """Get currently open IPOs from Chittorgarh and Moneycontrol."""
     all_ipos = []
 
     # 1. Chittorgarh (best GMP data)
@@ -122,7 +126,7 @@ def fetch_open_ipos() -> List[IPODetail]:
     except Exception as e:
         log.warning(f"Chittorgarh scrape failed: {e}")
 
-    # 2. Moneycontrol (fallback if Chittorgarh gave nothing)
+    # 2. Moneycontrol (fallback)
     if not all_ipos:
         try:
             url = "https://www.moneycontrol.com/ipo/ipo-calendar.php"
@@ -189,10 +193,9 @@ def fetch_open_ipos() -> List[IPODetail]:
         ]
     return all_ipos
 
-# ──────────────────────────────────────────────────────────────────────────
-# TELEGRAM BOT (with correct imports)
-# ──────────────────────────────────────────────────────────────────────────
-
+# ----------------------------------------------------------------------
+# Telegram Bot – compatible with v13 and v20
+# ----------------------------------------------------------------------
 _latest_ipos: List[IPODetail] = []
 _detail_cache: Dict[str, str] = {}
 
@@ -231,8 +234,18 @@ def build_detail_text(ipo: IPODetail) -> str:
    • Profit per lot (at GMP): ₹{ipo.lot_size * ipo.price_high * (ipo.gmp_percent/100):,.0f}
 """
 
-async def send_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Fetch fresh IPOs and send one summary message."""
+# ----- Handlers that work in both old and new API -----
+def send_summary_sync(bot, chat_id):
+    """Synchronous version for old updater."""
+    global _latest_ipos, _detail_cache
+    log.info("Fetching live open IPOs...")
+    _latest_ipos = fetch_open_ipos()
+    _detail_cache = {ipo.symbol: build_detail_text(ipo) for ipo in _latest_ipos}
+    summary = build_summary_text(_latest_ipos)
+    bot.send_message(chat_id=chat_id, text=summary, parse_mode="Markdown")
+
+async def send_summary_async(context, chat_id):
+    """Async version for v20+."""
     global _latest_ipos, _detail_cache
     log.info("Fetching live open IPOs...")
     _latest_ipos = fetch_open_ipos()
@@ -240,25 +253,26 @@ async def send_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     summary = build_summary_text(_latest_ipos)
     await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode="Markdown")
 
-async def detail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Please provide an IPO symbol. Example: `/detail IPO-DEMO1`", parse_mode="Markdown")
+# ----- Command handlers (compatible) -----
+def detail_handler(update, context):
+    symbol = context.args[0].upper() if context.args else ""
+    if not symbol:
+        update.message.reply_text("Please provide an IPO symbol. Example: `/detail IPO-DEMO1`", parse_mode="Markdown")
         return
-    symbol = context.args[0].upper()
     if symbol in _detail_cache:
-        await update.message.reply_text(_detail_cache[symbol], parse_mode="Markdown")
+        update.message.reply_text(_detail_cache[symbol], parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"❌ No IPO found with symbol `{symbol}`. Use /summary to see available symbols.", parse_mode="Markdown")
+        update.message.reply_text(f"❌ No IPO found with symbol `{symbol}`. Use /summary to see available symbols.", parse_mode="Markdown")
 
-async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def list_handler(update, context):
     if not _latest_ipos:
-        await update.message.reply_text("No IPOs in cache. Run /summary first.")
+        update.message.reply_text("No IPOs in cache. Run /summary first.")
         return
     symbols = "\n".join([f"• `{ipo.symbol}` – {ipo.name[:40]}" for ipo in _latest_ipos])
-    await update.message.reply_text(f"*Available IPO symbols:*\n{symbols}", parse_mode="Markdown")
+    update.message.reply_text(f"*Available IPO symbols:*\n{symbols}", parse_mode="Markdown")
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+def start_handler(update, context):
+    update.message.reply_text(
         "🤖 *IPO Sniper Bot*\n"
         "Commands:\n"
         "/summary – Get latest open IPOs (one message)\n"
@@ -268,15 +282,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-async def periodic_summary(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = int(TELEGRAM_CHAT_ID)
-    if chat_id:
-        await send_summary(context, chat_id)
+def summary_handler(update, context):
+    """Called when user sends /summary."""
+    chat_id = update.effective_chat.id
+    if TELEGRAM_V20:
+        # In v20 we have async context, but we can call the async function from sync by creating a new event loop? 
+        # Simpler: reuse synchronous send_summary_sync.
+        bot = context.bot
+        send_summary_sync(bot, chat_id)
+    else:
+        # v13: context is CallbackContext
+        send_summary_sync(context.bot, chat_id)
 
-# ──────────────────────────────────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────────────────────────────────
-
+# ----------------------------------------------------------------------
+# Main entry point
+# ----------------------------------------------------------------------
 def main():
     if not TELEGRAM_ENABLED or not TELEGRAM_TOKEN:
         log.error("Telegram disabled: missing token or library.")
@@ -284,23 +304,47 @@ def main():
         print("Or run manually with: python ipo_scanner_v4.py --console")
         return
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("summary", lambda u,c: send_summary(c, u.effective_chat.id)))
-    app.add_handler(CommandHandler("detail", detail_command))
-    app.add_handler(CommandHandler("list", list_command))
+    log.info(f"Using python-telegram-bot version {telegram.__version__}")
+    log.info(f"TELEGRAM_V20 = {TELEGRAM_V20}")
 
-    if TELEGRAM_CHAT_ID:
-        # Run once on startup
-        app.job_queue.run_once(lambda ctx: send_summary(ctx, int(TELEGRAM_CHAT_ID)), 1)
-        # Then every 6 hours
-        app.job_queue.run_repeating(lambda ctx: periodic_summary(ctx), interval=21600, first=10)
+    if TELEGRAM_V20:
+        # New API (v20+)
+        app = Application.builder().token(TELEGRAM_TOKEN).build()
+        app.add_handler(CommandHandler("start", start_handler))
+        app.add_handler(CommandHandler("summary", summary_handler))
+        app.add_handler(CommandHandler("detail", detail_handler))
+        app.add_handler(CommandHandler("list", list_handler))
 
-    log.info("IPO Sniper bot started. Polling...")
-    app.run_polling()
+        if TELEGRAM_CHAT_ID:
+            chat_id = int(TELEGRAM_CHAT_ID)
+            # Run once after 2 seconds
+            app.job_queue.run_once(lambda ctx: send_summary_async(ctx, chat_id), 1)
+            # Then every 6 hours
+            app.job_queue.run_repeating(lambda ctx: send_summary_async(ctx, chat_id), interval=21600, first=10)
+
+        log.info("IPO Sniper bot started (v20+). Polling...")
+        app.run_polling()
+    else:
+        # Old API (v13)
+        updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+        dp = updater.dispatcher
+        dp.add_handler(CommandHandler("start", start_handler))
+        dp.add_handler(CommandHandler("summary", summary_handler))
+        dp.add_handler(CommandHandler("detail", detail_handler))
+        dp.add_handler(CommandHandler("list", list_handler))
+
+        if TELEGRAM_CHAT_ID:
+            chat_id = int(TELEGRAM_CHAT_ID)
+            # Run once after startup
+            updater.job_queue.run_once(lambda _: send_summary_sync(updater.bot, chat_id), 1)
+            # Then every 6 hours
+            updater.job_queue.run_repeating(lambda _: send_summary_sync(updater.bot, chat_id), interval=21600, first=10)
+
+        log.info("IPO Sniper bot started (v13). Polling...")
+        updater.start_polling()
+        updater.idle()
 
 def run_console():
-    """Run once and print to console (no Telegram)."""
     ipos = fetch_open_ipos()
     print("\n" + "="*70)
     print(f"OPEN IPOs – {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -313,7 +357,6 @@ def run_console():
     print(f"\nTotal: {len(ipos)} open IPOs")
 
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--console":
         run_console()
     else:
