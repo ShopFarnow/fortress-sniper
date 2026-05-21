@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║        IPO SNIPER v5.5 — DB MIGRATION + NSE ENDPOINT FIX                   ║
+║        IPO SNIPER v5.6 — TELEGRAM FILTER + HTML ESCAPE + KELLY FIX        ║
 ║                                                                              ║
-║  FIXES vs v5.4:                                                              ║
-║  H. CRASH: sqlite3.OperationalError "table ipo_scans has no column          ║
-║     named is_upcoming" → init_db() now runs ALTER TABLE migrations for      ║
-║     every column that may be missing from an existing older-schema DB.      ║
-║     CREATE TABLE IF NOT EXISTS only runs DDL when the table doesn't exist;  ║
-║     pre-existing tables are never touched by it. Fixed with PRAGMA           ║
-║     table_info() diff + per-column ALTER TABLE ADD COLUMN.                  ║
-║  I. NSE SOURCE C still all-404 → v5.4 "fix" replaced one set of            ║
-║     deprecated endpoints with another deprecated set. Now uses              ║
-║     /api/ipo-info (mainboard), /api/emerge-live?category=ipo (SME),        ║
-║     and /api/live-analysis-data?index=CURRENT+IPO as fallback.             ║
-║     Warmup extended to include SME page cookie seeding.                     ║
-║  J. IsUpcoming dtype hazard → when concat mixes bool/int/object the         ║
-║     boolean mask ~df["IsUpcoming"] raises or silently wrong-filters.        ║
-║     Now explicitly .fillna(False).astype(bool) before any mask in run()    ║
-║     and send_telegram_alerts().                                              ║
+║  FIXES vs v5.5:                                                              ║
+║  K. Telegram sent 40+ IPOs including closed/allotted ones → now only sends  ║
+║     rows where DaysToClose > 0 AND (SubscriptionTimes > 0 OR score ≥ 60).  ║
+║     Investorgain returns listed IPOs with their post-listing data; these    ║
+║     have sub=0 and score ❌ SKIP and must be excluded from alerts.           ║
+║  L. Telegram 400 "can't parse entities" → two root causes fixed:            ║
+║     (a) Symbol field from investorgain contains raw suffix text like        ║
+║         "BSE SMEL@213.10 (34.87%)" — new _tg_clean_symbol() strips these   ║
+║         exchange/listing suffixes before html_lib.escape() is applied.      ║
+║     (b) sh.tier, row['Sector'], CloseDate inserted raw into HTML tags;      ║
+║         all dynamic strings now escaped individually before interpolation.  ║
+║  M. Kelly b_odds used static floor of 1500 INR → overstates downside since  ║
+║     IPO principal is returned on miss. Now uses actual risk model:          ║
+║     effective_risk = opportunity_cost(7-day lock-up @5.5%) + listing-gap   ║
+║     risk (2.5% adverse gap on allotted lot). b_odds = gain / effective_risk.║
 ║                                                                              ║
-║  RETAINED FIXES from v5.4 (A–G): Chittorgarh URLs, Investorgain tbody,     ║
-║  NSE warmup, column sniffer, Telegram 429 backoff, close-date parsing,     ║
-║  upcoming deprioritisation cap.                                              ║
+║  RETAINED: A–J fixes from v5.4 and v5.5.                                   ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -49,7 +46,7 @@ except ImportError:
 IPO_DB_PATH      = Path("data/ipo_sniper_v5.db")
 FALLBACK_CSV     = Path("data/ipo_fallback_v5.csv")
 JSON_EXPORT      = Path("data/ipo_latest_run.json")
-VERSION          = "IPO-SNIPER-v5.5-DB-MIGRATION-FIXED"
+VERSION          = "IPO-SNIPER-v5.6-TELEGRAM-KELLY-FIXED"
 MC_RUNS          = 50_000
 KELLY_FRACTION   = 0.25
 MAX_SYNDICATE    = 10
@@ -927,8 +924,22 @@ def compute_allotment(row: pd.Series) -> AllotmentProfile:
     p_mc, ci_lo, ci_hi = monte_carlo_allotment(sub, lot, size, price)
     matrix  = {k: round(1-(1-p_mc)**k, 6) for k in range(1, MAX_SYNDICATE+1)}
     gain    = gmp * price * lot
-    b_odds  = gain / max(1.0, 1500.0)
     cost    = lot * price
+
+    # FIX M: b_odds for Kelly must reflect actual capital at risk, not a static floor.
+    # In an IPO application the principal is returned if unallotted — so the true
+    # downside is NOT the full lot cost. It is:
+    #   (1) Opportunity cost: ~5.5% annual STCG-free return foregone during lock-up
+    #       = cost * 0.055 * (days_locked / 365), where lock-up ≈ 7 days typical
+    #   (2) Listing-gap risk on allotment: empirical SME/mainboard gap ~2-4% adverse
+    #       = price * lot * GAP_FLOOR_PCT
+    # b_odds = net_gain / effective_downside  (units: INR / INR = dimensionless ratio)
+    days_locked     = max(6, int(row.get("DaysToClose", 7))) + 2   # +2 for T+2 settlement
+    opp_cost        = cost * 0.055 * (days_locked / 365)           # opportunity cost in INR
+    GAP_FLOOR_PCT   = 0.025                                         # 2.5% adverse listing gap
+    gap_risk        = price * lot * GAP_FLOOR_PCT                   # worst-case allotment loss
+    effective_risk  = max(1.0, opp_cost + gap_risk)                 # total risk INR, always > 0
+    b_odds          = gain / effective_risk                          # true net odds ratio
 
     best_k, best_ev = 1, -float("inf")
     for k, p_win in matrix.items():
@@ -1102,6 +1113,21 @@ def _tg_send_with_retry(text: str, token: str, chat_id: str,
             log.error(f"  Telegram error: {exc}")
             return
 
+def _tg_clean_symbol(sym: str) -> str:
+    """
+    Strip everything after the first occurrence of exchange/listing metadata
+    that investorgain appends to the symbol: 'BSE SMEL@...', 'NSE SMEO', etc.
+    These suffixes contain '@', '(', '%', ')' that break Telegram HTML parsing
+    even after html_lib.escape() because they arrive pre-escaped from _clean_symbol.
+    """
+    # Remove trailing exchange/market suffixes like "BSE SMEL@213.10 (34.87%)"
+    # or "NSE SMEO" or "IPOL@104.60 (4.6%)"
+    sym = re.sub(r"\s*(BSE|NSE|IPO[A-Z]?|SME[A-Z]*)\s*.*$", "", sym, flags=re.IGNORECASE).strip()
+    # Remove any stray @price or (pct%) fragments
+    sym = re.sub(r"@[\d.,]+\s*\([\d.%+-]+\)", "", sym).strip()
+    sym = re.sub(r"\s+", " ", sym).strip()
+    return sym or "UNKNOWN"
+
 def send_telegram_alerts(df: pd.DataFrame, allots: dict, shariahs: dict):
     token   = os.getenv("TELEGRAM_TOKEN",   "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -1113,64 +1139,86 @@ def send_telegram_alerts(df: pd.DataFrame, allots: dict, shariahs: dict):
     ranked   = df.copy()
     ranked["IsUpcoming"] = ranked["IsUpcoming"].fillna(False).astype(bool)
     ranked   = ranked.sort_values(["IsUpcoming","FinalScore"], ascending=[True,False])
-    live_df  = ranked[~ranked["IsUpcoming"]]
+
+    # FIX K: Only send truly open IPOs — must have DaysToClose > 0.
+    # Investorgain returns already-listed/allotted IPOs (sub=0, DaysToClose=7 default)
+    # which appear as LIVE but are closed. Filter them out for Telegram.
+    # A row is considered genuinely open if: not upcoming AND DaysToClose > 0
+    # AND (SubscriptionTimes > 0 OR FinalScore >= 60).
+    live_df  = ranked[
+        (~ranked["IsUpcoming"]) &
+        (ranked["DaysToClose"] > 0) &
+        ((ranked["SubscriptionTimes"] > 0) | (ranked["FinalScore"] >= 60))
+    ]
     upco_df  = ranked[ranked["IsUpcoming"]]
 
+    log.info(f"📨  Telegram: {len(live_df)} open IPOs, {len(upco_df)} upcoming (filtered from {len(ranked)} total)")
+
     # ── Summary header (single message) ──────────────────────────────────
-    header = (f"⚔️ <b>{VERSION}</b>\n"
-              f"📅 <b>{date_str}</b>  |  {len(live_df)} live · {len(upco_df)} upcoming\n"
+    header = (f"⚔️ <b>IPO SNIPER</b>\n"
+              f"📅 <b>{date_str}</b>  |  {len(live_df)} open · {len(upco_df)} upcoming\n"
               f"{'━'*38}\n")
     for _, row in live_df.iterrows():
-        header += (f"  {row['Verdict']} <b>{html_lib.escape(str(row['Symbol']))}</b>"
-                   f" ({row['FinalScore']:.0f})  "
-                   f"{row['SubscriptionTimes']:.1f}×  GMP {row['gmp_pct']:.1f}%\n")
+        clean_sym = html_lib.escape(_tg_clean_symbol(str(row['Symbol'])))
+        # Verdict contains emoji + text — strip emoji for inline header to avoid parse issues
+        verdict_text = re.sub(r"[^\x00-\x7F\s\w]", "", str(row['Verdict'])).strip()
+        header += (f"  <b>{clean_sym}</b>"
+                   f" ({row['FinalScore']:.0f}) "
+                   f"{row['SubscriptionTimes']:.1f}× "
+                   f"GMP {row['gmp_pct']:.1f}%\n")
     if not upco_df.empty:
         header += f"\n🕐 <b>Upcoming ({len(upco_df)})</b>\n"
         for _, row in upco_df.iterrows():
-            header += (f"  🕐 <b>{html_lib.escape(str(row['Symbol']))}</b>"
+            clean_sym = html_lib.escape(_tg_clean_symbol(str(row['Symbol'])))
+            header += (f"  <b>{clean_sym}</b>"
                        f"  ₹{row['PriceBandLower']:.0f}–{row['PriceBandUpper']:.0f}"
-                       f"  closes {row['CloseDate']}\n")
+                       f"  closes {html_lib.escape(str(row['CloseDate']))}\n")
 
     if console:
         print(f"\n[TELEGRAM HEADER]\n{header}")
     else:
         _tg_send_with_retry(header, token, chat_id)
-        # FIX E: polite gap after header before detail messages
         time.sleep(2.0)
 
-    # ── One combined detail message per live IPO ──────────────────────────
+    # ── One combined detail message per open live IPO ─────────────────────
     for _, row in live_df.iterrows():
-        sym   = str(row["Symbol"])
-        a, sh = allots[sym], shariahs[sym]
-        score = row["FinalScore"]
-        em    = "🔥" if score >= 80 else "✅" if score >= 70 else "📈" if score >= 60 else "❌"
-        src   = str(row.get("Source","live"))
+        sym       = str(row["Symbol"])
+        a, sh     = allots[sym], shariahs[sym]
+        score     = row["FinalScore"]
+        clean_sym = html_lib.escape(_tg_clean_symbol(sym))
+        em        = "🔥" if score >= 80 else "✅" if score >= 70 else "📈" if score >= 60 else "⚠️"
+
+        # FIX L: all dynamic strings passed into HTML tags must be escaped.
+        # sh.tier and row['Sector'] were previously inserted raw.
+        sector_safe = html_lib.escape(str(row['Sector']))
+        tier_safe   = html_lib.escape(str(sh.tier))
+        qabda_safe  = html_lib.escape(str(sh.qabda_mandate))
+        score_label = html_lib.escape(f"{score:.1f}/100")
 
         msg = (
-            f"{em} <b>{html_lib.escape(sym)}</b> [{row['Sector']}]\n"
-            f"   🏆 <b>{score:.1f}/100</b>  {row['Verdict']}\n"
+            f"{em} <b>{clean_sym}</b> [{sector_safe}]\n"
+            f"   🏆 <b>{score_label}</b>\n"
             f"   📊 Sub: <b>{row['SubscriptionTimes']:.1f}×</b>"
             f"  GMP: <b>{row['gmp_pct']:.1f}%</b>"
             + ("  <i>(not yet available)</i>" if row["gmp_pct"] == 0 else "") + "\n"
             f"   💹 ₹{row['PriceBandLower']:.0f}–₹{row['PriceBandUpper']:.0f}"
             f"  Lot {row['LotSize']}  Size ₹{row['IssueSizeCr']:.0f}Cr\n"
-            f"   📅 Closes: {row['CloseDate']} ({row['DaysToClose']}d left)\n"
+            f"   📅 Closes: {html_lib.escape(str(row['CloseDate']))} ({row['DaysToClose']}d left)\n"
             f"   🎲 P(Allot): <b>{a.p_single_mc*100:.3f}%</b>"
             f"  [CI: {a.ci_95[0]*100:.2f}–{a.ci_95[1]*100:.2f}%]\n"
             f"   👥 Syndicate: <b>{a.optimal_syndicate} PANs</b>"
             f"  Kelly: {a.kelly_pct:.1f}%"
             f"  EV: ₹{a.ev_inr:,.0f}\n"
-            f"   🕌 {sh.tier}  (Barakah {sh.barakah_index:.0f}/100)\n"
+            f"   🕌 {tier_safe}  (Barakah {sh.barakah_index:.0f}/100)\n"
         )
         if sh.deferred_issues:
             msg += "   🚨 " + " | ".join(html_lib.escape(i) for i in sh.deferred_issues) + "\n"
-        msg += f"   ⚖️ {html_lib.escape(sh.qabda_mandate)}"
+        msg += f"   ⚖️ {qabda_safe}"
 
         if console:
             print(f"\n[TELEGRAM IPO]\n{msg}\n{'─'*55}")
         else:
             _tg_send_with_retry(msg, token, chat_id)
-            # FIX E: 2s gap between messages — stays well under Telegram's ~30 msg/s limit
             time.sleep(2.0)
 
 # ═══════════════════════════════════════════════════════════
