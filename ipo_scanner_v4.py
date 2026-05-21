@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║        IPO SNIPER v5.6 — TELEGRAM FILTER + HTML ESCAPE + KELLY FIX        ║
+║        IPO SNIPER v5.7 — OPEN-ONLY TELEGRAM + UPCOMING FIX + NSE STEALTH  ║
 ║                                                                              ║
-║  FIXES vs v5.5:                                                              ║
-║  K. Telegram sent 40+ IPOs including closed/allotted ones → now only sends  ║
-║     rows where DaysToClose > 0 AND (SubscriptionTimes > 0 OR score ≥ 60).  ║
-║     Investorgain returns listed IPOs with their post-listing data; these    ║
-║     have sub=0 and score ❌ SKIP and must be excluded from alerts.           ║
-║  L. Telegram 400 "can't parse entities" → two root causes fixed:            ║
-║     (a) Symbol field from investorgain contains raw suffix text like        ║
-║         "BSE SMEL@213.10 (34.87%)" — new _tg_clean_symbol() strips these   ║
-║         exchange/listing suffixes before html_lib.escape() is applied.      ║
-║     (b) sh.tier, row['Sector'], CloseDate inserted raw into HTML tags;      ║
-║         all dynamic strings now escaped individually before interpolation.  ║
-║  M. Kelly b_odds used static floor of 1500 INR → overstates downside since  ║
-║     IPO principal is returned on miss. Now uses actual risk model:          ║
-║     effective_risk = opportunity_cost(7-day lock-up @5.5%) + listing-gap   ║
-║     risk (2.5% adverse gap on allotted lot). b_odds = gain / effective_risk.║
+║  FIXES vs v5.6:                                                              ║
+║  N. Telegram still sent listed/allotted IPOs → root cause was in            ║
+║     _parse_ig_soup(): the raw symbol cell from Investorgain embeds status   ║
+║     codes BEFORE _clean_symbol strips them:                                  ║
+║       "L" suffix (e.g. "BSE SMEL") = Listed → now SKIPPED at parse time    ║
+║       "C" suffix or "Allotted" text = Closed/Allotted → SKIPPED at source  ║
+║       "U" suffix = Upcoming → IsUpcoming=True                               ║
+║       "@price (-pct%)" = listed with return shown → SKIPPED                 ║
+║     Listed/allotted rows are now dropped before they ever enter the df.     ║
+║  O. Upcoming ₹97–100 / 2026-06-10 everywhere → Chittorgarh upcoming page   ║
+║     is a DRHP filing list with no price/date columns. _parse_html_table     ║
+║     fell through to hardcoded "100" default, producing ₹97–100 for all.    ║
+║     Now: upcoming rows with default-value price (≤100) get lo=hi=0 (TBD).  ║
+║     Telegram shows "Price TBD / Date TBD" instead of fake ₹97–100.         ║
+║  P. Source C (NSE) 403 on all endpoints → NSE uses TLS fingerprinting +    ║
+║     JS challenge cookies; plain HTTP requests always get 403/404 regardless ║
+║     of headers. Fixed by switching to Playwright (same as Sources A & B)    ║
+║     with full browser stealth. Intercepts XHR JSON on page load.           ║
+║     Falls back to HTML scrape if no JSON intercepted. Non-fatal if blocked. ║
 ║                                                                              ║
-║  RETAINED: A–J fixes from v5.4 and v5.5.                                   ║
+║  RETAINED: A–M fixes from v5.4–v5.6.                                       ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -46,7 +50,7 @@ except ImportError:
 IPO_DB_PATH      = Path("data/ipo_sniper_v5.db")
 FALLBACK_CSV     = Path("data/ipo_fallback_v5.csv")
 JSON_EXPORT      = Path("data/ipo_latest_run.json")
-VERSION          = "IPO-SNIPER-v5.6-TELEGRAM-KELLY-FIXED"
+VERSION          = "IPO-SNIPER-v5.7-OPEN-ONLY-TELEGRAM"
 MC_RUNS          = 50_000
 KELLY_FRACTION   = 0.25
 MAX_SYNDICATE    = 10
@@ -226,15 +230,27 @@ def _parse_html_table(table, ipo_type: str, source_tag: str,
         if size > 50_000:
             size /= 1e7
 
-        lo, hi  = _parse_price_band(_c("price", "100"))
+        lo, hi  = _parse_price_band(_c("price", ""))
         lot     = _int(_c("lot", "")) or (1000 if sector == "SME" else 50)
+
+        # FIX O: Chittorgarh upcoming page (/report/upcoming-ipo/) is a DRHP filing list.
+        # It has no price band or lot size columns (those aren't filed yet).
+        # Previous code fell through to _parse_price_band("100") default, producing
+        # fake ₹97–100 bands. Now: if price parse returned defaults (lo==95, hi==100)
+        # AND is_upcoming is True, treat as TBD — emit 0/0 so Telegram shows "TBD".
+        if is_upcoming and hi <= 100 and lo >= 95:
+            lo, hi = 0.0, 0.0   # TBD — price not yet announced
 
         # FIX F: real close date, never hardcoded
         close_raw = _c("close", "")
         close_dt  = _parse_date(close_raw) if close_raw else None
         if close_dt is None:
-            # For upcoming IPOs we accept a wider unknown horizon
-            close_dt = TODAY + timedelta(days=20 if is_upcoming else 10)
+            if is_upcoming:
+                # Upcoming with unknown date: use a sentinel 20-day placeholder
+                # but mark it clearly so downstream can show "TBD"
+                close_dt = TODAY + timedelta(days=20)
+            else:
+                close_dt = TODAY + timedelta(days=10)
 
         gmp_raw = _c("gmp", "")
         if gmp_raw:
@@ -548,7 +564,30 @@ def fetch_source_b_investorgain() -> pd.DataFrame:
                 idx = col.get(key)
                 return cells[idx].get_text(strip=True) if idx is not None and idx < len(cells) else default
 
-            symbol = _clean_symbol(cells[col["sym"]].get_text(strip=True))
+            # FIX N: Extract raw symbol cell text BEFORE _clean_symbol strips status markers.
+            # Investorgain appends status codes into the symbol cell text:
+            #   "L"  = Listed (closed, showing post-listing GMP)     → SKIP
+            #   "C"  = Closed / Allotted                             → SKIP
+            #   "O"  = Open for subscription                         → KEEP
+            #   "U"  = Upcoming (not yet open)                       → mark IsUpcoming
+            # The suffix also contains listing price like "@213.10 (34.87%)" for listed ones.
+            # A negative pct in brackets, e.g. "(-14.75%)" = listed with loss = definitely closed.
+            sym_raw = cells[col["sym"]].get_text(strip=True)
+
+            # Detect status from suffix codes (BSE/NSE SMEL/SMEO/SMEU/SMECT/IPOL)
+            # "L" anywhere after exchange code = Listed
+            ig_listed  = bool(re.search(r"(BSE|NSE)\s*SME[A-Z]*L\b", sym_raw, re.I) or
+                              re.search(r"IPOL\b", sym_raw, re.I) or
+                              re.search(r"@[\d.]+\s*\([+-]?[\d.]+%\)", sym_raw))
+            ig_allotted = bool(re.search(r"Allotted|Allot\b", sym_raw, re.I) or
+                               re.search(r"(BSE|NSE)\s*SME[A-Z]*C\b", sym_raw, re.I))
+            ig_upcoming = bool(re.search(r"(BSE|NSE)\s*SME[A-Z]*U\b", sym_raw, re.I))
+
+            # Skip listed and allotted IPOs entirely — they are NOT open for subscription
+            if ig_listed or ig_allotted:
+                continue
+
+            symbol = _clean_symbol(sym_raw)
             if not symbol or len(symbol) < 3 or symbol.lower() in SKIP_SYMBOLS:
                 continue
 
@@ -560,7 +599,17 @@ def fetch_source_b_investorgain() -> pd.DataFrame:
             sub      = _flt(_c("sub", "0"), 0.0)
             size     = _flt(_c("size", "50"), 50.0)
             lot      = _int(_c("lot", "")) or 1000
-            close_dt = _parse_date(_c("close", "")) or (TODAY + timedelta(days=7))
+
+            # For upcoming rows, close date is often missing — use open-ended placeholder
+            close_raw = _c("close", "")
+            if close_raw:
+                close_dt = _parse_date(close_raw) or (TODAY + timedelta(days=20 if ig_upcoming else 7))
+            else:
+                close_dt = TODAY + timedelta(days=20 if ig_upcoming else 7)
+
+            days = (close_dt - TODAY).days
+            # If sub > 0 the IPO is currently open regardless of status suffix
+            is_open = sub > 0.0 or (not ig_upcoming and not ig_listed and not ig_allotted)
 
             records.append({
                 "Symbol":            symbol,
@@ -573,8 +622,8 @@ def fetch_source_b_investorgain() -> pd.DataFrame:
                 "gmp_pct":           round(gmp * 100, 2),
                 "SubscriptionTimes": round(sub, 2),
                 "CloseDate":         close_dt.strftime("%Y-%m-%d"),
-                "DaysToClose":       (close_dt - TODAY).days,
-                "IsUpcoming":        False,
+                "DaysToClose":       days,
+                "IsUpcoming":        ig_upcoming,
                 "Source":            "investorgain_gmp",
             })
         return pd.DataFrame(records)
@@ -624,92 +673,140 @@ def fetch_source_b_investorgain() -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════
 def fetch_source_c_nse() -> pd.DataFrame:
     """
-    FIX C (v2): Previous replacement endpoints were also 404 (they were still
-    the deprecated ones). Now uses /api/ipo-info (mainboard upcoming),
-    /api/emerge-live?category=ipo (SME live), and the live-analysis-data feed
-    as a third fallback. Warmup extended to hit the SME page too.
+    FIX C (v3): NSE returns 403/404 to all HTTP clients (including requests-with-cookies)
+    because it uses TLS fingerprinting + JS challenge cookies that only a real browser sets.
+    The only way to hit NSE API is via Playwright with stealth mode (same as Sources A & B).
+
+    Strategy:
+      1. Use Playwright to load the NSE IPO page and intercept the API JSON response.
+      2. NSE fires /api/getAllIpo or /api/ipo-detail on page load — intercept it.
+      3. If no JSON intercepted, scrape the rendered HTML table as fallback.
+      4. If Playwright unavailable, log clearly and return empty (Sources A+B are sufficient).
     """
     log.info("━━ SOURCE C: NSE India API ━━")
-    sess = _make_session("https://www.nseindia.com/")
-    sess.headers.update({
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.nseindia.com/market-data/upcoming-issues-ipo",
-    })
-    for url in NSE_WARMUP:
-        try:
-            sess.get(url, timeout=12)
-        except Exception:
-            pass
-        _jitter(1.5, 2.5)
+
+    if not PLAYWRIGHT_OK:
+        log.warning("  ⚠️  SOURCE C: Playwright not available — skipping NSE")
+        return pd.DataFrame()
+
+    NSE_IPO_PAGE = "https://www.nseindia.com/market-data/upcoming-issues-ipo"
+    # NSE fires one of these XHR calls when the IPO page loads
+    NSE_API_PATTERNS = [
+        "/api/getAllIpo", "/api/ipo-detail", "/api/ipo",
+        "/api/ipo-info", "/api/emerge-live", "/api/live-analysis-data",
+    ]
 
     records: List[dict] = []
-    seen: set = set()
+    intercepted_data: List[dict] = []
 
-    for endpoint, sector in NSE_ENDPOINTS:
-        try:
-            resp = sess.get(endpoint, timeout=20)
-            log.info(f"  NSE [{sector}] → {resp.status_code} ({endpoint.split('/')[-1][:30]})")
-            if resp.status_code != 200 or len(resp.content) < 30:
-                continue
-            deny = resp.headers.get("x-deny-reason", "")
-            if deny:
-                log.warning(f"  NSE blocked: {deny}")
-                continue
-            data  = resp.json()
-            # NSE wraps in various keys depending on endpoint
-            items = (data if isinstance(data, list) else
-                     data.get("data", data.get("ipoData",
-                     data.get("ipo", data.get("allIpo", [])))))
-            if not isinstance(items, list):
-                items = [items] if isinstance(items, dict) else []
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox", "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                ]
+            )
+            ctx = browser.new_context(
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"),
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
+                viewport={"width": 1366, "height": 768},
+                extra_http_headers={
+                    "Accept-Language": "en-IN,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                }
+            )
+            page = ctx.new_page()
 
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                sym = str(item.get("symbol",
-                          item.get("companyName",
-                          item.get("issuerName",
-                          item.get("name", ""))))).strip()
-                if not sym or len(sym) < 2 or sym in seen:
-                    continue
+            # Intercept JSON API responses
+            def _on_nse_resp(resp):
+                try:
+                    if any(pat in resp.url for pat in NSE_API_PATTERNS):
+                        if resp.status == 200:
+                            ct = resp.headers.get("content-type", "")
+                            if "json" in ct:
+                                body = resp.json()
+                                items = (body if isinstance(body, list) else
+                                         body.get("data", body.get("ipoData",
+                                         body.get("allIpo", body.get("ipo", [])))))
+                                if isinstance(items, list) and items:
+                                    intercepted_data.extend(items)
+                                    log.info(f"  NSE intercept: {len(items)} rows from {resp.url.split('/')[-1][:40]}")
+                except Exception:
+                    pass
 
-                lo, hi = _parse_price_band(str(item.get("priceBand",
-                                              item.get("issuePrice", "100"))))
-                size_raw = item.get("issueSize", item.get("totalIssueSizeCr",
-                           item.get("issueSizeCrores", 50.0)))
-                size = _flt(size_raw, 50.0)
-                if size > 50_000:
-                    size /= 1e7
-                lot = _int(item.get("lotSize", item.get("minBidQuantity", 0))) or \
-                      (1000 if sector == "SME" else 50)
-                sub_raw = str(item.get("subscriptionTimes",
-                              item.get("subscriptionStatus", "0")))
-                sub = _flt(re.search(r"[\d.]+", sub_raw).group()
-                           if re.search(r"[\d.]+", sub_raw) else "0")
-                close_dt = _parse_date(str(item.get("closeDate",
-                                           item.get("biddingEndDate",
-                                           item.get("closingDate", ""))))) or \
-                           (TODAY + timedelta(days=10))
-                seen.add(sym)
-                records.append({
-                    "Symbol": sym, "Sector": sector,
-                    "IssueSizeCr": round(size, 2),
-                    "PriceBandLower": lo, "PriceBandUpper": hi,
-                    "LotSize": lot,
-                    "GMP": 0.0, "gmp_pct": 0.0,
-                    "SubscriptionTimes": round(sub, 2),
-                    "CloseDate": close_dt.strftime("%Y-%m-%d"),
-                    "DaysToClose": (close_dt - TODAY).days,
-                    "IsUpcoming": sub == 0.0,
-                    "Source": "nse_api",
-                })
-            _jitter(1.5, 3.0)
-        except Exception as exc:
-            log.warning(f"  NSE error: {exc}")
+            page.on("response", _on_nse_resp)
+
+            # Warmup: hit NSE homepage to get cookies, then the IPO page
+            try:
+                page.goto("https://www.nseindia.com/", wait_until="domcontentloaded", timeout=30_000)
+                _jitter(1.5, 2.5)
+                page.goto(NSE_IPO_PAGE, wait_until="networkidle", timeout=45_000)
+                _jitter(2.0, 3.0)
+            except Exception as exc:
+                log.warning(f"  NSE page load error: {exc}")
+
+            if intercepted_data:
+                # Parse intercepted JSON items
+                seen: set = set()
+                for item in intercepted_data:
+                    if not isinstance(item, dict):
+                        continue
+                    sym = str(item.get("symbol", item.get("companyName",
+                              item.get("issuerName", item.get("name", ""))))).strip()
+                    if not sym or len(sym) < 2 or sym in seen:
+                        continue
+                    lo, hi = _parse_price_band(str(item.get("priceBand",
+                                               item.get("issuePrice", "100"))))
+                    size_raw = item.get("issueSize", item.get("issueSizeCrores", 50.0))
+                    size = _flt(size_raw, 50.0)
+                    if size > 50_000:
+                        size /= 1e7
+                    lot  = _int(item.get("lotSize", item.get("minBidQuantity", 0))) or 50
+                    sub_raw = str(item.get("subscriptionTimes", item.get("subscriptionStatus", "0")))
+                    sub  = _flt(re.search(r"[\d.]+", sub_raw).group() if re.search(r"[\d.]+", sub_raw) else "0")
+                    close_dt = _parse_date(str(item.get("closeDate",
+                                              item.get("biddingEndDate",
+                                              item.get("closingDate", ""))))) or \
+                               (TODAY + timedelta(days=10))
+                    is_up = sub == 0.0 or close_dt > TODAY + timedelta(days=2)
+                    seen.add(sym)
+                    records.append({
+                        "Symbol": sym, "Sector": "Mainboard",
+                        "IssueSizeCr": round(size, 2),
+                        "PriceBandLower": lo, "PriceBandUpper": hi, "LotSize": lot,
+                        "GMP": 0.0, "gmp_pct": 0.0,
+                        "SubscriptionTimes": round(sub, 2),
+                        "CloseDate": close_dt.strftime("%Y-%m-%d"),
+                        "DaysToClose": (close_dt - TODAY).days,
+                        "IsUpcoming": is_up, "Source": "nse_playwright",
+                    })
+            else:
+                # HTML scrape fallback
+                soup = BeautifulSoup(page.content(), "html.parser")
+                for tbl in soup.find_all("table"):
+                    if len(tbl.find_all("tr")) > 3:
+                        df_tbl = _parse_html_table(tbl, "Mainboard", "nse_html", is_upcoming=False)
+                        if not df_tbl.empty:
+                            log.info(f"  NSE HTML fallback: {len(df_tbl)} rows")
+                            browser.close()
+                            return df_tbl
+
+            browser.close()
+
+    except Exception as exc:
+        log.warning(f"  NSE Playwright error: {exc}")
 
     df = pd.DataFrame(records)
-    log.info(f"  ✅ SOURCE C: {len(df)} rows" if not df.empty else "  ⚠️  SOURCE C: no data")
+    if not df.empty:
+        log.info(f"  ✅ SOURCE C: {len(df)} rows")
+    else:
+        log.warning("  ⚠️  SOURCE C: no data (NSE may be blocking headless — Sources A+B are sufficient)")
     return df
 
 # ═══════════════════════════════════════════════════════════
@@ -1140,15 +1237,14 @@ def send_telegram_alerts(df: pd.DataFrame, allots: dict, shariahs: dict):
     ranked["IsUpcoming"] = ranked["IsUpcoming"].fillna(False).astype(bool)
     ranked   = ranked.sort_values(["IsUpcoming","FinalScore"], ascending=[True,False])
 
-    # FIX K: Only send truly open IPOs — must have DaysToClose > 0.
-    # Investorgain returns already-listed/allotted IPOs (sub=0, DaysToClose=7 default)
-    # which appear as LIVE but are closed. Filter them out for Telegram.
-    # A row is considered genuinely open if: not upcoming AND DaysToClose > 0
-    # AND (SubscriptionTimes > 0 OR FinalScore >= 60).
+    # FIX K (v2): Listed/Allotted IPOs are now dropped at source in _parse_ig_soup (FIX N).
+    # The remaining filter here is a safety net: DaysToClose must be > 0 (not already closed).
+    # We also require sub > 0 OR score >= 55 to exclude zero-data stragglers that
+    # slipped through with a placeholder close date.
     live_df  = ranked[
         (~ranked["IsUpcoming"]) &
         (ranked["DaysToClose"] > 0) &
-        ((ranked["SubscriptionTimes"] > 0) | (ranked["FinalScore"] >= 60))
+        ((ranked["SubscriptionTimes"] > 0) | (ranked["FinalScore"] >= 55))
     ]
     upco_df  = ranked[ranked["IsUpcoming"]]
 
@@ -1170,9 +1266,11 @@ def send_telegram_alerts(df: pd.DataFrame, allots: dict, shariahs: dict):
         header += f"\n🕐 <b>Upcoming ({len(upco_df)})</b>\n"
         for _, row in upco_df.iterrows():
             clean_sym = html_lib.escape(_tg_clean_symbol(str(row['Symbol'])))
-            header += (f"  <b>{clean_sym}</b>"
-                       f"  ₹{row['PriceBandLower']:.0f}–{row['PriceBandUpper']:.0f}"
-                       f"  closes {html_lib.escape(str(row['CloseDate']))}\n")
+            lo_p, hi_p = float(row['PriceBandLower']), float(row['PriceBandUpper'])
+            price_str = f"₹{lo_p:.0f}–{hi_p:.0f}" if hi_p > 0 else "Price TBD"
+            close_str = str(row['CloseDate']) if row['CloseDate'] != (TODAY + timedelta(days=20)).strftime("%Y-%m-%d") else "Date TBD"
+            header += (f"  <b>{clean_sym}</b>  {price_str}"
+                       f"  opens {html_lib.escape(close_str)}\n")
 
     if console:
         print(f"\n[TELEGRAM HEADER]\n{header}")
