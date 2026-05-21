@@ -4,3 +4,4 @@ pandas>=2.1.0
 numpy>=1.26.0
 lxml>=4.9.0
 playwright>=1.40.0
+cloudscraper
