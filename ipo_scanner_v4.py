@@ -241,16 +241,21 @@ def _parse_html_table(table, ipo_type: str, source_tag: str,
         if is_upcoming and hi <= 100 and lo >= 95:
             lo, hi = 0.0, 0.0   # TBD — price not yet announced
 
-        # FIX F: real close date, never hardcoded
+        # FIX F + FIX R: real close date parsing.
+        # For LIVE Chittorgarh rows: if close date is missing/unparseable, use TODAY+1
+        # (not TODAY+10). The subscription-status page shows the last 10 IPOs regardless
+        # of status — closed ones have past close dates; if we can't parse the date we
+        # must not assume +10 days (that lets closed IPOs through). +1 means they get
+        # DaysToClose=1, survive this run only, and are flagged at next run.
+        # For UPCOMING rows: +20 is fine (DRHP list, genuinely pre-open).
         close_raw = _c("close", "")
         close_dt  = _parse_date(close_raw) if close_raw else None
         if close_dt is None:
             if is_upcoming:
-                # Upcoming with unknown date: use a sentinel 20-day placeholder
-                # but mark it clearly so downstream can show "TBD"
                 close_dt = TODAY + timedelta(days=20)
             else:
-                close_dt = TODAY + timedelta(days=10)
+                # Use tomorrow as safe fallback — won't let truly closed IPOs fake future dates
+                close_dt = TODAY + timedelta(days=1)
 
         gmp_raw = _c("gmp", "")
         if gmp_raw:
@@ -564,26 +569,43 @@ def fetch_source_b_investorgain() -> pd.DataFrame:
                 idx = col.get(key)
                 return cells[idx].get_text(strip=True) if idx is not None and idx < len(cells) else default
 
-            # FIX N: Extract raw symbol cell text BEFORE _clean_symbol strips status markers.
-            # Investorgain appends status codes into the symbol cell text:
-            #   "L"  = Listed (closed, showing post-listing GMP)     → SKIP
-            #   "C"  = Closed / Allotted                             → SKIP
-            #   "O"  = Open for subscription                         → KEEP
-            #   "U"  = Upcoming (not yet open)                       → mark IsUpcoming
-            # The suffix also contains listing price like "@213.10 (34.87%)" for listed ones.
-            # A negative pct in brackets, e.g. "(-14.75%)" = listed with loss = definitely closed.
+            # FIX N (v2): Investorgain BSE/NSE suffix codes are market-segment + status badges.
+            # Format: "{Exchange} {Segment}{StatusCode}" e.g. "BSE SMEO", "NSE SMEL", "IPOL"
+            # Confirmed status codes from observed data:
+            #   O  = Open (currently accepting bids)           → KEEP as LIVE
+            #   U  = Undersubscribed (open, low demand)        → KEEP as LIVE (NOT upcoming)
+            #   T  = Today closing (last day)                  → KEEP as LIVE
+            #   CT = Closed Today (just closed)               → SKIP
+            #   C  = Closed / awaiting allotment              → SKIP
+            #   L  = Listed (post-IPO, showing listing return) → SKIP
+            #   IPOL = IPO Listed (mainboard listed)           → SKIP
+            #   @price (pct%) = listing price shown            → SKIP (always listed)
             sym_raw = cells[col["sym"]].get_text(strip=True)
 
-            # Detect status from suffix codes (BSE/NSE SMEL/SMEO/SMEU/SMECT/IPOL)
-            # "L" anywhere after exchange code = Listed
-            ig_listed  = bool(re.search(r"(BSE|NSE)\s*SME[A-Z]*L\b", sym_raw, re.I) or
-                              re.search(r"IPOL\b", sym_raw, re.I) or
-                              re.search(r"@[\d.]+\s*\([+-]?[\d.]+%\)", sym_raw))
-            ig_allotted = bool(re.search(r"Allotted|Allot\b", sym_raw, re.I) or
-                               re.search(r"(BSE|NSE)\s*SME[A-Z]*C\b", sym_raw, re.I))
-            ig_upcoming = bool(re.search(r"(BSE|NSE)\s*SME[A-Z]*U\b", sym_raw, re.I))
+            # Extract the status code after the exchange+segment prefix
+            status_match = re.search(
+                r"\b(?:BSE|NSE)\s+SME([A-Z]{1,3})\b"
+                r"|IPOL\b"
+                r"|IPO([A-Z])\b",
+                sym_raw, re.I
+            )
+            status_code = ""
+            if status_match:
+                status_code = (status_match.group(1) or status_match.group(2) or "").upper()
+                if "IPOL" in sym_raw.upper():
+                    status_code = "L"
 
-            # Skip listed and allotted IPOs entirely — they are NOT open for subscription
+            # Listing price suffix = always listed regardless of other codes
+            has_listing_price = bool(re.search(r"@[\d.]+\s*\([+-]?[\d.]+%\)", sym_raw))
+            has_allotted_text = bool(re.search(r"\bAllotted\b", sym_raw, re.I))
+
+            SKIP_CODES  = {"L", "C", "CT"}   # Listed, Closed, Closed-Today
+            OPEN_CODES  = {"O", "U", "T", ""}  # Open, Undersubscribed, Today-closing, unknown
+
+            ig_listed   = has_listing_price or status_code == "L"
+            ig_allotted = has_allotted_text or status_code in ("C", "CT")
+            ig_upcoming = False   # Investorgain live-GMP page doesn't show pre-open IPOs
+
             if ig_listed or ig_allotted:
                 continue
 
@@ -1212,16 +1234,32 @@ def _tg_send_with_retry(text: str, token: str, chat_id: str,
 
 def _tg_clean_symbol(sym: str) -> str:
     """
-    Strip everything after the first occurrence of exchange/listing metadata
-    that investorgain appends to the symbol: 'BSE SMEL@...', 'NSE SMEO', etc.
-    These suffixes contain '@', '(', '%', ')' that break Telegram HTML parsing
-    even after html_lib.escape() because they arrive pre-escaped from _clean_symbol.
+    Strip Investorgain exchange/status suffixes that are GLUED to the end of the
+    company name: e.g. "Q-Line BiotecNSE SMEO", "MerritronixBSE SMEU".
+
+    FIX Q: Previous regex `\\s*(BSE|NSE|SME[A-Z]*)\\s*.*$` was greedy and mid-string.
+    It would match "NSE" inside "NSEBTech Ltd" or "SME" inside "Malabar SME Foods",
+    truncating valid company names. Fixed with an end-anchored lookbehind pattern that
+    only strips when the badge is glued directly to the end of the name.
     """
-    # Remove trailing exchange/market suffixes like "BSE SMEL@213.10 (34.87%)"
-    # or "NSE SMEO" or "IPOL@104.60 (4.6%)"
-    sym = re.sub(r"\s*(BSE|NSE|IPO[A-Z]?|SME[A-Z]*)\s*.*$", "", sym, flags=re.IGNORECASE).strip()
-    # Remove any stray @price or (pct%) fragments
-    sym = re.sub(r"@[\d.,]+\s*\([\d.%+-]+\)", "", sym).strip()
+    # Match the Investorgain badge suffix anchored to end-of-string.
+    # Badge is always glued (no space) to last char of company name.
+    # Pattern: (BSE|NSE)(optional space)(SME)(1-3 uppercase letters)(optional @price(pct%))
+    sym = re.sub(
+        r"(?<=[A-Za-z0-9.])"                        # glued to company name char
+        r"(?:BSE|NSE)"                               # exchange
+        r"\s*(?:SME[A-Z]{0,3}|EMERGE[A-Z]{0,3})"   # segment + status code
+        r"(?:@[\d.]+\s*\([+-]?[\d.]+%\))?"          # optional @price(pct%)
+        r"\s*$",                                     # end of string
+        "", sym
+    ).strip()
+    # Mainboard IPO listing suffix: "IPOL@price(pct%)" or "IPON" etc.
+    sym = re.sub(
+        r"(?<=[A-Za-z0-9.])IPO[A-Z]?(?:@[\d.]+\s*\([+-]?[\d.]+%\))?\s*$",
+        "", sym
+    ).strip()
+    # Stray @price(pct%) not caught above
+    sym = re.sub(r"@[\d.,]+\s*\([+-]?[\d.%]+\)\s*$", "", sym).strip()
     sym = re.sub(r"\s+", " ", sym).strip()
     return sym or "UNKNOWN"
 
