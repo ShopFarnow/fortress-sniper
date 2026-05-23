@@ -79,11 +79,12 @@ class IPORecord:
     listing_date: Optional[str]   = None
     issue_price:  Optional[str]   = None
     lot_size:     Optional[str]   = None
-    gmp:          Optional[str]   = None
-    allotment_date: Optional[str] = None
-    status:       IPOStatus       = IPOStatus.UNKNOWN
+    gmp:           Optional[str]   = None
+    allotment_date: Optional[str]  = None
+    listing_price:  Optional[str]  = None   # numeric price at listing (NOT a date)
+    status:        IPOStatus       = IPOStatus.UNKNOWN
     # internal normalised key (not serialised)
-    _norm_key:    str              = field(default="", repr=False)
+    _norm_key:     str             = field(default="", repr=False)
 
     def merge(self, other: "IPORecord") -> None:
         """Absorb fields from another record for the same IPO."""
@@ -91,7 +92,8 @@ class IPORecord:
             if src not in self.sources:
                 self.sources.append(src)
         for attr in ("open_date", "close_date", "listing_date",
-                     "issue_price", "lot_size", "gmp", "allotment_date"):
+                     "issue_price", "lot_size", "gmp", "allotment_date",
+                     "listing_price"):
             if not getattr(self, attr) and getattr(other, attr):
                 setattr(self, attr, getattr(other, attr))
 
@@ -211,6 +213,11 @@ def compute_status(rec: IPORecord, today: Optional[datetime] = None) -> IPOStatu
     if listing_dt and listing_dt > today:
         return IPOStatus.UPCOMING
 
+    # Heuristic: record has a listing_price but no parseable dates
+    # → it came from a historical data dump (e.g. IndiaTrade), treat as Listed
+    if rec.listing_price and not open_dt and not close_dt and not listing_dt:
+        return IPOStatus.LISTED
+
     # Heuristic fall-through
     name_lower = rec.name.lower()
     if any(tok in name_lower for tok in ("sme ipo", "upcoming")):
@@ -313,7 +320,8 @@ def deduplicate(records: list[IPORecord]) -> list[IPORecord]:
 
 def _field_count(rec: IPORecord) -> int:
     return sum(1 for f in (rec.open_date, rec.close_date, rec.listing_date,
-                           rec.issue_price, rec.lot_size, rec.gmp) if f)
+                           rec.issue_price, rec.lot_size, rec.gmp,
+                           rec.listing_price) if f)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -393,29 +401,58 @@ class CircuitBreaker:
 # 7. RAW ROW → IPORecord  (shared helper)
 # ══════════════════════════════════════════════════════════════════════════════
 
+_PURE_PRICE_RE = re.compile(r"^[₹\s]*[\d,]+\.?\d*\s*$")  # "1015.00", "₹120", "2,600"
+
+
+def _is_price_string(s: str | None) -> bool:
+    """Return True if the string looks like a pure numeric price, not a date."""
+    if not s:
+        return False
+    clean = s.strip().replace(",", "")
+    return bool(_PURE_PRICE_RE.match(clean))
+
+
 def _make_record(source: str, name: str, **kwargs) -> Optional[IPORecord]:
     name = _clean_name(name)
     if not name or len(name) < 3:
         return None
+    # Skip rows where the "name" cell is a bare price like "₹120" or "135"
+    # but allow real company names that start with digits e.g. "3M India"
+    if _is_price_string(name):
+        return None
     rec              = IPORecord(name=name, sources=[source])
     rec.open_date    = kwargs.get("open_date") or None
     rec.close_date   = kwargs.get("close_date") or None
-    rec.listing_date = kwargs.get("listing_date") or None
     rec.issue_price  = _clean_price(kwargs.get("issue_price"))
     rec.lot_size     = kwargs.get("lot_size") or None
     rec.gmp          = kwargs.get("gmp") or None
     rec._norm_key    = normalise_name(name)
+
+    # listing_date vs listing_price: if the value looks like a pure number
+    # (e.g. IndiaTrade sends "1015.00") it is a price at listing, not a date
+    raw_listing = kwargs.get("listing_date") or None
+    if raw_listing:
+        if _is_price_string(raw_listing):
+            rec.listing_price = raw_listing          # store as price
+        elif parse_date(raw_listing) is not None:
+            rec.listing_date  = raw_listing          # valid date string
+        # else: ambiguous / garbage → discard
     return rec
 
 
 def _clean_name(raw: str) -> str:
     if not raw:
         return ""
-    # Remove trailing date ranges stuck to the name
-    raw = re.sub(r"\d{1,2}\s*[-–]\s*\d{1,2}\s+[A-Za-z]+(\s+\d{4})?$", "", raw)
+    # Collapse all whitespace (newlines, tabs, multiple spaces) to single space
+    raw = re.sub(r"\s+", " ", raw).strip()
+    raw = re.sub(r" {2,}", " ", raw).strip()
     # Remove parenthetical suffixes: (SME IPO), (NSE SME), etc.
-    raw = re.sub(r"\s*\(.*?\)\s*$", "", raw)
-    return raw.strip()
+    # Use re.DOTALL so . matches newlines that may survive the first pass
+    raw = re.sub(r"\s*\([^)]*\)\s*$", "", raw, flags=re.DOTALL)
+    raw = re.sub(r" {2,}", " ", raw).strip()
+    # Remove trailing date ranges stuck to the name
+    raw = re.sub(r"\d{1,2}\s*[-–]\s*\d{1,2}\s+[A-Za-z]+(\s+\d{4})?$", "", raw).strip()
+    return raw
 
 
 def _clean_price(raw: str | None) -> Optional[str]:
@@ -455,8 +492,12 @@ def _parse_tables(soup: BeautifulSoup, source: str) -> list[IPORecord]:
                 col["lot"]     = i
             elif "gmp" in h and "gmp" not in col:
                 col["gmp"]     = i
-            elif "list" in h and "listing" not in col:
+            elif ("listing date" in h or ("list" in h and "date" in h)
+                  or h in ("listing", "listed on", "list date")) and "listing" not in col:
                 col["listing"] = i
+            elif ("listing price" in h or "list price" in h
+                  or h in ("listed price", "listing@")) and "lprice" not in col:
+                col["lprice"]  = i
 
         if "name" not in col:
             col["name"] = 0
@@ -470,6 +511,8 @@ def _parse_tables(soup: BeautifulSoup, source: str) -> list[IPORecord]:
                 idx = col.get(k, -1)
                 return cells[idx] if 0 <= idx < len(cells) else None
 
+            # Use listing date if available; fall back to listing price col
+            raw_listing = _c("listing") or _c("lprice")
             rec = _make_record(
                 source,
                 name         = _c("name") or "",
@@ -478,7 +521,7 @@ def _parse_tables(soup: BeautifulSoup, source: str) -> list[IPORecord]:
                 issue_price  = _c("price"),
                 lot_size     = _c("lot"),
                 gmp          = _c("gmp"),
-                listing_date = _c("listing"),
+                listing_date = raw_listing,
             )
             if rec:
                 records.append(rec)
@@ -835,10 +878,11 @@ def print_results(records: list[IPORecord]) -> None:
             if rec.open_date or rec.close_date:
                 date_part = f"  {rec.open_date or '?'} → {rec.close_date or '?'}"
             extras = "".join([
-                f"  ₹{rec.issue_price.lstrip('₹')}" if rec.issue_price else "",
-                f"  Lot:{rec.lot_size}"               if rec.lot_size    else "",
-                f"  GMP:{rec.gmp}"                    if rec.gmp         else "",
-                f"  Listing:{rec.listing_date}"        if rec.listing_date else "",
+                f"  ₹{rec.issue_price.lstrip('₹')}" if rec.issue_price  else "",
+                f"  Lot:{rec.lot_size}"              if rec.lot_size     else "",
+                f"  GMP:{rec.gmp}"                   if rec.gmp          else "",
+                f"  Listing:{rec.listing_date}"       if rec.listing_date else "",
+                f"  ListPrice:₹{rec.listing_price}"  if rec.listing_price else "",
             ])
             src_line = f"[{', '.join(rec.sources)}]"
             print(f"  • {rec.name}")
@@ -856,7 +900,7 @@ def save_json(records: list[IPORecord], path: str = "ipo_data.json") -> None:
 
 def save_csv(records: list[IPORecord], path: str = "ipo_data.csv") -> None:
     fields = ["name", "status", "open_date", "close_date", "listing_date",
-              "issue_price", "lot_size", "gmp", "sources"]
+              "issue_price", "listing_price", "lot_size", "gmp", "sources"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
