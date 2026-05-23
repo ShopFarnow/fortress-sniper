@@ -215,7 +215,13 @@ def compute_status(rec: IPORecord, today: Optional[datetime] = None) -> IPOStatu
 
     # Heuristic: record has a listing_price but no parseable dates
     # → it came from a historical data dump (e.g. IndiaTrade), treat as Listed
-    if rec.listing_price and not open_dt and not close_dt and not listing_dt:
+    _no_dates = not open_dt and not close_dt and not listing_dt
+    if _no_dates and rec.listing_price:
+        return IPOStatus.LISTED
+    # Heuristic: has issue_price but no dates and no GMP (would be present if active)
+    # → historical IPO record from a database dump, treat as Listed
+    _has_price = bool(rec.issue_price and rec.issue_price.strip("₹ -"))
+    if _no_dates and _has_price and not rec.gmp:
         return IPOStatus.LISTED
 
     # Heuristic fall-through
@@ -621,10 +627,27 @@ def fetch_investorgain() -> list[IPORecord]:
 
     table = soup.find("table", id=re.compile(r"ipo", re.I)) or soup.find("table")
     if not table:
-        log.warning("  Investorgain: no table")
-        return records
+        log.warning("  Investorgain: no table via cloudscraper – trying Playwright")
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+                page = browser.new_context(user_agent=random.choice(_USER_AGENTS)).new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                page.wait_for_timeout(5_000)
+                html = page.content()
+                browser.close()
+            soup = BeautifulSoup(html, "lxml")
+            table = soup.find("table", id=re.compile(r"ipo", re.I)) or soup.find("table")
+            if not table:
+                log.warning("  Investorgain: no table even with Playwright")
+                return records
+        except Exception as exc:
+            log.warning(f"  Investorgain Playwright error: {exc}")
+            return records
 
-    headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+    headers = [re.sub(r"\s+", " ", th.get_text()).strip().lower()
+               for th in table.find_all("th")]
     for row in table.find_all("tr")[1:]:
         cells = [td.get_text(strip=True) for td in row.find_all("td")]
         if not cells or "no data" in cells[0].lower():
@@ -661,7 +684,7 @@ def fetch_screener() -> list[IPORecord]:
             page    = ctx.new_page()
             page.goto("https://www.screener.in/ipo/recent/",
                       wait_until="domcontentloaded", timeout=25_000)
-            page.wait_for_selector("table", timeout=10_000)
+            page.wait_for_selector("table", timeout=15_000)
             html = page.content()
             browser.close()
         records = _parse_tables(BeautifulSoup(html, "lxml"), "Screener")
@@ -892,6 +915,81 @@ def print_results(records: list[IPORecord]) -> None:
     print()
 
 
+
+def print_table(records: list[IPORecord]) -> None:
+    """
+    Print IPO data as a clean Unicode-box table.
+    Columns: Status | IPO Name | Issue Price | Open → Close | Listing Date | Sources
+    """
+    if not records:
+        print("\n⚠️  No IPO data collected.\n")
+        return
+
+    # ── build rows ──────────────────────────────────────────────────────────
+    rows: list[tuple[str, ...]] = []
+    for rec in records:
+        icon   = _STATUS_ICONS.get(rec.status, "⚪")
+        status = f"{icon} {rec.status.value}"
+
+        # Subscription window
+        if rec.open_date and rec.close_date:
+            window = f"{rec.open_date} → {rec.close_date}"
+        elif rec.open_date:
+            window = f"{rec.open_date} → ?"
+        else:
+            window = "—"
+
+        # Listing date (date or price-at-listing)
+        listing = rec.listing_date or (
+            f"₹{rec.listing_price}" if rec.listing_price else "—"
+        )
+
+        price = rec.issue_price or "—"
+
+        rows.append((status, rec.name, price, window, listing))
+
+    # ── compute column widths ───────────────────────────────────────────────
+    HDR = ("Status", "IPO Name", "Price", "Open → Close", "Listing")
+    # visible width (emoji = 2 chars, normal = 1)
+    def _vw(s: str) -> int:
+        return sum(2 if ord(c) > 0x2000 else 1 for c in s)
+
+    def _pad(s: str, w: int) -> str:
+        return s + " " * max(0, w - _vw(s))
+
+    col_w = [max(_vw(h), max(_vw(r[i]) for r in rows))
+             for i, h in enumerate(HDR)]
+    # cap Name column at 44
+    col_w[1] = min(col_w[1], 44)
+
+    def _row_cells(cells: tuple[str, ...]) -> str:
+        parts = []
+        for i, cell in enumerate(cells):
+            truncated = cell if _vw(cell) <= col_w[i] else cell[:col_w[i]-1] + "…"
+            parts.append(_pad(truncated, col_w[i]))
+        return "│ " + " │ ".join(parts) + " │"
+
+    sep_top  = "┌─" + "─┬─".join("─" * w for w in col_w) + "─┐"
+    sep_mid  = "├─" + "─┼─".join("─" * w for w in col_w) + "─┤"
+    sep_div  = "╞═" + "═╪═".join("═" * w for w in col_w) + "═╡"  # status divider
+    sep_bot  = "└─" + "─┴─".join("─" * w for w in col_w) + "─┘"
+
+    now_str = datetime.now().strftime("%d %b %Y %H:%M")
+    print(f"\n  IPO TABLE  —  {now_str}   ({len(records)} IPOs)")
+    print(sep_top)
+    print(_row_cells(HDR))
+    print(sep_mid)
+
+    prev_status = None
+    for rec, row in zip(records, rows):
+        if prev_status and rec.status != prev_status:
+            print(sep_div)           # visual break between status groups
+        print(_row_cells(row))
+        prev_status = rec.status
+
+    print(sep_bot)
+    print()
+
 def save_json(records: list[IPORecord], path: str = "ipo_data.json") -> None:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump([r.to_dict() for r in records], fh, indent=2, ensure_ascii=False)
@@ -918,7 +1016,7 @@ def save_csv(records: list[IPORecord], path: str = "ipo_data.csv") -> None:
 def main_all() -> list[IPORecord]:
     """Fetch all IPOs, all statuses."""
     records = run_pipeline()
-    print_results(records)
+    print_table(records)
     save_json(records, "ipo_data.json")
     save_csv(records, "ipo_data.csv")
     return records
@@ -927,7 +1025,7 @@ def main_all() -> list[IPORecord]:
 def main_open_only() -> list[IPORecord]:
     """Fetch only currently OPEN IPOs (strict date filter)."""
     records = run_pipeline(status_filter=[IPOStatus.OPEN])
-    print_results(records)
+    print_table(records)
     save_json(records, "open_ipo_data.json")
     save_csv(records, "open_ipo_data.csv")
     return records
