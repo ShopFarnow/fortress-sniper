@@ -119,6 +119,38 @@ _HALAL_WEIGHT_MAX  = 0.15
 _ADVISOR_MIN_SAMPLES = 5
 _WEIGHT_KEYS = ("gmp", "sub", "sentiment", "trend", "size", "halal")
 
+# ── Shariah verdict confidence gates ─────────────────────────────────────────
+# HARAM requires EVIDENCE, not doubt. Any ruling below this confidence is
+# downgraded to TIER_2_CONDITIONAL — a caution flag, never an outright block.
+_HARAM_MIN_CONFIDENCE = 60
+
+# Phrases in haram_reason / compliance_notes that signal the LLM is expressing
+# uncertainty rather than issuing a genuine Shariah ruling.
+# ANY match → downgrade to CONDITIONAL, never block.
+_UNCERTAINTY_PHRASES = (
+    "insufficient information",
+    "unable to determine",
+    "cannot determine",
+    "not enough information",
+    "no information available",
+    "unclear",
+    "lack of information",
+    "preliminary audit suggests",   # hedged — not a ruling
+    "may involve",                  # speculative — not a ruling
+    "could involve",
+    "might involve",
+    "possibly impermissible",
+    "cannot confirm",
+    "further review required",
+    "manual review",
+    "further investigation",
+    "more information needed",
+    "limited information",
+    "without more details",
+    "no business description",
+    "description unavailable",
+)
+
 # ── v12 sector pre‑filter sets (FIX 3: expanded with common Indian SME terms) ─
 OBVIOUS_HALAL_SECTORS = {
     "it services", "software", "saas", "erp", "crm", "cloud computing",
@@ -1666,79 +1698,154 @@ def _name_based_stub(company_name: str) -> str:
     )
 
 
+def _is_antibot_page(html: str, status_code: int) -> bool:
+    """
+    Detect Cloudflare / anti-bot interstitials that return 200 but are useless.
+    Triggers on: 403/429 status, or telltale HTML phrases.
+    """
+    if status_code in (403, 429, 503):
+        return True
+    lower = html.lower()
+    triggers = (
+        "just a moment",            # Cloudflare 'checking your browser'
+        "cloudflare",               # Cloudflare branding
+        "enable javascript",        # JS gate
+        "ddos-guard",               # DDoS-Guard
+        "please wait",              # Generic spinner
+        "access denied",
+        "403 forbidden",
+        "captcha",
+    )
+    return any(t in lower for t in triggers)
+
+
 def fetch_company_description(company_name: str) -> str:
     """
-    FIX 2: Multi-source description fetcher with guaranteed non-empty return.
+    FIX 2 (upgraded): Cloudflare-piercing description fetcher.
+
+    Fetch strategy per URL (3-tier):
+      Tier A — cloudscraper  (stealth TLS fingerprint, bypasses most CF rules)
+      Tier B — Playwright    (full headless browser, defeats JS challenges)
+      Tier C — name-based stub (last resort; low-confidence flag sent to tracker)
 
     Sources tried in order:
-      1. Chittorgarh IPO page
-      2. Screener.in company page
-      3. Moneycontrol IPO overview
-      4. Economic Times IPO page
-      5. NSE company info page
-      6. BSE search page
-      → Name-based stub (always succeeds, flags low confidence in tracker)
+      1. Chittorgarh IPO page      (most detailed Indian IPO descriptions)
+      2. Screener.in company page  (good for listed/pre-IPO financials)
+      3. Moneycontrol IPO page     (large editorial coverage)
+      4. Economic Times IPO page   (good sector + revenue summaries)
+      5. NSE company info page     (official but JS-heavy → PW handles it)
+      6. BSE stock page            (fallback official source)
     """
     if company_name in _DESC_CACHE:
         return _DESC_CACHE[company_name]
 
-    slug         = _slugify(company_name)
-    slug_nodash  = slug.replace("-", "")
-    slug_upper   = company_name.strip().upper().replace(" ", "")[:15]
+    slug        = _slugify(company_name)
+    slug_nodash = slug.replace("-", "")
+    slug_upper  = company_name.strip().upper().replace(" ", "")[:15]
 
     sources = [
-        ("chittorgarh",    f"https://www.chittorgarh.com/ipo/{slug}-ipo/"),
-        ("screener",       f"https://www.screener.in/company/{slug_nodash}/"),
-        ("moneycontrol",   f"https://www.moneycontrol.com/ipo/{slug}-ipo/"),
-        ("et_ipo",         f"https://economictimes.indiatimes.com/markets/ipos/fpos/{slug}-ipo"),
-        ("nse",            f"https://www.nseindia.com/get-quotes/equity?symbol={slug_upper}"),
-        ("bse",            f"https://www.bseindia.com/stock-share-price/{slug}/{slug_upper}/"),
+        ("chittorgarh",  f"https://www.chittorgarh.com/ipo/{slug}-ipo/"),
+        ("screener",     f"https://www.screener.in/company/{slug_nodash}/"),
+        ("moneycontrol", f"https://www.moneycontrol.com/ipo/{slug}-ipo/"),
+        ("et_ipo",       f"https://economictimes.indiatimes.com/markets/ipos/fpos/{slug}-ipo"),
+        ("nse",          f"https://www.nseindia.com/get-quotes/equity?symbol={slug_upper}"),
+        ("bse",          f"https://www.bseindia.com/stock-share-price/{slug}/{slug_upper}/"),
     ]
 
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-IN,en;q=0.9",
-        "Referer": "https://www.google.com/",
-    })
+    # ── Build cloudscraper once (reuse across all URLs this call) ─────────────
+    try:
+        import cloudscraper
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False},
+            delay=2,
+        )
+        _have_cs = True
+    except ImportError:
+        scraper   = None
+        _have_cs  = False
+        log.debug("  [desc] cloudscraper not installed — will use requests+playwright only")
 
     llm_tracker.start(company_name, "DESC_FETCH", f"trying {len(sources)} sources")
 
     for label, url in sources:
-        try:
-            r     = sess.get(url, timeout=8)
-            deny  = r.headers.get("x-deny-reason", "")
-            if deny or r.status_code != 200:
-                log.debug(f"  [desc:{label}] HTTP {r.status_code}  deny={deny!r}")
-                continue
-            soup = BeautifulSoup(r.text, "lxml")
-            text = _extract_desc_text(soup, min_len=40)
-            if text:
-                result = text[:3000]
-                _DESC_CACHE[company_name] = result
-                llm_tracker.ok(
-                    company_name, "DESC_FETCH",
-                    f"source={label}  len={len(result)}"
-                )
-                return result
-        except requests.exceptions.ConnectionError:
-            log.debug(f"  [desc:{label}] connection blocked by egress proxy")
-        except Exception as exc:
-            log.debug(f"  [desc:{label}] {exc}")
+        html: Optional[str] = None
 
-    # ── All web sources failed → name-based stub ──────────────────────────────
+        # ── Tier A: cloudscraper ──────────────────────────────────────────────
+        if _have_cs and scraper is not None:
+            try:
+                resp  = scraper.get(url, timeout=12)
+                deny  = resp.headers.get("x-deny-reason", "")
+                if deny:
+                    log.debug(f"  [desc:{label}] egress deny={deny!r} — skip")
+                    continue
+                if not _is_antibot_page(resp.text, resp.status_code):
+                    html = resp.text
+                    log.debug(f"  [desc:{label}] cloudscraper OK  status={resp.status_code}")
+                else:
+                    log.debug(
+                        f"  [desc:{label}] anti-bot detected (status={resp.status_code}) "
+                        f"→ escalating to Playwright"
+                    )
+            except requests.exceptions.ConnectionError:
+                log.debug(f"  [desc:{label}] CS connection blocked by egress proxy")
+                continue
+            except Exception as exc:
+                log.debug(f"  [desc:{label}] CS error: {exc}")
+
+        # ── Tier B: Playwright (when cloudscraper failed or triggered anti-bot) ─
+        if html is None and PLAYWRIGHT_OK:
+            log.debug(f"  [desc:{label}] deploying Playwright for {url}")
+            llm_tracker.warn(
+                company_name, "DESC_FETCH",
+                f"{label}: CS blocked → Playwright fallback"
+            )
+            html = _pw_get_html(url, wait_ms=4000, selector="p, div, article")
+
+        # ── Tier A fallback: plain requests if neither CS nor PW available ────
+        if html is None and not _have_cs and not PLAYWRIGHT_OK:
+            try:
+                r    = requests.get(url, timeout=8, headers={
+                    "User-Agent": random.choice(_USER_AGENTS),
+                    "Accept-Language": "en-IN,en;q=0.9",
+                    "Referer": "https://www.google.com/",
+                })
+                if r.status_code == 200 and not _is_antibot_page(r.text, r.status_code):
+                    html = r.text
+            except Exception:
+                pass
+
+        if not html:
+            log.debug(f"  [desc:{label}] all tiers returned nothing — next source")
+            continue
+
+        # ── Parse whatever HTML we got ────────────────────────────────────────
+        soup = BeautifulSoup(html, "lxml")
+        text = _extract_desc_text(soup, min_len=40)
+        if text:
+            result = text[:3000]
+            _DESC_CACHE[company_name] = result
+            llm_tracker.ok(
+                company_name, "DESC_FETCH",
+                f"source={label}  len={len(result)}"
+            )
+            log.debug(f"  [desc:{label}] {company_name}: {len(result)} chars ✓")
+            return result
+
+        log.debug(f"  [desc:{label}] HTML fetched but no usable text extracted")
+
+    # ── Tier C: name-based stub (guaranteed non-empty, flags low confidence) ──
     stub = _name_based_stub(company_name)
     _DESC_CACHE[company_name] = stub
     llm_tracker.warn(
         company_name, "DESC_FETCH",
-        f"all {len(sources)} sources failed — name stub ({len(stub)} chars)"
+        f"all {len(sources)} sources failed — name stub ({len(stub)} chars). "
+        f"LLM will assign low confidence → rule-based fallback will activate."
     )
     log.warning(
-        f"  [desc] {company_name}: all sources failed — "
-        f"using name stub (LLM confidence will be low → rule fallback)"
+        f"  [desc] {company_name}: all {len(sources)} sources failed "
+        f"(cloudscraper={'yes' if _have_cs else 'no'}, "
+        f"playwright={'yes' if PLAYWRIGHT_OK else 'no'}) "
+        f"— using name stub"
     )
     return stub
 
@@ -2036,15 +2143,58 @@ def run_shariah(row: pd.Series, company_description: str = "") -> ShariahVerdict
     llm_conf   = int(llm.get("confidence", 0))
     llm_reason = llm.get("haram_reason") or llm.get("compliance_notes", "")
 
+    # ── HARAM confidence gate + uncertainty detector ──────────────────────────
+    # A genuine Shariah HARAM ruling requires EVIDENCE, not speculation.
+    # Two conditions must BOTH be true to block:
+    #   1. LLM said is_compliant=False
+    #   2. Confidence >= _HARAM_MIN_CONFIDENCE  (≥60%)
+    #   3. The reason does NOT contain uncertainty language
+    #
+    # If either condition fails, downgrade to TIER_2_CONDITIONAL (caution)
+    # instead of a hard block — consistent with the principle of Ihtiyat
+    # (precaution without injustice).
     if not llm.get("is_compliant", True):
-        reason_str = llm.get("haram_reason", "Core business impermissible.")
-        issues.append(f"Audit: {reason_str}")
-        qabda = "N/A — Investment not permissible per Shariah audit."
-        llm_tracker.ok(sym, "FINAL", f"HARAM  method={method}")
-        return ShariahVerdict(
-            sym, "HARAM_CORE_BUSINESS", 0.0, False, qabda, issues,
-            llm_confidence=llm_conf, llm_reason=reason_str, llm_method=method,
-        )
+        reason_str   = llm.get("haram_reason", "") or llm.get("compliance_notes", "")
+        reason_lower = reason_str.lower()
+
+        # Check whether the LLM is expressing doubt rather than a ruling
+        _uncertain = any(phrase in reason_lower for phrase in _UNCERTAINTY_PHRASES)
+
+        if llm_conf >= _HARAM_MIN_CONFIDENCE and not _uncertain:
+            # ── Genuine high-confidence HARAM ruling ─────────────────────────
+            issues.append(f"Audit: {reason_str}")
+            qabda = "N/A — Investment not permissible per Shariah audit."
+            llm_tracker.ok(
+                sym, "FINAL",
+                f"HARAM  conf={llm_conf}%  method={method}"
+            )
+            return ShariahVerdict(
+                sym, "HARAM_CORE_BUSINESS", 0.0, False, qabda, issues,
+                llm_confidence=llm_conf, llm_reason=reason_str, llm_method=method,
+            )
+        else:
+            # ── Low-confidence or uncertain "HARAM" → downgrade to CONDITIONAL ─
+            _why = (
+                f"low confidence ({llm_conf}%)"
+                if not _uncertain else
+                f"uncertain language detected in reason"
+            )
+            downgrade_note = (
+                f"LLM flagged concerns but {_why} — "
+                f"treating as CONDITIONAL, not HARAM. Manual review advised."
+            )
+            issues.append(f"⚠️ Audit Downgraded: {downgrade_note}")
+            if reason_str:
+                issues.append(f"   LLM note: {reason_str[:160]}")
+            barakah -= 20   # significant penalty, but not a full block
+            llm_tracker.warn(
+                sym, "FINAL",
+                f"HARAM downgraded → CONDITIONAL  conf={llm_conf}%  uncertain={_uncertain}"
+            )
+            log.warning(
+                f"  [shariah] {sym}: HARAM downgraded to CONDITIONAL "
+                f"(conf={llm_conf}%  uncertain={_uncertain})"
+            )
 
     # ── TIER 2: KEYWORD GUARD ─────────────────────────────────────────────────
     kw_reason = _keyword_haram_check(sym, sector, desc)
@@ -2136,6 +2286,10 @@ def apply_market_mood_penalty(score: float) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _sector_avg_sub(df: pd.DataFrame, sector: str) -> float:
+    if df is None or df.empty or "Sector" not in df.columns:
+        return 1.0
+    if "SubscriptionTimes" not in df.columns:
+        return 1.0
     live_sector = df[(~df.get("IsUpcoming", pd.Series([False] * len(df))).fillna(False))
                      & (df["Sector"] == sector)]
     if live_sector.empty:
@@ -2423,14 +2577,14 @@ Respond ONLY with JSON matching the schema."""
     # ── Fallback to OpenAI ────────────────────────────────────────────────────
     openai_key = os.getenv("OPENAI_API_KEY", "")
     if not openai_key:
-        llm_tracker.fail("ADVISOR", "OPENAI_FULL", "no API key for advisor")
+        llm_tracker.fail("ADVISOR", "OPENAI", "no API key for advisor")
         log.warning("  [advisor] No API key — weights unchanged")
         return base_weights
 
     try:
         import openai
         client = openai.OpenAI(api_key=openai_key)
-        llm_tracker.start("ADVISOR", "OPENAI_FULL", "OpenAI advisor fallback")
+        llm_tracker.start("ADVISOR", "OPENAI", "OpenAI advisor fallback")
         resp = client.chat.completions.create(
             model           = "gpt-4o",
             messages        = [{"role": "user", "content": prompt}],
@@ -2452,11 +2606,11 @@ Respond ONLY with JSON matching the schema."""
         s = sum(new_weights.values())
         new_weights = {k: round(v / s, 6) for k, v in new_weights.items()}
         _persist_weight_change(base_weights, new_weights, reasoning, stats_summary)
-        llm_tracker.ok("ADVISOR", "OPENAI_FULL", f"regime={detected}")
+        llm_tracker.ok("ADVISOR", "OPENAI", f"regime={detected}")
         log.info(f"  [advisor] OpenAI fallback → New weights: {new_weights}")
         return new_weights
     except Exception as exc:
-        llm_tracker.fail("ADVISOR", "OPENAI_FULL", str(exc)[:60])
+        llm_tracker.fail("ADVISOR", "OPENAI", str(exc)[:60])
         log.error(f"  [advisor] Advisor failed: {exc}")
         return base_weights
 
@@ -2837,9 +2991,18 @@ def build_ipo_card(row: pd.Series, allot: AllotmentProfile, shariah: ShariahVerd
         f"\n🕌 <b>SHARIAH COMPLIANCE</b>\n"
         f"• Status: {sh_icon} {sh_label}  (Barakah: {shariah.barakah_index:.0f}/100)\n"
         f"• Audit: {_method_badge}\n"
+        f"• <i>{html_lib.escape(shariah.qabda_mandate)}</i>\n"
         + llm_note
-        + (f"• 🚨 <i>" + " | ".join(html_lib.escape(i) for i in shariah.deferred_issues) + "</i>\n"
-           if shariah.deferred_issues else "")
+        + (
+            # Downgraded HARAM issues get their own styled block so the reason is readable
+            "".join(
+                f"• ⚠️ <i>{html_lib.escape(i)}</i>\n"
+                if i.startswith("⚠️ Audit Downgraded") else
+                f"• 🚨 <i>{html_lib.escape(i)}</i>\n"
+                for i in shariah.deferred_issues
+            )
+            if shariah.deferred_issues else ""
+        )
         + f"\n📅 <b>TIMELINE</b>\n"
         f"• {open_part}{html_lib.escape(close_str)}\n"
         f"• {days_part}\n"
@@ -2985,6 +3148,7 @@ def run(backtest: bool = False):
 
     # ── FIX 1: dump LLM tracker summary at end of every run ──────────────────
     llm_tracker.dump_summary()
+    llm_tracker.reset()   # clear for next run (important if run() is called in a loop/scheduler)
 
     log.info("🏁 Complete.")
     return df
