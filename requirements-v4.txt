@@ -8,3 +8,4 @@ tenacity
 cloudscraper
 openai
 lxml
+hashFiles
