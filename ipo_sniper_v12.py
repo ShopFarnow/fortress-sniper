@@ -1666,21 +1666,39 @@ def _slugify(name: str) -> str:
 
 
 def _extract_desc_text(soup: BeautifulSoup, min_len: int = 40) -> str:
-    """Try progressively broader selectors until we find enough text."""
+    """Surgically extract the business model, ignoring website boilerplate."""
+    
+    # 1. Destroy generic noise before searching
+    for bad in soup.find_all(['nav', 'footer', 'script', 'style', 'noscript', 'header', 'aside']):
+        bad.decompose()
+
+    # 2. Chittorgarh-Specific Golden Target
+    # Chittorgarh usually starts their descriptions with "Incorporated in..."
+    for p in soup.find_all("p"):
+        text = p.get_text(" ", strip=True)
+        if "incorporated in" in text.lower() or "founded in" in text.lower():
+            # Grab this paragraph and the next two
+            siblings = p.find_next_siblings("p", limit=2)
+            combined = text + " " + " ".join(s.get_text(" ", strip=True) for s in siblings)
+            if len(combined) >= min_len:
+                return combined
+
+    # 3. Generic Fallbacks for other sites
     for tag, attrs in [
-        ("div",     {"class": re.compile(r"about|company|description|overview|business", re.I)}),
+        ("div",     {"itemprop": "articleBody"}),
+        ("div",     {"class": re.compile(r"company-profile|about-company|desc", re.I)}),
         ("section", {"id":    re.compile(r"about|overview|business", re.I)}),
-        ("div",     {"id":    re.compile(r"about|overview|description", re.I)}),
-        ("article", {}),
-        ("p",       {}),
+        ("p",       {}), 
     ]:
-        blocks = soup.find_all(tag, attrs)[:8]
+        blocks = soup.find_all(tag, attrs)[:3]
         text   = " ".join(b.get_text(" ", strip=True) for b in blocks)
         text   = re.sub(r"\s+", " ", text).strip()
-        if len(text) >= min_len:
+        
+        # Filter out generic 300-char site disclaimers
+        if len(text) >= min_len and "India's No 1" not in text and "cookie" not in text.lower():
             return text
-    return ""
 
+    return ""
 
 def _name_based_stub(company_name: str) -> str:
     """
