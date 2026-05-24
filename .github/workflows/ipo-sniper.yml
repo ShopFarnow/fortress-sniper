@@ -1,54 +1,172 @@
-name: IPO Sniper v11.0
+name: IPO Sniper v12.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECRETS REQUIRED (GitHub → Settings → Secrets → Actions):
+#   OPENAI_API_KEY       sk-...
+#   ANTHROPIC_API_KEY    sk-ant-...
+#   TELEGRAM_TOKEN       123456:ABC-...
+#   TELEGRAM_CHAT_ID     -100...
+#
+# FILE PLACEMENT:  .github/workflows/ipo_sniper.yml
+# SCRIPT EXPECTED: ipo_sniper_v12.py  (repo root)
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
+  # Mon–Fri 10:00 AM IST  (04:30 UTC)
   schedule:
-    - cron: '0 0 * * *'  # 00:00 UTC = 05:30 AM IST
+    - cron: "30 4 * * 1-5"
+
+  # Manual run from Actions tab with optional flags
   workflow_dispatch:
+    inputs:
+      backtest:
+        description: "Run backtest after scan?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      force_advisor:
+        description: "Force monthly advisor (bypass day-of-month gate)?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+
+# Never let two runs overlap
+concurrency:
+  group: ipo-sniper
+  cancel-in-progress: false
 
 jobs:
-  ipo-scan:
+  scan:
+    name: "Fetch → Shariah Audit → Score → Telegram"
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+
+      # ── 1. Code ───────────────────────────────────────────────────────────────
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # ── 2. Python ─────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: pip
 
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-ipo-v11-${{ hashFiles('requirements-v4.txt') }}
-          restore-keys: ${{ runner.os }}-pip-ipo-v11-
-
+      # ── 3. Python packages ────────────────────────────────────────────────────
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements-v4.txt
-          python -m playwright install --with-deps chromium
+          pip install \
+            "numpy>=1.26,<2.0"         \
+            "pandas>=2.2,<3.0"         \
+            "requests>=2.31,<3.0"      \
+            "beautifulsoup4>=4.12,<5.0"\
+            "lxml>=5.0,<6.0"           \
+            "cloudscraper>=1.2.71"     \
+            "playwright>=1.44,<2.0"    \
+            "openai>=1.30,<2.0"        \
+            "rapidfuzz>=3.9,<4.0"      \
+            "tenacity>=8.3,<9.0"       \
+            "python-dotenv>=1.0,<2.0"
 
-      - name: Restore DB cache
-        uses: actions/cache@v4
+      # ── 4. Playwright Chromium ────────────────────────────────────────────────
+      - name: Install Chromium
+        run: |
+          playwright install chromium --with-deps
+          python -c "
+          from playwright.sync_api import sync_playwright
+          pw=sync_playwright().start(); b=pw.chromium.launch(headless=True)
+          b.close(); pw.stop(); print('Playwright OK')
+          "
+
+      # ── 5. Restore persistent data (SQLite DB + Shariah cache) ────────────────
+      # Key rolls per run-id so today's run restores from the latest saved state.
+      # restore-keys fallback picks up the most recent cache if today's is absent.
+      - name: Restore data cache
+        uses: actions/cache/restore@v4
         with:
-          path: data
-          key: sniper-db-ipo-v11-${{ github.run_id }}
-          restore-keys: sniper-db-ipo-v11-
+          path: data/
+          key:          ipo-data-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: ipo-data-${{ runner.os }}-
 
-      - name: Run IPO Sniper v11.0
+      # ── 6. Main scan ──────────────────────────────────────────────────────────
+      - name: Run IPO Sniper
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python ipo_sniper_v11.py
+          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          ARGS=""
+          [ "${{ github.event.inputs.backtest }}" = "true" ] && ARGS="--backtest"
+          python ipo_sniper_v12.py $ARGS
 
-      - name: Upload DB artifact
+      # ── 7. Force monthly advisor (manual only) ────────────────────────────────
+      # Normally fires only on the 1st of the month inside run().
+      # This step lets you trigger a recalibration at any time.
+      - name: Force monthly advisor
+        if: ${{ github.event.inputs.force_advisor == 'true' }}
+        env:
+          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python - <<'PYEOF'
+          import importlib.util
+          spec = importlib.util.spec_from_file_location("sniper", "ipo_sniper_v12.py")
+          mod  = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          new_w = mod.run_monthly_strategy_advisor(mod.BASE_WEIGHTS, days_lookback=30)
+          print("Recalibrated weights:", new_w)
+          PYEOF
+
+      # ── 8. Persist data cache ─────────────────────────────────────────────────
+      - name: Save data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/
+          key: ipo-data-${{ runner.os }}-${{ github.run_id }}
+
+      # ── 9. Upload artifacts ───────────────────────────────────────────────────
+      - name: Upload scan output
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ipo-sniper-v11-db
-          path: data/
+          name: ipo-scan-${{ github.run_id }}
+          path: |
+            data/ipo_latest_run.json
+            data/ipo_sniper_v7.db
+            data/shariah_audit_cache.db
           retention-days: 30
+          if-no-files-found: warn
+
+      # ── 10. Telegram failure alert ────────────────────────────────────────────
+      - name: Alert on failure
+        if: failure()
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PYEOF'
+          import os, requests
+          t  = os.getenv("TELEGRAM_TOKEN",  "")
+          c  = os.getenv("TELEGRAM_CHAT_ID","")
+          if t and c:
+              requests.post(
+                  f"https://api.telegram.org/bot{t}/sendMessage",
+                  json={
+                      "chat_id":    c,
+                      "parse_mode": "HTML",
+                      "text": (
+                          "⚠️ <b>IPO SNIPER v12.0 — RUN FAILED</b>\n"
+                          "Run: ${{ github.run_id }} · ${{ github.ref_name }}\n"
+                          "Open Actions tab for full logs."
+                      ),
+                  },
+                  timeout=10,
+              )
+          PYEOF
