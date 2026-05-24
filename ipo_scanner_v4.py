@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║         IPO SNIPER v7.0 — SCRAPER OVERHAUL + TELEGRAM REDESIGN             ║
+║         IPO SNIPER v8.0 — SHARIAH AUDIT + PARALLEL FETCH UPGRADE           ║
 ║                                                                              ║
-║  Data Layer  → ipo_scraper.py (battle-tested multi-source scraper)          ║
-║    • Groww        JSON/XHR intercept (dates + prices)                       ║
-║    • Investorgain Playwright  (GMP + exchange-code parsing)                 ║
-║    • IndiaTrade   Playwright  (large historical + current DB)               ║
-║    • Screener.in  Playwright  (subscription status + td-header tables)      ║
-║    • NSE JSON API (retained — authoritative dates/prices)                   ║
+║  v8.0 Changes (3-point audit):                                              ║
+║    1. run_shariah() — HARAM_SECTORS core-business filter added              ║
+║       (banks, NBFCs, breweries, casinos, tobacco, etc. → Barakah=0)        ║
+║    2. fetch_unified_calendar() — Sources A-D now run in parallel            ║
+║       via ThreadPoolExecutor(max_workers=4) — ~3-4× faster                 ║
+║    3. build_ipo_card() — EV relabelled to "Math. Expectation (Not           ║
+║       Guaranteed)" to guard against Maysir (gambling mindset)               ║
 ║                                                                              ║
-║  Score Engine → ALL v6.0 fixes retained (SCORE-1 through SCORE-5)           ║
+║  Data Layer  → multi-source scraper (Screener, Investorgain, Groww,        ║
+║                IndiaTrade, NSE JSON API)                                    ║
+║  Score Engine → ALL v6.0 fixes retained (SCORE-1 through SCORE-5)          ║
 ║  Allotment   → Monte-Carlo 50,000 runs (unchanged)                          ║
-║  Shariah     → Barakah index unchanged                                      ║
+║  Shariah     → Barakah index + core-business Al-Maqasid filter             ║
 ║  Database    → SQLite schema unchanged (migrations safe)                    ║
-║                                                                              ║
 ║  Telegram    → OPEN IPOs only. No summary. Professional card format.        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
@@ -42,7 +44,7 @@ except ImportError:
 IPO_DB_PATH  = Path("data/ipo_sniper_v7.db")
 FALLBACK_CSV = Path("data/ipo_fallback_v7.csv")
 JSON_EXPORT  = Path("data/ipo_latest_run.json")
-VERSION      = "IPO-SNIPER-v7.0"
+VERSION      = "IPO-SNIPER-v8.0"
 MC_RUNS      = 50_000
 KELLY_FRACTION = 0.25
 MAX_SYNDICATE  = 10
@@ -1077,12 +1079,19 @@ def fetch_unified_calendar() -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
     today_dt = _dt.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # ── Scraper sources A-D → IPORecord → DataFrame ──────────────────────────
-    all_records = []
-    all_records.extend(_fetch_screener())
-    all_records.extend(_fetch_investorgain_new())
-    all_records.extend(_fetch_groww())
-    all_records.extend(_fetch_indiatrade())
+    # ── Scraper sources A-D → IPORecord → DataFrame (parallel) ──────────────
+    import concurrent.futures
+    all_records: list = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        f_screener = executor.submit(_fetch_screener)
+        f_ig       = executor.submit(_fetch_investorgain_new)
+        f_groww    = executor.submit(_fetch_groww)
+        f_india    = executor.submit(_fetch_indiatrade)
+        for future in (f_screener, f_ig, f_groww, f_india):
+            try:
+                all_records.extend(future.result())
+            except Exception as _exc:
+                log.warning(f"  Parallel fetch error: {_exc}")
 
     log.info(f"Raw IPO records before dedup: {len(all_records)}")
     deduped_records = deduplicate_records(all_records)
@@ -1235,13 +1244,39 @@ def compute_allotment(row: pd.Series) -> AllotmentProfile:
         ci_95=(ci_lo, ci_hi),
     )
 
-def run_shariah(row: pd.Series) -> ShariahVerdict:
+# ── Haram sector keywords (Al-Maqasid core-business screen) ──────────────────
+HARAM_SECTORS: set = {
+    "bank", "banking", "finance", "financial", "nbfc",
+    "microfinance", "moneylending", "insurance", "reinsurance",
+    "brewery", "distillery", "liquor", "alcohol", "wine", "spirits",
+    "casino", "gambling", "gaming", "lottery",
+    "pork", "pig", "swine",
+    "tobacco", "cigarette", "cigar",
+    "adult entertainment", "pornography",
+}
+
+def run_shariah(row: pd.Series,
+                company_description: str = "") -> ShariahVerdict:
     gmp, sub, size, sector, sym = (
         float(row["GMP"]), float(row["SubscriptionTimes"]),
         float(row["IssueSizeCr"]), str(row["Sector"]), str(row["Symbol"])
     )
     barakah = 100.0
     issues: List[str] = []
+
+    # 1. CORE BUSINESS SCREENING (Al-Maqasid al-Shariah)
+    # Check both the scraped sector label and any free-text description
+    combined_text = (sym + " " + sector + " " + company_description).lower()
+    if any(kw in combined_text for kw in HARAM_SECTORS):
+        barakah = 0.0
+        issues.append(
+            "NON-COMPLIANT: Core business engages in Riba or Haram commodities "
+            "(Ala Hazrat Barelvi — contracts rooted in impermissible trade are void)."
+        )
+        qabda = "N/A — Investment not permissible."
+        return ShariahVerdict(sym, "HARAM_CORE_BUSINESS", 0.0, False, qabda, issues)
+
+    # 2. MARKET BEHAVIOUR — Najash & Gharar
     najash  = gmp > 0.40 and sub > 80
     if najash:
         barakah -= 25
@@ -1505,7 +1540,7 @@ def build_ipo_card(row: pd.Series, allot: AllotmentProfile,
         f"  Single PAN: {p_pct:.2f}%  [95% CI: {ci_lo_p:.1f}–{ci_hi_p:.1f}%]\n"
         f"  Best strategy: {allot.optimal_syndicate} PANs  "
         f"·  Kelly: {allot.kelly_pct:.1f}%  "
-        f"·  EV: ₹{ev_inr:,.0f}\n"
+        f"·  Math. Expectation (Not Guaranteed): ₹{ev_inr:,.0f}\n"
         f"\n<b>Timeline:</b>\n"
         f"  {open_part}{close_part}\n"
         f"  {days_part}\n"
