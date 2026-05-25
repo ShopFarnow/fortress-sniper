@@ -27,12 +27,22 @@ from typing import Optional
 
 import requests
 
+# Optional gspread for Sheets restore (gracefully absent if not installed)
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials as _GCreds
+    _GSPREAD_OK = True
+except ImportError:
+    _GSPREAD_OK = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DB_PATH          = Path(os.getenv("CACHE_PATH", "outputs/sniper_cache.db"))
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
+SPREADSHEET_ID    = os.getenv("SPREADSHEET_ID", "")
 
 # Reply timeout — picks not confirmed within this window are auto-SKIPPED
 REPLY_TIMEOUT_MINUTES = int(os.getenv("REPLY_TIMEOUT_MINUTES", "30"))
@@ -192,6 +202,169 @@ def _save_offset(offset: int) -> None:
         log.warning(f"Failed to save offset to file: {e}")
 
 # ── /confirm and /skip by rank (now checks both tables) ──────────────────────
+
+def _restore_todays_picks_from_sheets() -> int:
+    """
+    FIX-RH-RESTORE: Populate local SQLite from Google Sheets so the reply
+    handler can find today's picks even on a fresh GitHub Actions runner
+    (where the sniper's DB cache is not shared).
+
+    Reads the SCREENER tab (today's picks, written by the sniper) and inserts
+    rows into sniper_results_v54 and pick_outcomes using INSERT OR IGNORE.
+    Returns the number of picks restored (0 if Sheets unavailable).
+    """
+    if not _GSPREAD_OK:
+        log.debug("FIX-RH-RESTORE: gspread not installed — skipping")
+        return 0
+    if not GOOGLE_CREDS_JSON or not SPREADSHEET_ID:
+        log.debug("FIX-RH-RESTORE: GOOGLE_CREDS_JSON or SPREADSHEET_ID not set — skipping")
+        return 0
+
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    restored = 0
+
+    try:
+        import json as _json
+        creds_dict = _json.loads(GOOGLE_CREDS_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = _GCreds.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        wb = gc.open_by_key(SPREADSHEET_ID)
+    except Exception as e:
+        log.warning(f"FIX-RH-RESTORE: Sheets auth failed (non-fatal): {e}")
+        return 0
+
+    try:
+        # ── Read SCREENER tab ─────────────────────────────────────────────────
+        try:
+            ws = wb.worksheet("SCREENER")
+            rows = ws.get_all_values()
+        except Exception as e:
+            log.warning(f"FIX-RH-RESTORE: Cannot read SCREENER tab: {e}")
+            return 0
+
+        if not rows or len(rows) < 2:
+            log.warning("FIX-RH-RESTORE: SCREENER tab empty — nothing to restore")
+            return 0
+
+        header = [h.strip() for h in rows[0]]
+        # SCREENER columns: Date,Symbol,Sector,Grade,Fused/100,Fort%,APEX/100,
+        #   Fortress/80,...,BuyLo,BuyHi,StopLoss,R1,R2,R3,...,Story
+        def _col(name):
+            try:
+                return header.index(name)
+            except ValueError:
+                return None
+
+        col_date  = _col("Date")
+        col_sym   = _col("Symbol")
+        col_grade = _col("Grade")
+        col_fused = _col("Fused/100")
+        col_buylo = _col("BuyLo")
+        col_sl    = _col("StopLoss")
+        col_r1    = _col("R1")
+        col_r2    = _col("R2")
+        col_r3    = _col("R3")
+        col_story = _col("Story")
+        col_sec   = _col("Sector")
+
+        def _f(row, col, default=0.0):
+            if col is None or col >= len(row):
+                return default
+            v = row[col]
+            try:
+                return float(v) if v else default
+            except (ValueError, TypeError):
+                return default
+
+        def _s(row, col, default=""):
+            if col is None or col >= len(row):
+                return default
+            return str(row[col]).strip() or default
+
+        picks_to_restore = []
+        for row in rows[1:]:
+            if not row or not any(row):
+                continue
+            row_date = _s(row, col_date)
+            # Accept today's date in any common format
+            if today_str not in row_date and row_date not in (today_str, ""):
+                continue
+            symbol = _s(row, col_sym).upper()
+            if not symbol:
+                continue
+            picks_to_restore.append({
+                "symbol":  symbol,
+                "grade":   _s(row, col_grade, "PROBE"),
+                "fused":   _f(row, col_fused, 50.0),
+                "close":   _f(row, col_buylo, 0.0),
+                "sl":      _f(row, col_sl, 0.0),
+                "r1":      _f(row, col_r1, 0.0),
+                "r2":      _f(row, col_r2, 0.0),
+                "r3":      _f(row, col_r3, 0.0),
+                "story":   _s(row, col_story, ""),
+                "sector":  _s(row, col_sec, "DIVERSIFIED"),
+            })
+
+        if not picks_to_restore:
+            log.warning(f"FIX-RH-RESTORE: No picks found for {today_str} in SCREENER tab")
+            return 0
+
+        # ── Write into local SQLite ───────────────────────────────────────────
+        with _db_conn() as con:
+            for p in picks_to_restore:
+                # sniper_results_v54 — lane=FORTRESS as default (conservative)
+                try:
+                    con.execute("""
+                        INSERT OR IGNORE INTO sniper_results_v54
+                          (run_date, symbol, lane, grade, fused_score, close,
+                           stop_loss, r1, r2, r3, story, sector)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (today_str, p["symbol"], "FORTRESS", p["grade"],
+                          p["fused"], p["close"], p["sl"],
+                          p["r1"], p["r2"], p["r3"], p["story"], p["sector"]))
+                except Exception:
+                    pass
+
+                # sniper_results (legacy table — reply handler checks this first)
+                try:
+                    con.execute("""
+                        INSERT OR IGNORE INTO sniper_results
+                          (run_date, symbol, grade, fused_score, close,
+                           stop_loss, r1, r2, r3, story, sector)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """, (today_str, p["symbol"], p["grade"], p["fused"],
+                          p["close"], p["sl"], p["r1"], p["r2"], p["r3"],
+                          p["story"], p["sector"]))
+                except Exception:
+                    pass
+
+                # pick_outcomes (outcome engine needs this)
+                try:
+                    con.execute("""
+                        INSERT OR IGNORE INTO pick_outcomes
+                          (run_date, symbol, entry_price, stop_loss, r1, r2, r3,
+                           grade, fused_score, sector, story, status)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (today_str, p["symbol"], p["close"], p["sl"],
+                          p["r1"], p["r2"], p["r3"], p["grade"], p["fused"],
+                          p["sector"], p["story"], "open"))
+                except Exception:
+                    pass
+
+                restored += 1
+
+        log.info(f"FIX-RH-RESTORE: Restored {restored} pick(s) from SCREENER tab for {today_str} ✅")
+
+    except Exception as e:
+        log.warning(f"FIX-RH-RESTORE: Unexpected error (non-fatal): {e}")
+
+    return restored
+
+
 def _get_pick_by_rank(con: sqlite3.Connection, rank: int) -> Optional[dict]:
     if rank < 1:
         log.debug(f"_get_pick_by_rank: invalid rank={rank} (must be ≥ 1)")
@@ -341,7 +514,25 @@ def _get_todays_signal(con: sqlite3.Connection, symbol: str) -> dict:
             (symbol.upper(), latest_run)
         ).fetchone()
     if not row:
-        return {}
+        # FIX-RH-RESTORE: Final fallback — check pick_outcomes table.
+        # This catches the case where SCREENER restore populated pick_outcomes
+        # but the sniper_results* tables weren't written (e.g. DB schema mismatch).
+        try:
+            po_row = con.execute(
+                "SELECT entry_price, fused_score, grade, halal_tier FROM pick_outcomes "
+                "WHERE symbol=? AND run_date=? AND status='open'",
+                (symbol.upper(), latest_run)
+            ).fetchone()
+            if po_row:
+                row = (po_row[0], po_row[1], po_row[2])  # close, fused, grade
+                # halal_tier from pick_outcomes — patch into cal below
+                _po_halal = po_row[3]
+            else:
+                return {}
+        except Exception:
+            return {}
+    else:
+        _po_halal = None
 
     # Safe meta_prob retrieval
     meta_prob = None
@@ -371,7 +562,8 @@ def _get_todays_signal(con: sqlite3.Connection, symbol: str) -> dict:
         "meta_prob":             meta_prob,
         "calibrated_confidence": cal[0] if cal else None,
         "position_size_tier":    cal[1] if cal else None,
-        "halal_tier":            cal[2] if cal else None,
+        # FIX-RH-RESTORE: fall back to halal_tier from pick_outcomes if judged_picks missing
+        "halal_tier":            (cal[2] if cal else None) or _po_halal,
     }
 
 def _log_decision(con: sqlite3.Connection, symbol: str, decision: str,
@@ -399,6 +591,12 @@ def process_updates() -> None:
         return
 
     _auto_expire_timeout_picks()
+
+    # FIX-RH-RESTORE: Populate local SQLite from Sheets before processing any
+    # commands. The reply handler runs on a fresh GitHub Actions runner that
+    # doesn't share the sniper's DB cache — without this, TAKEN <symbol> always
+    # fails with "not found in latest picks" even when the sniper ran fine.
+    _restore_todays_picks_from_sheets()
 
     offset = _load_offset()
     updates = _get_updates(offset)
