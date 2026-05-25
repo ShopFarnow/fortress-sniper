@@ -3,7 +3,7 @@ name: "UNIFIED HALAL SNIPER v5.4"
 on:
   schedule:
     # Job 1: Main sniper engine — 8:30 AM IST = 3:00 AM UTC
-    - cron: "0 0 * * 1-5"           # FIXED: was 0 0
+    - cron: "0 3 * * 1-5"           # FIX: was "0 0" (midnight UTC = 5:30 AM IST, too late)
     # Job 2: Reply handler poll — every 10 min, 8:30 AM–4 PM IST = 3:00 AM–10:30 AM UTC
     - cron: "*/10 3-10 * * 1-5"
     # Job 3: Outcome engine — 3:30 PM IST = 10:00 AM UTC
@@ -15,6 +15,11 @@ on:
     inputs:
       fast_rerun:
         description: "Fast rerun (use score cache)"
+        required: false
+        default: "false"
+        type: boolean
+      force_weekly:
+        description: "Force weekly review even if not Monday"
         required: false
         default: "false"
         type: boolean
@@ -32,13 +37,16 @@ env:
 
 jobs:
 
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 1 — Main sniper engine
+  # ══════════════════════════════════════════════════════════════════
   sniper-run:
     name: "⚔️ Sniper Daily Run"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'schedule' && github.event.schedule == '0 0 * * 1-5')
+      (github.event_name == 'schedule' && github.event.schedule == '0 3 * * 1-5')
 
     steps:
       - uses: actions/checkout@v4
@@ -57,9 +65,6 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install survival model dependencies
-        # FIX-v5.4: install scikit-survival so the survival meta-model is ready
-        # to activate when 100+ closed picks are accumulated. The pip cache
-        # action above means this only incurs the ~45s install cost once.
         run: |
           pip install -r requirements-survival.txt || \
             echo "⚠️  scikit-survival install failed — survival model will run in fallback mode"
@@ -83,7 +88,6 @@ jobs:
           ACCOUNT_EQUITY:    ${{ secrets.ACCOUNT_EQUITY || '500000' }}
           ACCOUNT_RISK_PCT:  ${{ secrets.ACCOUNT_RISK_PCT || '0.015' }}
           FAST_RERUN:        ${{ inputs.fast_rerun || 'false' }}
-          # FIX-v5.4: explicit model pin — removes dependency on default in code
           CLAUDE_MODEL:      "claude-sonnet-4-6"
 
       - name: Save DB
@@ -101,10 +105,6 @@ jobs:
           path: outputs/
           retention-days: 14
 
-      # FIX-v5.4: Persistent DB artifact — survives GitHub Actions cache eviction
-      # (cache is purged after 7 days of no access; artifacts are kept for retention-days).
-      # This is a safety net: even if the cache is evicted mid-week, you can restore
-      # from the last artifact and re-prime the cache manually.
       - name: Upload DB as persistent artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -113,6 +113,11 @@ jobs:
           path: outputs/sniper_cache.db
           retention-days: 90
 
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 2 — Reply handler
+  # FIX: added GOOGLE_SHEET_ID + GOOGLE_CREDS_JSON so the Sheets
+  # restore can find today's picks on a fresh runner.
+  # ══════════════════════════════════════════════════════════════════
   reply-handler:
     name: "📱 Reply Handler"
     runs-on: ubuntu-latest
@@ -156,6 +161,10 @@ jobs:
           TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
           CACHE_PATH:            outputs/sniper_cache.db
           REPLY_TIMEOUT_MINUTES: "30"
+          # FIX: these two were missing — required for Sheets restore
+          # so TAKEN <symbol> works even when DB cache is cold/stale
+          GOOGLE_SHEET_ID:       ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON:     ${{ secrets.GOOGLE_CREDS_JSON }}
 
       - name: Save offset
         if: always()
@@ -171,6 +180,9 @@ jobs:
           path: outputs/sniper_cache.db
           key: sniper-db-persistent
 
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 3 — Outcome engine
+  # ══════════════════════════════════════════════════════════════════
   outcome-check:
     name: "📊 Outcome Engine"
     runs-on: ubuntu-latest
@@ -214,6 +226,8 @@ jobs:
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           CACHE_PATH:        outputs/sniper_cache.db
 
       - name: Save DB
@@ -223,6 +237,9 @@ jobs:
           path: outputs/sniper_cache.db
           key: sniper-db-persistent
 
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 4 — Weekly review
+  # ══════════════════════════════════════════════════════════════════
   weekly-review:
     name: "📈 Weekly Review"
     runs-on: ubuntu-latest
@@ -263,6 +280,7 @@ jobs:
           GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           CACHE_PATH:        outputs/sniper_cache.db
+          FORCE_WEEKLY:      ${{ inputs.force_weekly || 'false' }}
 
       - name: Save DB
         if: always()
