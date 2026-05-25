@@ -4148,6 +4148,12 @@ def _preload_histories_yf(symbols: List[str], days: int = 300) -> Dict[str, pd.D
                                        for c in sub.columns]
                         if "close" not in sub.columns and "adj close" in sub.columns:
                             sub = sub.rename(columns={"adj close": "close"})
+                        # FIX-YF2: yfinance 1.x resets DatetimeIndex to 'index' not 'date'.
+                        # Detect the datetime column by dtype and normalise to 'date'.
+                        _dt_col = next((c for c in sub.columns if c != "date" and
+                                        pd.api.types.is_datetime64_any_dtype(sub[c])), None)
+                        if _dt_col:
+                            sub = sub.rename(columns={_dt_col: "date"})
                         sub["date"] = pd.to_datetime(sub["date"])
                         df = sub[["date", "open", "high", "low", "close", "volume"]].dropna()
                         cache[sym.upper()] = _validate_no_lookahead(df)
@@ -4228,6 +4234,11 @@ def fetch_history(symbol: str, days: int = 300,
                     raw.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in raw.columns]
                     if "close" not in raw.columns and "adj close" in raw.columns:
                         raw = raw.rename(columns={"adj close": "close"})
+                    # FIX-YF2: yfinance 1.x resets DatetimeIndex to 'index' not 'date'.
+                    _dt_col = next((c for c in raw.columns if c != "date" and
+                                   pd.api.types.is_datetime64_any_dtype(raw[c])), None)
+                    if _dt_col:
+                        raw = raw.rename(columns={_dt_col: "date"})
                     raw["date"] = pd.to_datetime(raw["date"])
                     df = raw[["date","open","high","low","close","volume"]].dropna()
                     return _validate_no_lookahead(df)
@@ -11914,6 +11925,11 @@ def run():
                             sub.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in sub.columns]
                             if "close" not in sub.columns and "adj close" in sub.columns:
                                 sub = sub.rename(columns={"adj close": "close"})
+                            # FIX-YF2: yfinance 1.x resets DatetimeIndex to 'index' not 'date'.
+                            _dt_col = next((c for c in sub.columns if c != "date" and
+                                           pd.api.types.is_datetime64_any_dtype(sub[c])), None)
+                            if _dt_col:
+                                sub = sub.rename(columns={_dt_col: "date"})
                             sub["date"] = pd.to_datetime(sub["date"])
                             df = sub[["date", "open", "high", "low", "close", "volume"]].dropna()
                             with _hist_lock:
