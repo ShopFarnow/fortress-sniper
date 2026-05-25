@@ -10549,6 +10549,105 @@ def _auto_expire_stale_positions():
         log.debug(f"Auto-expire stale positions: {e}")
 
 
+
+def _restore_db_from_sheets():
+    """
+    FIX-RESTORE: Repopulate pick_outcomes and trade_decisions from Google Sheets
+    backups (DB_BACKUP and DB_DECISIONS tabs) into the local SQLite DB.
+
+    Called at the START of _weekly_ai_status_agent() before any queries, so a
+    fresh GitHub Actions runner (empty SQLite cache) always has full history.
+    Uses INSERT OR IGNORE on both tables — safe to call even when the DB already
+    has data (no duplicates, no overwrites of live data).
+    """
+    if not _sheets_ok():
+        log.debug("FIX-RESTORE: Sheets not configured — skipping restore")
+        return
+
+    restored_outcomes = 0
+    restored_decisions = 0
+
+    # ── Restore pick_outcomes from DB_BACKUP tab ───────────────────────────
+    try:
+        ws_backup = _get_ws("DB_BACKUP")
+        if ws_backup is not None:
+            raw = ws_backup.get_all_values()
+            if raw and len(raw) >= 2:
+                # Header row: run_date,symbol,grade,fused_score,status,exit_price,
+                #             pnl_pct,days_held,hit_target,story[,exported_at:...]
+                with _db_conn(write=True) as con:
+                    for row in raw[1:]:
+                        if not row or not row[0]:
+                            continue
+                        try:
+                            run_date   = row[0]
+                            symbol     = row[1]
+                            grade      = row[2] if len(row) > 2 else None
+                            fused      = float(row[3]) if len(row) > 3 and row[3] else None
+                            status     = row[4] if len(row) > 4 else "open"
+                            exit_price = float(row[5]) if len(row) > 5 and row[5] else None
+                            pnl_pct    = float(row[6]) if len(row) > 6 and row[6] else None
+                            days_held  = float(row[7]) if len(row) > 7 and row[7] else None
+                            story      = row[9] if len(row) > 9 else ""
+                            con.execute(
+                                "INSERT OR IGNORE INTO pick_outcomes "
+                                "(run_date, symbol, grade, fused_score, status, "
+                                " exit_price, pnl_pct, days_held, story) "
+                                "VALUES (?,?,?,?,?,?,?,?,?)",
+                                (run_date, symbol, grade, fused, status,
+                                 exit_price, pnl_pct, days_held, story)
+                            )
+                            restored_outcomes += 1
+                        except Exception as row_err:
+                            log.debug(f"FIX-RESTORE: pick_outcomes row skip: {row_err}")
+                log.info(f"FIX-RESTORE: {restored_outcomes} pick_outcomes rows restored from DB_BACKUP ✅")
+            else:
+                log.warning("FIX-RESTORE: DB_BACKUP tab is empty — no outcomes to restore")
+    except Exception as e:
+        log.warning(f"FIX-RESTORE: pick_outcomes restore failed (non-fatal): {e}")
+
+    # ── Restore trade_decisions from DB_DECISIONS tab ─────────────────────
+    try:
+        ws_dec = _get_ws("DB_DECISIONS")
+        if ws_dec is not None:
+            raw = ws_dec.get_all_values()
+            if raw and len(raw) >= 2:
+                # Header: run_date,symbol,decision,entry_price,shares_taken,
+                #         skip_reason,ai_confidence,worth_flag,logged_at[,exported_at:...]
+                with _db_conn(write=True) as con:
+                    for row in raw[1:]:
+                        if not row or not row[0]:
+                            continue
+                        try:
+                            run_date      = row[0]
+                            symbol        = row[1]
+                            decision      = row[2] if len(row) > 2 else "SKIPPED"
+                            entry_price   = float(row[3]) if len(row) > 3 and row[3] else None
+                            shares_taken  = float(row[4]) if len(row) > 4 and row[4] else 0.0
+                            skip_reason   = row[5] if len(row) > 5 else None
+                            ai_confidence = float(row[6]) if len(row) > 6 and row[6] else None
+                            worth_flag    = row[7] if len(row) > 7 else None
+                            logged_at     = row[8] if len(row) > 8 else None
+                            con.execute(
+                                "INSERT OR IGNORE INTO trade_decisions "
+                                "(run_date, symbol, decision, entry_price, shares_taken, "
+                                " skip_reason, ai_confidence, worth_flag, logged_at) "
+                                "VALUES (?,?,?,?,?,?,?,?,?)",
+                                (run_date, symbol, decision, entry_price, shares_taken,
+                                 skip_reason, ai_confidence, worth_flag, logged_at)
+                            )
+                            restored_decisions += 1
+                        except Exception as row_err:
+                            log.debug(f"FIX-RESTORE: trade_decisions row skip: {row_err}")
+                log.info(f"FIX-RESTORE: {restored_decisions} trade_decisions rows restored from DB_DECISIONS ✅")
+            else:
+                log.warning("FIX-RESTORE: DB_DECISIONS tab is empty — no decisions to restore")
+    except Exception as e:
+        log.warning(f"FIX-RESTORE: trade_decisions restore failed (non-fatal): {e}")
+
+    log.info(f"FIX-RESTORE: complete — outcomes={restored_outcomes}, decisions={restored_decisions}")
+
+
 def _backup_db_to_sheets():
     """
     FIX-A6: Export last 500 pick_outcomes rows to a BACKUP tab in Google Sheets.
@@ -10938,6 +11037,12 @@ def _weekly_ai_status_agent():
         )
         return
 
+    # FIX-RESTORE: Restore pick_outcomes + trade_decisions from Sheets BEFORE
+    # backup or queries. On a fresh GitHub Actions runner the local SQLite is
+    # empty — without this step all weekly queries return zero, producing a
+    # false "no activity" report even when real trades existed.
+    _restore_db_from_sheets()
+
     # FIX-A6: Backup DB to Sheets at the start of weekly review.
     # GitHub Actions cache TTL is 7 days — the weekly run is the perfect trigger
     # to ensure history is preserved before it can expire.
@@ -11027,6 +11132,23 @@ def _weekly_ai_status_agent():
                 for tier in ("PURE", "ACCEPTABLE", "RISKY")
             }
         }
+
+        # FIX-GUARD: If all activity metrics are zero, the DB restore failed or
+        # the week was genuinely empty. Abort and send a diagnostic warning
+        # instead of a misleading "no activity" AI-generated report.
+        if context["taken"] == 0 and context["skipped"] == 0 and context["total_closed"] == 0:
+            warn_msg = (
+                "⚠️ <b>Weekly review aborted — all metrics zero.</b>\n\n"
+                "Possible causes:\n"
+                "  • DB_BACKUP / DB_DECISIONS Sheets tabs are empty\n"
+                "  • GitHub Actions runner cache evicted AND Sheets restore failed\n"
+                "  • Sheets credentials expired (check GOOGLE_CREDS_JSON secret)\n\n"
+                f"Week queried: {since} → today\n"
+                "No report sent. Please check Sheets tabs and runner logs."
+            )
+            _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, warn_msg)
+            log.warning("FIX-GUARD: Weekly review aborted — zero-data context after restore attempt")
+            return
 
         prompt = (
             "You are a trading performance analyst reviewing a week of NSE halal swing trades.\n"
