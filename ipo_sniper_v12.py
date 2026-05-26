@@ -44,9 +44,23 @@ except ImportError:
     _RAPIDFUZZ_OK = False
 
 try:
-    from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
+    from tenacity import (
+        retry,
+        retry_if_exception_type,
+        stop_after_attempt,
+        wait_exponential_jitter,
+    )
     _TENACITY_OK = True
 except ImportError:
+    # Provide no-op stubs so the @retry decorator below gracefully degrades
+    def retry(*a, **kw):          # type: ignore[misc]
+        return lambda f: f
+    def stop_after_attempt(n):    # type: ignore[misc]
+        return None
+    def wait_exponential_jitter(*a, **kw):  # type: ignore[misc]
+        return None
+    def retry_if_exception_type(*a, **kw):  # type: ignore[misc]
+        return None
     _TENACITY_OK = False
 
 
@@ -157,16 +171,19 @@ OBVIOUS_HALAL_SECTORS = {
     "healthcare", "hospital", "pharma", "biotech", "medical devices",
     "manufacturing", "auto components", "engineering", "capital goods",
     "education", "edtech", "school", "college",
-    "agriculture", "agri inputs", "food processing",
+    "agriculture", "agri inputs", "food processing", "food", "dal",
+    "pulses", "spices", "flour", "rice", "grain", "fmcg",
     "logistics", "warehousing", "courier",
     "renewable energy", "solar", "wind", "power generation",
     "real estate development", "construction", "infrastructure",
-    "textiles", "apparel", "retail",
+    "textiles", "apparel", "retail", "fashion", "garments", "saree",
+    "jewellery", "jewelry", "jeweler", "gold", "gems",
     # common fragments seen in Indian SME IPO names / descriptions
     "infotech", "techno", "systems", "solutions", "services",
     "chemicals", "packaging", "printing", "cables", "wires",
     "steel", "iron", "cement", "ceramics", "pipes", "pumps",
     "hospital", "diagnostic", "clinic", "labs",
+    "overseas", "exports", "imports", "trading",
 }
 OBVIOUS_HARAM_SECTORS = {
     "bank", "banking", "nbfc", "microfinance", "housing finance",
@@ -177,6 +194,16 @@ OBVIOUS_HARAM_SECTORS = {
     "tobacco", "cigarette", "cigar", "pan masala",
     "adult entertainment", "pornography",
 }
+
+# Sectors where missing D/E data is treated as a risk flag ("guilty until proven innocent").
+# Allocated once at module level — referenced inside _pick_audit for every IPO row.
+_CAPITAL_INTENSIVE_SECTORS: frozenset = frozenset({
+    "infrastructure", "construction", "real estate", "nbfc",
+    "housing finance", "steel", "power", "cement", "mining",
+    "manufacturing", "auto", "shipping", "aviation", "telecom",
+    "ports", "roads", "bridges", "railway", "metro",
+    "oil", "gas", "refinery", "petrochemical",
+})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -191,6 +218,7 @@ class LLMTracker:
       DESC_FETCH   – web scraping for company description
       CACHE_HIT    – Shariah SQLite cache lookup
       PREFILTER    – sector keyword pre-filter
+      DE_RATIO     – debt/equity ratio fetch & gate (new)
       RULE_AUDIT   – rule-based fallback
       OPENAI_MINI  – gpt-4o-mini structured-output call
       OPENAI_FULL  – gpt-4o escalated call
@@ -879,7 +907,8 @@ def _fetch_investorgain_new() -> list:
     try:
         import cloudscraper
         scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows"}, delay=3)
+            browser={"browser": "chrome", "platform": "windows"})
+        time.sleep(3)
         r = scraper.get(url, timeout=30)
         if r.status_code == 200 and not r.headers.get("x-deny-reason"):
             soup  = BeautifulSoup(r.text, "lxml")
@@ -1008,7 +1037,23 @@ def _ipo_records_to_df(records: list, source_label: str = "") -> pd.DataFrame:
         rec.status = status
 
         lo, hi   = _parse_price_band(rec.issue_price or "")
-        lot_size = _int(rec.lot_size or "0") or 50
+        raw_lot  = _int(rec.lot_size or "0")
+
+        # ── Infer lot size from price when scraper didn't capture it ──────────
+        # SEBI rules: retail max ₹2 lakh per application.
+        # If lot is missing (0) or suspiciously small (≤1), estimate from price.
+        # This prevents the default lot=50 making capital look trivially small.
+        if raw_lot <= 1 and hi > 0:
+            # Estimate: closest standard lot that brings cost near ₹1–2 lakh
+            for candidate in [10, 15, 20, 25, 35, 40, 50, 75, 100, 125,
+                               150, 200, 250, 300, 400, 500, 600, 800, 1000,
+                               1200, 1400, 1600, 2000, 3000]:
+                if hi * candidate >= 50_000:   # at least ₹50k per lot
+                    raw_lot = candidate
+                    break
+            else:
+                raw_lot = 50
+        lot_size = max(1, raw_lot)
 
         gmp_raw = rec.gmp or ""
         gmp_num = _flt(gmp_raw, 0.0)
@@ -1038,12 +1083,21 @@ def _ipo_records_to_df(records: list, source_label: str = "") -> pd.DataFrame:
         else:
             sector = "Mainboard"
 
+        # ── Estimate issue size if not scraped ───────────────────────────────
+        # SME IPOs are typically ₹10–100 Cr; Mainboard ₹100–5000 Cr.
+        # Use lot × price × assumed retail allotment shares as rough proxy.
+        if hi > 0 and lot_size > 0:
+            est_size_cr = round((hi * lot_size * 500) / 1e7, 1)   # 500 lots proxy
+            est_size_cr = max(10.0, min(est_size_cr, 5000.0))
+        else:
+            est_size_cr = 50.0
+
         src_str = ", ".join(rec.sources) if rec.sources else source_label
 
         rows.append({
             "Symbol":            rec.name,
             "Sector":            sector,
-            "IssueSizeCr":       50.0,
+            "IssueSizeCr":       est_size_cr,
             "PriceBandLower":    lo,
             "PriceBandUpper":    hi,
             "LotSize":           lot_size,
@@ -1155,9 +1209,67 @@ def fetch_source_e_nse() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# VALIDATION + ENRICHMENT
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Live subscription enrichment ──────────────────────────────────────────────
+_SUB_CACHE: Dict[str, float] = {}
+
+def _fetch_live_subscription(symbols: List[str]) -> Dict[str, float]:
+    """
+    Fetch live subscription data for a list of IPO names.
+    Tries IndiaTrade (already works in source D) and IPO GMP sources.
+    Returns dict of {normalised_symbol: subscription_times}.
+    """
+    if not symbols:
+        return {}
+
+    result: Dict[str, float] = {}
+
+    try:
+        import cloudscraper as _cs
+        scraper = _cs.create_scraper(
+            browser={"browser": "chrome", "platform": "windows"})
+        time.sleep(1)
+    except ImportError:
+        return {}
+
+    sub_urls = [
+        "https://ipo.indiratrade.com/Home",
+        "https://www.chittorgarh.com/report/live-ipo-subscription-status/80/",
+        "https://ipowatch.in/ipo-subscription-status-live-data/",
+    ]
+
+    for url in sub_urls:
+        try:
+            r = scraper.get(url, timeout=12)
+            deny = r.headers.get("x-deny-reason", "")
+            if deny or r.status_code != 200 or _is_antibot_page(r.text, r.status_code):
+                continue
+
+            soup = BeautifulSoup(r.text, "lxml")
+            for table in soup.find_all("table"):
+                for row in table.find_all("tr")[1:]:
+                    cells = [td.get_text(strip=True) for td in row.find_all("td")]
+                    if len(cells) < 3:
+                        continue
+                    name_raw = cells[0].lower()
+                    # find subscription column — look for a cell with x or times
+                    for cell in cells[1:]:
+                        sub_m = re.search(r"([\d,]+\.?\d*)\s*[xX×]?", cell.replace(",", ""))
+                        if sub_m:
+                            sub_val = float(sub_m.group(1))
+                            if 0.01 <= sub_val <= 10_000:
+                                # fuzzy match against our symbol list
+                                for sym in symbols:
+                                    key = _normalise_name(sym)
+                                    if key[:8] in name_raw or name_raw[:8] in key:
+                                        result[sym] = max(result.get(sym, 0.0), sub_val)
+                                break
+            if result:
+                log.info(f"  📊 Live sub data: {len(result)} companies enriched")
+                break
+        except Exception as exc:
+            log.debug(f"  [sub_fetch] {url}: {exc}")
+
+    return result
 
 REQUIRED_DEFAULTS = {
     "Symbol":            "UNKNOWN",
@@ -1185,16 +1297,12 @@ def _validate_row(row: pd.Series) -> Tuple[bool, str]:
     if not sym or len(sym) < 2 or sym.lower() in ("unknown", "nan", "none", ""):
         return False, "invalid_symbol"
     price       = float(row.get("PriceBandUpper", 0))
+    lot         = int(row.get("LotSize", 0))
     is_upcoming = bool(row.get("IsUpcoming", False))
-    if is_upcoming:
-        if price > 200_000:
-            return False, f"price_out_of_range:{price}"
-    else:
-        if price <= 0:
-            return False, "live_price_zero"
-        if price > 200_000:
-            return False, f"price_out_of_range:{price}"
-    lot = int(row.get("LotSize", 0))
+    if price > 200_000:
+        return False, f"price_out_of_range:{price}"
+    if not is_upcoming and price <= 0:
+        return False, "live_price_zero"
     if lot <= 0 or lot > 200_000:
         return False, f"lot_out_of_range:{lot}"
     days    = int(row.get("DaysToClose", 0))
@@ -1255,7 +1363,9 @@ def fetch_unified_calendar() -> pd.DataFrame:
 
     import concurrent.futures
     all_records: list = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    # max_workers=2: launching 4 Playwright Chromium instances simultaneously
+    # can spike RAM by 800MB–1.2GB on a typical 2GB VPS and trigger the OOM killer.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         f_screener = executor.submit(_fetch_screener)
         f_ig       = executor.submit(_fetch_investorgain_new)
         f_groww    = executor.submit(_fetch_groww)
@@ -1320,6 +1430,18 @@ def fetch_unified_calendar() -> pd.DataFrame:
     ], ignore_index=True)
     deduped = pd.concat([live_df, upcoming_capped], ignore_index=True)
 
+    # ── Enrich subscription data for live IPOs ────────────────────────────────
+    # All scrapers set SubscriptionTimes=0.0 by default. Attempt a live fetch
+    # from IndiaTrade/Chittorgarh sub pages for IPOs that are currently open.
+    live_syms = deduped.loc[~deduped["IsUpcoming"], "Symbol"].tolist()
+    if live_syms:
+        live_subs = _fetch_live_subscription(live_syms)
+        if live_subs:
+            for sym, sub_val in live_subs.items():
+                mask = deduped["Symbol"] == sym
+                if mask.any():
+                    deduped.loc[mask, "SubscriptionTimes"] = sub_val
+
     log.info(f"✅ Final: {len(deduped)} IPOs  "
              f"({int((~deduped['IsUpcoming']).sum())} live, "
              f"{int(deduped['IsUpcoming'].sum())} upcoming)")
@@ -1363,15 +1485,17 @@ class AllotmentProfile:
 
 @dataclass
 class ShariahVerdict:
-    symbol:          str
-    tier:            str
-    barakah_index:   float
-    najash_alert:    bool
-    qabda_mandate:   str
-    deferred_issues: List[str]
-    llm_confidence:  int  = 0
-    llm_reason:      str  = ""
-    llm_method:      str  = ""
+    symbol:           str
+    tier:             str
+    barakah_index:    float
+    najash_alert:     bool
+    qabda_mandate:    str
+    deferred_issues:  List[str]
+    llm_confidence:   int   = 0
+    llm_reason:       str   = ""
+    llm_method:       str   = ""
+    business_summary: str   = ""   # e.g. "In-vitro diagnostics & testing kits"
+    revenue_cr:       Optional[float] = None  # annual revenue in ₹ Cr if scraped
 
 def monte_carlo_allotment(sub, lot, size_cr, price, n=MC_RUNS):
     if sub <= 0 or lot <= 0 or price <= 0 or size_cr <= 0:
@@ -1432,16 +1556,35 @@ _SHARIAH_SO_SCHEMA: dict = {
         "schema": {
             "type": "object",
             "properties": {
-                "is_compliant":     {"type": "boolean"},
+                "is_compliant":       {"type": "boolean"},
                 "tier": {
                     "type": "string",
                     "enum": ["TIER_1_COMPLIANT", "TIER_2_CONDITIONAL", "HARAM_CORE_BUSINESS"],
                 },
-                "haram_reason":     {"type": ["string", "null"]},
-                "compliance_notes": {"type": "string"},
-                "confidence":       {"type": "integer"},
+                "haram_reason":       {"type": ["string", "null"]},
+                "compliance_notes":   {"type": "string"},
+                "confidence":         {"type": "integer"},
+                # ── New fields for Wakeel-style report ──────────────────────
+                "business_summary":   {
+                    "type": "string",
+                    "description": (
+                        "One concise sentence describing the company's core "
+                        "business (e.g. 'In-vitro diagnostics & medical testing kits'). "
+                        "Max 15 words."
+                    ),
+                },
+                "revenue_cr": {
+                    "type": ["number", "null"],
+                    "description": (
+                        "Company's annual revenue in INR Crores if mentioned in "
+                        "the description, else null."
+                    ),
+                },
             },
-            "required": ["is_compliant", "tier", "haram_reason", "compliance_notes", "confidence"],
+            "required": [
+                "is_compliant", "tier", "haram_reason", "compliance_notes",
+                "confidence", "business_summary", "revenue_cr",
+            ],
             "additionalProperties": False,
         },
     },
@@ -1599,9 +1742,15 @@ Set confidence to 0–100 reflecting your certainty given the description qualit
 # ── SQLite audit cache ────────────────────────────────────────────────────────
 _AUDIT_CACHE_PATH = Path("data/shariah_audit_cache.db")
 
+import threading as _threading
+_AUDIT_CACHE_LOCK = _threading.Lock()   # guards concurrent _cache_set writes
+
+
 def _init_audit_cache():
     _AUDIT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(_AUDIT_CACHE_PATH)) as con:
+        # WAL mode: readers don't block writers; safe for future parallel LLM calls
+        con.execute("PRAGMA journal_mode=WAL;")
         con.execute("""
             CREATE TABLE IF NOT EXISTS shariah_cache (
                 symbol         TEXT PRIMARY KEY,
@@ -1636,21 +1785,22 @@ def _cache_get(symbol: str) -> Optional[dict]:
         return None
 
 def _cache_set(symbol: str, result: dict, description: str):
-    try:
-        with sqlite3.connect(str(_AUDIT_CACHE_PATH)) as con:
-            con.execute("""
-                INSERT OR REPLACE INTO shariah_cache
-                    (symbol,is_compliant,tier,haram_reason,notes,confidence,description,cached_at)
-                VALUES (?,?,?,?,?,?,?,?)
-            """, (
-                symbol, int(result.get("is_compliant", True)),
-                result.get("tier", "TIER_2_CONDITIONAL"),
-                result.get("haram_reason"), result.get("compliance_notes", ""),
-                result.get("confidence", 0), description[:2000],
-                datetime.utcnow().isoformat(),
-            ))
-    except Exception as exc:
-        log.warning(f"  Audit cache write failed: {exc}")
+    with _AUDIT_CACHE_LOCK:   # thread-safe: prevents OperationalError on concurrent writes
+        try:
+            with sqlite3.connect(str(_AUDIT_CACHE_PATH)) as con:
+                con.execute("""
+                    INSERT OR REPLACE INTO shariah_cache
+                        (symbol,is_compliant,tier,haram_reason,notes,confidence,description,cached_at)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (
+                    symbol, int(result.get("is_compliant", True)),
+                    result.get("tier", "TIER_2_CONDITIONAL"),
+                    result.get("haram_reason"), result.get("compliance_notes", ""),
+                    result.get("confidence", 0), description[:2000],
+                    datetime.utcnow().isoformat(),
+                ))
+        except Exception as exc:
+            log.warning(f"  Audit cache write failed: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1666,40 +1816,165 @@ def _slugify(name: str) -> str:
 
 
 def _extract_desc_text(soup: BeautifulSoup, min_len: int = 40) -> str:
-    """Surgically extract the business model, ignoring website boilerplate."""
-    
-    # 1. Destroy generic noise before searching
-    for bad in soup.find_all(['nav', 'footer', 'script', 'style', 'noscript', 'header', 'aside']):
-        bad.decompose()
+    """
+    Multi-strategy extractor. Tries site-specific selectors first (Chittorgarh,
+    Screener, Moneycontrol) then falls back to generic patterns.
+    Returns the LONGEST match found across all selectors, not just the first.
+    """
+    candidates = []
 
-    # 2. Chittorgarh-Specific Golden Target
-    # Chittorgarh usually starts their descriptions with "Incorporated in..." or "Founded in..."
-    for p in soup.find_all("p"):
-        text = p.get_text(" ", strip=True)
-        if "incorporated in" in text.lower() or "founded in" in text.lower():
-            # Grab this paragraph and the next two
-            siblings = p.find_next_siblings("p", limit=2)
-            combined = text + " " + " ".join(s.get_text(" ", strip=True) for s in siblings)
-            if len(combined) >= min_len:
-                return combined
-
-    # 3. Generic Fallbacks for other sites
-    for tag, attrs in [
-        ("div",     {"itemprop": "articleBody"}),
-        ("div",     {"class": re.compile(r"company-profile|about-company|desc", re.I)}),
-        ("section", {"id":    re.compile(r"about|overview|business", re.I)}),
-        ("p",       {}), 
+    # ── Strategy 1: Chittorgarh-specific ─────────────────────────────────────
+    # Their IPO pages use card-body, tab-pane, and custom ipo-* classes
+    for sel in [
+        "div.card-body",
+        "div.tab-pane",
+        "div.ipo-description",
+        "div.company-details",
+        "div.about-company",
+        "section.about",
+        "div#about",
+        "div#company",
+        "div#overview",
     ]:
-        blocks = soup.find_all(tag, attrs)[:3]
-        text   = " ".join(b.get_text(" ", strip=True) for b in blocks)
-        text   = re.sub(r"\s+", " ", text).strip()
-        
-        # Filter out generic 300-char site disclaimers
-        if len(text) >= min_len and "India's No 1" not in text and "cookie" not in text.lower():
-            return text
+        for el in soup.select(sel)[:4]:
+            txt = re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
+            # skip navigation-length snippets and pure-number blocks
+            if len(txt) >= min_len and not re.match(r'^[\d\s₹,.\-/]+$', txt):
+                candidates.append(txt)
 
-    return ""
-    
+    # ── Strategy 2: Generic semantic tags ─────────────────────────────────────
+    for tag, attrs in [
+        ("div",     {"class": re.compile(r"about|company|descri|overview|business|detail|content|summary", re.I)}),
+        ("section", {"class": re.compile(r"about|overview|business|company", re.I)}),
+        ("section", {"id":    re.compile(r"about|overview|business|company", re.I)}),
+        ("article", {}),
+        ("main",    {}),
+    ]:
+        blocks = soup.find_all(tag, attrs)[:6]
+        txt = " ".join(b.get_text(" ", strip=True) for b in blocks)
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if len(txt) >= min_len:
+            candidates.append(txt)
+
+    # ── Strategy 3: Paragraph harvest (skip short nav/breadcrumb <p> tags) ───
+    # Collect paragraphs that are at least 60 chars (real sentences, not nav)
+    long_paras = [
+        re.sub(r"\s+", " ", p.get_text(" ", strip=True)).strip()
+        for p in soup.find_all("p")
+        if len(p.get_text(strip=True)) >= 60
+    ]
+    if long_paras:
+        candidates.append(" ".join(long_paras[:10]))
+
+    if not candidates:
+        return ""
+
+    # Return the longest useful candidate (most information)
+    best = max(candidates, key=len)
+    # Strip obvious boilerplate suffixes (cookie notices, disclaimers)
+    best = re.sub(
+        r"(cookie|privacy policy|terms of use|all rights reserved|disclaimer).*",
+        "", best, flags=re.IGNORECASE,
+    ).strip()
+    return best if len(best) >= min_len else ""
+
+
+# ── Proactive D/E ratio fetcher ───────────────────────────────────────────────
+_DE_CACHE: Dict[str, Optional[float]] = {}
+
+def fetch_de_ratio(company_name: str) -> Optional[float]:
+    """
+    Fetch Debt-to-Equity ratio from multiple sources.
+    Returns float if found, None if unavailable.
+    Cached per company name for the run lifetime.
+
+    This is called BEFORE the LLM so a high D/E can block an IPO
+    even when the sector looks halal (e.g. jewellery with D/E=1.50).
+    """
+    if company_name in _DE_CACHE:
+        return _DE_CACHE[company_name]
+
+    slug        = _slugify(company_name)
+    slug_nodash = slug.replace("-", "").upper()
+
+    sources = [
+        # Screener.in — most reliable D/E source for Indian companies
+        f"https://www.screener.in/company/{slug_nodash}/consolidated/",
+        f"https://www.screener.in/company/{slug_nodash}/",
+        # Trendlyne
+        f"https://trendlyne.com/fundamentals/stock/{slug_nodash}/",
+    ]
+
+    try:
+        import cloudscraper as _cs
+        scraper = _cs.create_scraper(
+            browser={"browser": "chrome", "platform": "windows"})
+        time.sleep(1)
+    except ImportError:
+        scraper = None
+
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Accept-Language": "en-IN,en;q=0.9",
+    })
+
+    for url in sources:
+        html: Optional[str] = None
+        try:
+            client = scraper if scraper else sess
+            r = client.get(url, timeout=10)
+            deny = r.headers.get("x-deny-reason", "")
+            if deny or r.status_code != 200 or _is_antibot_page(r.text, r.status_code):
+                continue
+            html = r.text
+        except Exception:
+            continue
+
+        if not html:
+            continue
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # ── Method A: look for D/E in ratio tables ────────────────────────────
+        de_patterns = re.compile(
+            r"debt\s*[/\\-]?\s*equity|d\s*/\s*e\s*ratio|debt\s+to\s+equity",
+            re.IGNORECASE,
+        )
+        for row in soup.find_all("tr"):
+            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            if len(cells) >= 2 and de_patterns.search(cells[0]):
+                # Value is usually in the 2nd or last cell
+                for val_cell in cells[1:]:
+                    m = re.search(r"[\d]+\.?\d*", val_cell.replace(",", ""))
+                    if m:
+                        de = float(m.group())
+                        if 0 <= de <= 50:          # sanity range
+                            _DE_CACHE[company_name] = de
+                            log.info(
+                                f"  [D/E] {company_name}: ratio={de:.2f}  "
+                                f"({'HARAM' if de>0.33 else 'OK'})"
+                            )
+                            return de
+
+        # ── Method B: regex scan of raw page text ────────────────────────────
+        text = soup.get_text(" ")
+        m = re.search(
+            r"debt\s*[/\\-]?\s*equity\s*[:\s]+([0-9]+\.?[0-9]*)",
+            text, re.IGNORECASE,
+        )
+        if m:
+            de = float(m.group(1))
+            if 0 <= de <= 50:
+                _DE_CACHE[company_name] = de
+                log.info(f"  [D/E] {company_name}: ratio={de:.2f} (regex scan)")
+                return de
+
+    _DE_CACHE[company_name] = None
+    log.debug(f"  [D/E] {company_name}: not found in any source")
+    return None
+
+
 def _name_based_stub(company_name: str) -> str:
     """
     Construct a minimal ~90-char description from the company name alone.
@@ -1775,8 +2050,8 @@ def fetch_company_description(company_name: str) -> str:
         import cloudscraper
         scraper = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False},
-            delay=2,
         )
+        time.sleep(2)
         _have_cs = True
     except ImportError:
         scraper   = None
@@ -2101,16 +2376,20 @@ def audit_business_with_router(
 
 def _pick_audit(company_name: str, description: str, sector: str) -> dict:
     """
-    FIX 3: passes description AND company_name to _sector_pre_filter so that
-    matching works against real text, not just "SME"/"Mainboard".
+    Shariah dispatch with D/E gate added BEFORE the LLM call.
 
-    Dispatch order:
-      1. Sector pre-filter  (description + name + sector field)
-      2. LLM router         (OpenAI primary)
-      3. Rule-based audit   (automatic fallback)
+    Order:
+      1. Sector pre-filter  (keyword match on name + desc + sector)
+      2. D/E ratio gate     (runs ALWAYS — overrides even a HALAL pre-filter)
+         • D/E > 0.33  → HARAM  (riba-laden capital structure)
+         • 0.20–0.33   → downgrade HALAL → CONDITIONAL, note in desc
+         • < 0.20      → inject confirmation into desc for LLM
+      3. LLM router         (with D/E-enriched description)
+      4. Rule-based fallback
     """
     llm_tracker.start(company_name, "PREFILTER", f"sector='{sector}'")
     pre = _sector_pre_filter(sector, description, company_name)
+
     if pre is not None:
         decision, result = pre
         llm_tracker.ok(
@@ -2121,9 +2400,81 @@ def _pick_audit(company_name: str, description: str, sector: str) -> dict:
             f"  [prefilter] {company_name}: {decision} "
             f"(conf={result['confidence']}%  method={result['_method']})"
         )
-        return result
+    else:
+        llm_tracker.skip(company_name, "PREFILTER", "no keyword match → D/E check")
 
-    llm_tracker.skip(company_name, "PREFILTER", "no keyword match → LLM")
+    # ── D/E ratio gate (always runs, can override HALAL pre-filter) ───────────
+    llm_tracker.start(company_name, "DE_RATIO", "fetching debt/equity")
+    de = fetch_de_ratio(company_name)
+
+    if de is not None:
+        if de > 0.33:
+            # Hard HARAM regardless of sector — riba-laden capital structure
+            result = {
+                "is_compliant":     False,
+                "tier":             "HARAM_CORE_BUSINESS",
+                "haram_reason":     (
+                    f"Debt/Equity ratio = {de:.2f} exceeds the 0.33 Islamic "
+                    f"finance threshold. Excess interest-bearing debt (Riba)."
+                ),
+                "compliance_notes": "D/E gate blocked.",
+                "confidence":       88,
+                "_method":          "de_ratio_haram",
+            }
+            llm_tracker.ok(
+                company_name, "DE_RATIO",
+                f"D/E={de:.2f} > 0.33 → HARAM (overrides sector verdict)"
+            )
+            log.info(f"  [D/E] {company_name}: HARAM  D/E={de:.2f} > 0.33")
+            return result
+
+        elif de > 0.20:
+            # Grey zone — downgrade HALAL → CONDITIONAL, flag for LLM
+            if pre and pre[0] == "HALAL":
+                pre[1]["tier"]             = "TIER_2_CONDITIONAL"
+                pre[1]["compliance_notes"] += (
+                    f" However D/E={de:.2f} is near the 0.33 limit — conditional."
+                )
+                pre[1]["confidence"]       = min(pre[1]["confidence"], 65)
+                pre[1]["_method"]          = "de_ratio_conditional"
+            # Inject into description for LLM
+            description += f"\n\nFINANCIAL NOTE: Debt/Equity ratio = {de:.2f} (near 0.33 limit)."
+            llm_tracker.warn(
+                company_name, "DE_RATIO",
+                f"D/E={de:.2f} 0.20–0.33 → CONDITIONAL flag injected"
+            )
+        else:
+            # Clean — confirm in description, boosts LLM confidence
+            description += f"\n\nFINANCIAL NOTE: Debt/Equity ratio = {de:.2f} (within 0.33 limit — compliant)."
+            llm_tracker.ok(
+                company_name, "DE_RATIO",
+                f"D/E={de:.2f} < 0.20 → compliant, injected into desc"
+            )
+    else:
+        # ── D/E not found — "Guilty Until Proven Innocent" for high-risk sectors ─
+        # Capital-intensive sectors commonly carry riba-laden debt.
+        # If we can't verify the ratio, treat as CONDITIONAL and warn the LLM.
+        sector_lower = description.lower() + " " + company_name.lower()
+        _is_capital_intensive = any(k in sector_lower for k in _CAPITAL_INTENSIVE_SECTORS)
+
+        if _is_capital_intensive:
+            description += (
+                "\n\nFINANCIAL NOTE: Debt/Equity ratio could not be verified. "
+                "Given the capital-intensive nature of this sector, treat as "
+                "TIER_2_CONDITIONAL until D/E is confirmed below 0.33."
+            )
+            llm_tracker.warn(
+                company_name, "DE_RATIO",
+                "not found + capital-intensive → CONDITIONAL warning injected"
+            )
+        else:
+            llm_tracker.skip(company_name, "DE_RATIO", "not found — LLM proceeds without it")
+
+    # ── Return pre-filter result if we have one (D/E didn't override) ────────
+    if pre is not None:
+        return pre[1]
+
+    # ── LLM audit (with D/E-enriched description) ─────────────────────────────
     return audit_business_with_router(company_name, description)
 
 
@@ -2178,10 +2529,15 @@ def run_shariah(row: pd.Series, company_description: str = "") -> ShariahVerdict
         # Check whether the LLM is expressing doubt rather than a ruling
         _uncertain = any(phrase in reason_lower for phrase in _UNCERTAINTY_PHRASES)
 
+        # Extract new LLM fields (present when using updated schema)
+        biz_summary = llm.get("business_summary", "") or ""
+        revenue_cr  = llm.get("revenue_cr")
+
         if llm_conf >= _HARAM_MIN_CONFIDENCE and not _uncertain:
             # ── Genuine high-confidence HARAM ruling ─────────────────────────
             issues.append(f"Audit: {reason_str}")
             qabda = "N/A — Investment not permissible per Shariah audit."
+
             llm_tracker.ok(
                 sym, "FINAL",
                 f"HARAM  conf={llm_conf}%  method={method}"
@@ -2189,6 +2545,7 @@ def run_shariah(row: pd.Series, company_description: str = "") -> ShariahVerdict
             return ShariahVerdict(
                 sym, "HARAM_CORE_BUSINESS", 0.0, False, qabda, issues,
                 llm_confidence=llm_conf, llm_reason=reason_str, llm_method=method,
+                business_summary=biz_summary, revenue_cr=revenue_cr,
             )
         else:
             # ── Low-confidence or uncertain "HARAM" → downgrade to CONDITIONAL ─
@@ -2215,6 +2572,10 @@ def run_shariah(row: pd.Series, company_description: str = "") -> ShariahVerdict
             )
 
     # ── TIER 2: KEYWORD GUARD ─────────────────────────────────────────────────
+    # Extract LLM-generated summary fields (available when schema v2 is used)
+    biz_summary = llm.get("business_summary", "") or ""
+    revenue_cr  = llm.get("revenue_cr")
+
     kw_reason = _keyword_haram_check(sym, sector, desc)
     if kw_reason:
         issues.append(f"Keyword Guard: {kw_reason}")
@@ -2223,6 +2584,7 @@ def run_shariah(row: pd.Series, company_description: str = "") -> ShariahVerdict
         return ShariahVerdict(
             sym, "HARAM_CORE_BUSINESS", 0.0, False, qabda, issues,
             llm_confidence=llm_conf, llm_reason=kw_reason, llm_method="keyword",
+            business_summary=biz_summary, revenue_cr=revenue_cr,
         )
 
     llm_tier = llm.get("tier", "TIER_2_CONDITIONAL")
@@ -2258,6 +2620,7 @@ def run_shariah(row: pd.Series, company_description: str = "") -> ShariahVerdict
     return ShariahVerdict(
         sym, tier, final_barakah, najash, qabda, issues,
         llm_confidence=llm_conf, llm_reason=llm_reason, llm_method=method,
+        business_summary=biz_summary, revenue_cr=revenue_cr,
     )
 
 
@@ -2316,6 +2679,17 @@ def _sector_avg_sub(df: pd.DataFrame, sector: str) -> float:
 
 def master_score(row, allot: AllotmentProfile, shariah: ShariahVerdict,
                  w: Dict[str, float], df_context: pd.DataFrame = None) -> Dict:
+    price       = float(row["PriceBandUpper"]) or 100.0
+    lot         = int(row["LotSize"])
+    lot_cost    = price * lot
+
+    # ── PRICED OUT gate: SEBI retail cap is ₹2 lakh per application ───────────
+    if lot_cost > 200_000:
+        return {
+            "FinalScore": 0.0,
+            "Verdict":    "🚫 PRICED OUT",
+        }
+
     days        = max(0, int(row["DaysToClose"]))
     tf          = 1.0 if days >= 7 else (0.5 + 0.5 * days / 7)
     gmp         = float(row["GMP"])
@@ -2366,17 +2740,21 @@ def run_backtest(days_lookback: int = 180) -> None:
     log.info("📊 Running automated backtest (last %d days)...", days_lookback)
     try:
         with sqlite3.connect(str(IPO_DB_PATH)) as con:
-            outcomes = pd.read_sql(f"""
+            outcomes = pd.read_sql(
+                """
                 SELECT symbol, issue_price, lot_size,
                        predicted_gmp_pct, predicted_ev_inr,
                        day1_listing_price, day1_gain_pct,
                        t2_closing_price, halal_gain_pct, halal_profit_inr,
                        verdict_was, final_score_was, listed_date
                 FROM ipo_outcomes
-                WHERE listed_date >= date('now', '-{days_lookback} days')
+                WHERE listed_date >= date('now', ?)
                   AND t2_closing_price IS NOT NULL
                 ORDER BY listed_date DESC
-            """, con)
+                """,
+                con,
+                params=(f"-{int(days_lookback)} days",),
+            )
     except Exception as e:
         log.error(f"Backtest DB read failed: {e}")
         return
@@ -2480,13 +2858,17 @@ def _persist_weight_change(old_weights, new_weights, reasoning, stats):
 def run_monthly_strategy_advisor(base_weights: dict, days_lookback: int = 30) -> dict:
     try:
         with sqlite3.connect(str(IPO_DB_PATH)) as con:
-            df = pd.read_sql(f"""
+            df = pd.read_sql(
+                """
                 SELECT symbol, predicted_gmp_pct, halal_gain_pct,
                        error_margin_pct, verdict_was, final_score_was, halal_profit_inr
                 FROM ipo_outcomes
-                WHERE t2_date >= date('now', '-{days_lookback} days')
+                WHERE t2_date >= date('now', ?)
                   AND halal_gain_pct IS NOT NULL
-            """, con)
+                """,
+                con,
+                params=(f"-{int(days_lookback)} days",),
+            )
     except Exception as exc:
         log.warning(f"  [advisor] DB read failed: {exc}")
         return base_weights
@@ -2566,8 +2948,14 @@ Respond ONLY with JSON matching the schema."""
                 timeout=30,
             )
             if resp.status_code == 200:
-                raw_text    = resp.json()["content"][0]["text"].strip()
-                json_match  = re.search(r"\{.*\}", raw_text, re.DOTALL)
+                raw_text = resp.json()["content"][0]["text"].strip()
+                # Strip markdown code fences if present
+                raw_text = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
+                # Non-greedy match to avoid capturing trailing garbage
+                json_match = re.search(r"\{.*?\}", raw_text, re.DOTALL)
+                # Fallback: if non-greedy finds nothing (nested braces), try greedy
+                if not json_match:
+                    json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
                 if json_match:
                     parsed      = json.loads(json_match.group())
                     reasoning   = parsed.pop("reasoning", "(none)")
@@ -2780,6 +3168,8 @@ def _extend_init_db_for_v11(con: sqlite3.Connection) -> None:
 def init_db():
     IPO_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(IPO_DB_PATH)) as con:
+        # WAL mode: safe for future concurrent reads during a parallel LLM scoring pass
+        con.execute("PRAGMA journal_mode=WAL;")
         con.execute("""
             CREATE TABLE IF NOT EXISTS ipo_scans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2848,31 +3238,33 @@ def persist_db(df, allots, shariahs):
 
 _SEP = "━" * 20
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential_jitter(initial=1, max=60),
+    retry=retry_if_exception_type((requests.exceptions.Timeout,
+                                   requests.exceptions.ConnectionError)),
+    reraise=False,
+)
 def _tg_send(text: str, token: str, chat_id: str, max_retries: int = 3):
     text = text[:4096]
-    for attempt in range(max_retries):
+    r = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+        timeout=15,
+    )
+    if r.status_code == 200:
+        return
+    if r.status_code == 429:
+        # Honour Telegram's retry_after header before tenacity re-tries
+        retry_after = 35
         try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-                timeout=15,
-            )
-            if r.status_code == 200:
-                return
-            if r.status_code == 429:
-                retry_after = 35
-                try:
-                    retry_after = r.json()["parameters"]["retry_after"]
-                except Exception:
-                    pass
-                log.info(f"  TG 429 → wait {retry_after}s")
-                time.sleep(retry_after + 1)
-            else:
-                log.warning(f"  TG {r.status_code}: {r.text[:80]}")
-                return
-        except Exception as exc:
-            log.error(f"  TG error: {exc}")
-            return
+            retry_after = r.json()["parameters"]["retry_after"]
+        except Exception:
+            pass
+        log.info(f"  TG 429 → wait {retry_after}s")
+        time.sleep(retry_after + 1)
+        raise requests.exceptions.ConnectionError("429 rate-limited")  # trigger retry
+    log.warning(f"  TG {r.status_code}: {r.text[:80]}")
 
 def _tg_clean(sym: str) -> str:
     sym = re.sub(
@@ -2884,10 +3276,11 @@ def _tg_clean(sym: str) -> str:
     return re.sub(r"\s+", " ", sym).strip() or "UNKNOWN"
 
 def _verdict_action(verdict: str, score: float) -> str:
-    if "PEARL"      in verdict: return "Exceptional across all signals. Apply maximum lots immediately."
-    if "STRONG BUY" in verdict: return "Strong risk/reward. Apply full allocation."
-    if "MODERATE"   in verdict: return "Decent opportunity. Apply 1–2 lots cautiously."
-    if "UPCOMING"   in verdict: return "Mark calendar. Set alert for open date."
+    if "PRICED OUT"  in verdict: return "Lot cost exceeds ₹2 lakh SEBI retail cap. Not accessible to retail investors."
+    if "PEARL"       in verdict: return "Exceptional across all signals. Apply maximum lots immediately."
+    if "STRONG BUY"  in verdict: return "Strong risk/reward. Apply full allocation."
+    if "MODERATE"    in verdict: return "Decent opportunity. Apply 1–2 lots cautiously."
+    if "UPCOMING"    in verdict: return "Mark calendar. Set alert for open date."
     return "Risk/reward not favourable. Skip this round."
 
 def _format_price(lo: float, hi: float) -> str:
@@ -2917,6 +3310,30 @@ def build_ipo_card(row: pd.Series, allot: AllotmentProfile, shariah: ShariahVerd
     days_part = _format_days(days)
     is_haram  = (shariah.tier == "HARAM_CORE_BUSINESS")
 
+    # ── Business summary line (from LLM schema v2) ────────────────────────────
+    biz_line = (
+        f"• Business: <i>{html_lib.escape(shariah.business_summary)}</i>\n"
+        if shariah.business_summary else ""
+    )
+    rev_line = (
+        f"• Revenue: ~₹{shariah.revenue_cr:,.0f} Cr\n"
+        if shariah.revenue_cr else ""
+    )
+
+    # ── PRICED OUT card ───────────────────────────────────────────────────────
+    if "PRICED OUT" in verdict:
+        return (
+            f"🚫 <b>PRICED OUT — RETAIL INACCESSIBLE</b>\n"
+            f"<b>{sym}</b> · <code>{sector}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• Price: {price_str}  (Lot: {lot:,} shares)\n"
+            f"• <b>Capital required: ₹{lot_cost:,.0f}</b>  (exceeds ₹2L SEBI cap)\n"
+            + biz_line + rev_line +
+            f"• Shariah: {('🟢 Tier 1 Compliant' if 'TIER_1' in shariah.tier else '🟡 Tier 2') if not is_haram else '🚫 HARAM'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Size: ₹{size_cr:.0f} Cr  ·  Source: {source}"
+        )
+
     if is_haram:
         sh_icon, sh_label = "🚫", "HARAM — Do Not Invest"
     elif "TIER_1" in shariah.tier:
@@ -2933,6 +3350,8 @@ def build_ipo_card(row: pd.Series, allot: AllotmentProfile, shariah: ShariahVerd
         "rule_halal":       "📜 Rule‑based (Halal)",
         "rule_haram":       "📜 Rule‑based (Haram)",
         "rule_debt":        "📜 Debt/Equity rule",
+        "de_ratio_haram":   "📊 D/E Gate (Haram)",
+        "de_ratio_conditional": "📊 D/E Gate (Conditional)",
         "fallback_rule":    "⚙️ Fallback rule",
         "rule_short_desc":  "📜 Rule (short desc)",
     }.get(shariah.llm_method, "⏳ Unknown")
@@ -2949,6 +3368,7 @@ def build_ipo_card(row: pd.Series, allot: AllotmentProfile, shariah: ShariahVerd
             f"<b>Ruling:</b> HARAM CORE BUSINESS\n"
             f"<b>Reason:</b> <i>{reason}</i>\n"
             f"<b>Audit:</b> {_method_badge}\n"
+            + biz_line + rev_line +
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Barakah: 0/100  ·  Score: {score:.0f}/100\n"
             f"Source: {source}"
@@ -2961,11 +3381,21 @@ def build_ipo_card(row: pd.Series, allot: AllotmentProfile, shariah: ShariahVerd
                 else (f"{gmp_pct:.1f}%" if gmp_pct > 0 else "Awaiting Data"))
     sub      = float(row.get("SubscriptionTimes", 0.0))
     sub_text = f"{sub:.1f}× overall" if sub > 0 else "Awaiting Live Tapes"
+    # QIB / NII breakdown if available
+    qib      = float(row.get("QIB_Sub", 0.0))
+    nii      = float(row.get("NII_Sub", 0.0))
+    ret      = float(row.get("Retail_Sub", 0.0))
+    sub_detail = ""
+    if qib > 0 or nii > 0 or ret > 0:
+        sub_detail = (
+            f"  QIB: {qib:.1f}×  NII: {nii:.1f}×  Retail: {ret:.1f}×\n"
+        )
 
     if "SKIP" in verdict:
         return (
             f"{em} <b>IPO AVOID │ Score: {score:.0f}/100</b>\n"
             f"<b>{sym}</b> · <code>{sector}</code>\n────────────────────\n"
+            + biz_line + rev_line +
             f"<b>Action:</b> {html_lib.escape(action)}\n────────────────────\n"
             f"• Price: {price_str}  (Lot: {lot:,} shares)\n"
             f"• Capital: ₹{lot_cost:,.0f}\n"
@@ -2994,8 +3424,10 @@ def build_ipo_card(row: pd.Series, allot: AllotmentProfile, shariah: ShariahVerd
         f"<b>Action:</b> {html_lib.escape(action)}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"\n📊 <b>MARKET DEMAND</b>\n"
+        + biz_line + rev_line +
         f"• Subscription: <code>{sub_text}</code>\n"
-        f"• Grey Market Premium: <code>{gmp_text}</code>\n"
+        + sub_detail
+        + f"• Grey Market Premium: <code>{gmp_text}</code>\n"
         f"• Issue Size: ₹{size_cr:.0f} Cr\n"
         f"\n💳 <b>DEAL STRUCTURE</b>\n"
         f"• Bid Bracket: {price_str}\n"
@@ -3124,11 +3556,49 @@ def run(backtest: bool = False):
     pending_count = (df["llm_method"] == "pending").sum()
     rule_count    = df["llm_method"].str.startswith("rule").sum()
     pre_count     = df["llm_method"].str.startswith("prefilter").sum()
+
     log.info(
         f"🕌 Shariah: {haram_count} HARAM  |  "
         f"LLM={llm_count}  Pre‑filter={pre_count}  Rule={rule_count}  "
         f"Cache={cache_count}  Pending={pending_count}"
     )
+
+    # ── Stub telemetry: alert if scraper quality has degraded ─────────────────
+    # Count how many DESC_FETCH entries in the tracker ended up as name stubs.
+    # If > 20% of companies got a stub, the primary scrapers are likely broken.
+    total_companies = len(df)
+    stub_warns = sum(
+        1 for e in llm_tracker.events
+        if e["stage"] == "DESC_FETCH"
+        and e["status"] == "WARN"
+        and "name stub" in e["detail"].lower()
+    )
+    if total_companies > 0:
+        stub_pct = stub_warns / total_companies * 100
+        if stub_pct > 20:
+            _stub_alert_msg = (
+                f"⚠️ <b>IPO SNIPER — SCRAPER DEGRADATION ALERT</b>\n"
+                f"{stub_warns}/{total_companies} companies ({stub_pct:.0f}%) "
+                f"fell back to name-based stubs.\n"
+                f"Primary description scrapers may be broken (new Cloudflare rules?).\n"
+                f"Shariah verdicts for this run are LOW CONFIDENCE."
+            )
+            log.warning(
+                f"  🚨 Stub telemetry: {stub_pct:.0f}% stub rate "
+                f"({stub_warns}/{total_companies}) — scrapers may be broken"
+            )
+            _token   = os.getenv("TELEGRAM_TOKEN",   "")
+            _chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+            if _token and _chat_id:
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{_token}/sendMessage",
+                        json={"chat_id": _chat_id, "text": _stub_alert_msg,
+                              "parse_mode": "HTML"},
+                        timeout=10,
+                    )
+                except Exception:
+                    pass  # don't let telemetry crash the main run
 
     persist_db(df, allots, shariahs)
     JSON_EXPORT.parent.mkdir(parents=True, exist_ok=True)
