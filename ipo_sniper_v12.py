@@ -31,6 +31,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import threading as _threading   # used by LLMTracker, cache locks, and WAL guards
+import concurrent.futures        # used by fetch_unified_calendar and parallel scoring in run()
 
 # ── Thread locks (module-level singletons, defined before any class/function) ─
 _AUDIT_CACHE_LOCK = _threading.Lock()   # guards concurrent _cache_set writes
@@ -1360,7 +1361,6 @@ def fetch_unified_calendar() -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
     today_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    import concurrent.futures
     all_records: list = []
     # max_workers=2: launching 4 Playwright Chromium instances simultaneously
     # can spike RAM by 800MB–1.2GB on a typical 2GB VPS and trigger the OOM killer.
