@@ -30,6 +30,12 @@ import numpy as np
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+import threading as _threading   # used by LLMTracker, cache locks, and WAL guards
+
+# ── Thread locks (module-level singletons, defined before any class/function) ─
+_AUDIT_CACHE_LOCK = _threading.Lock()   # guards concurrent _cache_set writes
+_DESC_CACHE_LOCK  = _threading.Lock()   # guards concurrent writes to _DESC_CACHE
+_DE_CACHE_LOCK    = _threading.Lock()   # guards concurrent writes to _DE_CACHE
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -1735,10 +1741,6 @@ Set confidence to 0–100 reflecting your certainty given the description qualit
 # ── SQLite audit cache ────────────────────────────────────────────────────────
 _AUDIT_CACHE_PATH = Path("data/shariah_audit_cache.db")
 
-import threading as _threading
-_AUDIT_CACHE_LOCK = _threading.Lock()   # guards concurrent _cache_set writes
-
-
 def _init_audit_cache():
     _AUDIT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(_AUDIT_CACHE_PATH)) as con:
@@ -1819,7 +1821,6 @@ def _cache_set(symbol: str, result: dict, description: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _DESC_CACHE: Dict[str, str] = {}
-_DESC_CACHE_LOCK = _threading.Lock()   # guards concurrent writes to _DESC_CACHE
 
 
 def _slugify(name: str) -> str:
@@ -1892,7 +1893,6 @@ def _extract_desc_text(soup: BeautifulSoup, min_len: int = 40) -> str:
 
 # ── Proactive D/E ratio fetcher ───────────────────────────────────────────────
 _DE_CACHE: Dict[str, Optional[float]] = {}
-_DE_CACHE_LOCK = _threading.Lock()   # guards concurrent writes to _DE_CACHE
 
 def fetch_de_ratio(company_name: str) -> Optional[float]:
     """
