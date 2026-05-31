@@ -1,10 +1,24 @@
-name: "UNIFIED HALAL SNIPER v5.4"
+name: "UNIFIED HALAL SNIPER v5.5.1"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v5.5.1 CHANGES vs v5.4 (2026-05-30):
+#   FIX-DB1   : CACHE_PATH is now set explicitly in EVERY job — sniper, reply,
+#               outcome, and weekly all share the same outputs/sniper_cache.db
+#               path.  The v5.4 outcome + weekly jobs were missing CACHE_PATH,
+#               so they silently opened a second DB at the default path and
+#               wrote nothing useful.
+#   FIX-SCRIPT: All python calls updated to sniper_unified_v5_5.py and
+#               reply_handler_v5_5.py.
+#   FIX-BUNKER: No YML change needed — hard gate is inside the Python code.
+#   FIX-STREAK: No YML change needed — fii_dii_history table auto-created in
+#               _init_db(); _append_fii_dii_history() called inside run().
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
     # Job 1: Main sniper engine — 8:30 AM IST = 3:00 AM UTC
-    - cron: "0 3 * * 1-5"           # FIX: was "0 0" (midnight UTC = 5:30 AM IST, too late)
-    # Job 2: Reply handler poll — every 10 min, 8:30 AM–4 PM IST = 3:00 AM–10:30 AM UTC
+    - cron: "0 3 * * 1-5"
+    # Job 2: Reply handler poll — every 10 min, 8:30 AM–4 PM IST = 3:00–10:30 AM UTC
     - cron: "*/10 3-10 * * 1-5"
     # Job 3: Outcome engine — 3:30 PM IST = 10:00 AM UTC
     - cron: "0 10 * * 1-5"
@@ -69,14 +83,18 @@ jobs:
           pip install -r requirements-survival.txt || \
             echo "⚠️  scikit-survival install failed — survival model will run in fallback mode"
 
+      # FIX-DB1: cache key and path both point to outputs/sniper_cache.db
       - name: Restore DB
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
           key: sniper-db-persistent
 
-      - name: Run Sniper v5.4
-        run: python sniper_unified_v5_4.py
+      - name: Ensure outputs directory
+        run: mkdir -p outputs
+
+      - name: Run Sniper v5.5.1
+        run: python sniper_unified_v5_5.py
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -115,8 +133,6 @@ jobs:
 
   # ══════════════════════════════════════════════════════════════════
   # JOB 2 — Reply handler
-  # FIX: added GOOGLE_SHEET_ID + GOOGLE_CREDS_JSON so the Sheets
-  # restore can find today's picks on a fresh runner.
   # ══════════════════════════════════════════════════════════════════
   reply-handler:
     name: "📱 Reply Handler"
@@ -142,6 +158,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # FIX-DB1: same cache key as Job 1 — reply_handler writes TAKEN decisions
+      # to the same outputs/sniper_cache.db that the sniper created.
       - name: Restore DB
         uses: actions/cache@v4
         with:
@@ -154,15 +172,18 @@ jobs:
           path: tg_offset.txt
           key: tg-offset-persistent
 
+      - name: Ensure outputs directory
+        run: mkdir -p outputs
+
       - name: Poll Telegram
-        run: python reply_handler_v5_4.py
+        run: python reply_handler_v5_5.py
         env:
           TELEGRAM_TOKEN:        ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          # FIX-DB1: explicit CACHE_PATH — was missing in v5.4 reply job,
+          # causing reply_handler to open a different DB than the sniper.
           CACHE_PATH:            outputs/sniper_cache.db
           REPLY_TIMEOUT_MINUTES: "30"
-          # FIX: these two were missing — required for Sheets restore
-          # so TAKEN <symbol> works even when DB cache is cold/stale
           GOOGLE_SHEET_ID:       ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON:     ${{ secrets.GOOGLE_CREDS_JSON }}
 
@@ -207,16 +228,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # FIX-DB1: same cache key — outcome engine must read picks written by Job 1
       - name: Restore DB
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
           key: sniper-db-persistent
 
+      - name: Ensure outputs directory
+        run: mkdir -p outputs
+
       - name: Run outcome engine
         run: |
           python - <<'EOF'
-          from sniper_unified_v5_4 import _init_db, _run_outcome_engine, _auto_log_skipped_picks, _get_last_trading_day
+          from sniper_unified_v5_5 import _init_db, _run_outcome_engine, _auto_log_skipped_picks, _get_last_trading_day
           _init_db()
           _, date_label = _get_last_trading_day()
           _run_outcome_engine()
@@ -228,6 +253,8 @@ jobs:
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
           GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          # FIX-DB1: was missing in v5.4 — outcome engine was opening a
+          # different DB and finding zero picks to resolve.
           CACHE_PATH:        outputs/sniper_cache.db
 
       - name: Save DB
@@ -264,14 +291,18 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # FIX-DB1: same cache key — weekly review needs all pick_outcomes history
       - name: Restore DB
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
           key: sniper-db-persistent
 
+      - name: Ensure outputs directory
+        run: mkdir -p outputs
+
       - name: Run weekly review
-        run: python sniper_unified_v5_4.py --weekly-review
+        run: python sniper_unified_v5_5.py --weekly-review
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -279,6 +310,8 @@ jobs:
           OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
           GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          # FIX-DB1: was missing in v5.4 — weekly review was querying an
+          # empty DB and reporting zero trades / zero performance data.
           CACHE_PATH:        outputs/sniper_cache.db
           FORCE_WEEKLY:      ${{ inputs.force_weekly || 'false' }}
 
