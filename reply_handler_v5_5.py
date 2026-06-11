@@ -555,6 +555,20 @@ def _get_todays_signal(con: sqlite3.Connection, symbol: str) -> dict:
     except Exception:
         pass
 
+    # v6.0: pull meta_p_win and kelly_mult from sniper_results_v54 if available
+    meta_p_win = None
+    kelly_mult = None
+    try:
+        v6_row = con.execute(
+            "SELECT meta_p_win, kelly_mult FROM sniper_results_v54 "
+            "WHERE symbol=? AND run_date=? LIMIT 1",
+            (symbol.upper(), latest_run)
+        ).fetchone()
+        if v6_row:
+            meta_p_win = v6_row[0]
+            kelly_mult = v6_row[1]
+    except Exception:
+        pass
     return {
         "close":                 row[0],
         "fused":                 row[1],
@@ -564,6 +578,8 @@ def _get_todays_signal(con: sqlite3.Connection, symbol: str) -> dict:
         "position_size_tier":    cal[1] if cal else None,
         # FIX-RH-RESTORE: fall back to halal_tier from pick_outcomes if judged_picks missing
         "halal_tier":            (cal[2] if cal else None) or _po_halal,
+        "meta_p_win":            meta_p_win,
+        "kelly_mult":            kelly_mult,
     }
 
 def _log_decision(con: sqlite3.Connection, symbol: str, decision: str,
@@ -991,6 +1007,13 @@ def process_updates() -> None:
                         ack += f" | Size: {sig['position_size_tier']}"
                     if sig.get("halal_tier"):
                         ack += f" | Halal: {sig['halal_tier']}"
+                    # v6.0: meta-labeler and Kelly info
+                    meta_p = sig.get("meta_p_win")
+                    if meta_p is not None:
+                        ack += f"\n   🤖 Meta P(win): <b>{float(meta_p):.0%}</b>"
+                    kelly_m = sig.get("kelly_mult")
+                    if kelly_m and float(kelly_m) != 1.0:
+                        ack += f" | 📐 Kelly ×{float(kelly_m):.2f}"
                     _send_ack(chat_id, ack)
             except Exception as e:
                 log.error(f"TAKEN {sym} DB error: {e}")
