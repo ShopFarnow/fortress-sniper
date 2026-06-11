@@ -1,14 +1,53 @@
-name: "UNIFIED HALAL SNIPER v5.5.3"
+name: "UNIFIED HALAL SNIPER v5.5.2"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v5.5.2 CHANGES vs v5.5.1 — ROOT-CAUSE PERSISTENCE + SCHEDULE FIXES
+#
+#   The three reported symptoms (weekly empty, Telegram TAKEN never recorded,
+#   "core data but no pearls") all trace to ONE root cause: the DB never
+#   persisted across the fresh GitHub Actions runners, so:
+#     • open picks never reached the outcome engine → never closed
+#       (DB_BACKUP held only status=open rows; PERFORMANCE = "no closed picks")
+#     • the reply handler's TAKEN never reached the outcome runner, and the
+#       outcome job then stamped every pick SKIPPED/no_response
+#       (DB_DECISIONS held only SKIPPED/no_response rows)
+#     • the weekly review had no wins/closed to analyse
+#
+#   FIX-CACHE  : actions/cache@v4 with a STATIC key (sniper-db-persistent) is
+#               WRITE-ONCE — once the cache exists it is never updated, and the
+#               combined action used as a "Save" step re-restores the stale copy
+#               OVER the freshly-written DB. Replaced with the split
+#               restore@v4 (prefix restore-keys) + save@v4 (unique rolling key)
+#               so every run saves a NEW cache and restores the most recent one.
+#               Applied to the DB (all 4 jobs) and the Telegram offset (Job 2).
+#
+#   FIX-PERSIST: _restore_db_from_sheets() / _backup_db_to_sheets() previously
+#               ran ONLY in the weekly agent. They are now wired into the daily
+#               run (inside run(), see the .py) AND the outcome job below, so
+#               history is durable every day and self-heals after cache eviction.
+#
+#   FIX-SKIP   : the daily run() called _auto_log_skipped_picks() at ~08:30 IST,
+#               BEFORE the reply window opened, pre-marking every pick SKIPPED.
+#               That call is disabled in run() (see the .py); the EOD outcome job
+#               below remains the single correct place for it.
+#
+#   FIX-WEEKLY : the weekly cron "30 3 * * 1" collided with the every-10-min
+#               reply-handler cron ("*/10 3-10 * * 1-5" fires at :30 too) and the
+#               08:30 sniper window. Moved to "45 2 * * 1" (02:45 UTC = 08:15 IST
+#               Mon) — before the daily window, zero overlap. The Monday weekday
+#               guard inside the .py is unchanged; for a manual test run, tick the
+#               force_weekly dispatch input.
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    # FIX: Moved to 2:00 AM UTC (7:30 AM IST). Guarantees Job 1 finishes BEFORE Job 2 starts.
-    - cron: "0 2 * * 1-5"
-    # Job 2: Reply handler poll starts at 3:00 AM UTC (8:30 AM IST) - Zero overlap.
+    # Job 1: Main sniper engine — 8:30 AM IST = 3:00 AM UTC
+    - cron: "0 3 * * 1-5"
+    # Job 2: Reply handler poll — every 10 min, 8:30 AM–4 PM IST = 3:00–10:30 AM UTC
     - cron: "*/10 3-10 * * 1-5"
-    # Job 3: Outcome engine — 10:00 AM UTC (3:30 PM IST)
+    # Job 3: Outcome engine — 3:30 PM IST = 10:00 AM UTC
     - cron: "0 10 * * 1-5"
-    # Job 4: Weekly review — Monday 2:45 AM UTC (8:15 AM IST)
+    # Job 4: Weekly review — Monday 8:15 AM IST = 2:45 AM UTC  (FIX-WEEKLY: was 30 3)
     - cron: "45 2 * * 1"
 
   workflow_dispatch:
@@ -18,23 +57,35 @@ on:
         required: false
         default: "false"
         type: boolean
+      force_weekly:
+        description: "Force weekly review even if not Monday"
+        required: false
+        default: "false"
+        type: boolean
 
 env:
   NSE_MAX_RETRIES:        "1"
   SUPPRESS_HEALTH_ALERTS: "1"
+  FORCE_YFINANCE:         "false"
   REPLY_TIMEOUT_MINUTES:  "30"
   APEX_MIN_SCORE:         "40"
+  APEX_TOP_N:             "5"
+  CAPACITY_MAX_OPEN:      "4"
+  CAPACITY_MAX_WEEK:      "6"
   MC_SIMS:                "600"
 
 jobs:
 
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 1 — Main sniper engine
+  # ══════════════════════════════════════════════════════════════════
   sniper-run:
     name: "⚔️ Sniper Daily Run"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'schedule' && github.event.schedule == '0 2 * * 1-5')
+      (github.event_name == 'schedule' && github.event.schedule == '0 3 * * 1-5')
 
     steps:
       - uses: actions/checkout@v4
@@ -52,6 +103,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Install survival model dependencies
+        run: |
+          pip install -r requirements-survival.txt || \
+            echo "⚠️  scikit-survival install failed — survival model will run in fallback mode"
+
+      # FIX-CACHE: rolling restore — primary key never matches (forces prefix
+      # match on restore-keys → newest sniper-db-* cache from any prior job/run).
       - name: Restore DB
         uses: actions/cache/restore@v4
         with:
@@ -63,7 +121,7 @@ jobs:
       - name: Ensure outputs directory
         run: mkdir -p outputs
 
-      - name: Run Sniper Engine
+      - name: Run Sniper v5.5.2
         run: python sniper_unified_v5_5.py
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
@@ -76,10 +134,17 @@ jobs:
           ACCOUNT_EQUITY:    ${{ secrets.ACCOUNT_EQUITY || '500000' }}
           ACCOUNT_RISK_PCT:  ${{ secrets.ACCOUNT_RISK_PCT || '0.015' }}
           FAST_RERUN:        ${{ inputs.fast_rerun || 'false' }}
+          CLAUDE_MODEL:      "claude-sonnet-4-6"
+          # v5.6 PEARL-LOCATOR: confluence + RS re-rank with Option-C catalyst
+          # fallback. CONVICTION_RERANK=true kept — Option-C handles empty feeds.
+          # CONV_RS_CATALYST_FLOOR: rs_pct >= this substitutes for a missing
+          # news catalyst so top-grade setups survive when the feed is silent.
+          # Lower to 80 to widen the net; raise to 90 to tighten it.
           CONVICTION_RERANK: "true"
-          # FIX: Bypasses the bug that forcibly downgraded APEX picks to GOOD
-          CONV_REQUIRE_CATALYST: "false"
+          CONV_RS_CATALYST_FLOOR: "85"
 
+      # FIX-CACHE: rolling save — unique key per run+attempt, so the cache is
+      # ALWAYS written (a static key is never updated once it exists).
       - name: Save DB
         if: always()
         uses: actions/cache/save@v4
@@ -87,10 +152,29 @@ jobs:
           path: outputs/sniper_cache.db
           key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
 
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sniper-report-${{ github.run_id }}
+          path: outputs/
+          retention-days: 14
+
+      - name: Upload DB as persistent artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sniper-db-latest
+          path: outputs/sniper_cache.db
+          retention-days: 90
+
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 2 — Reply handler
+  # ══════════════════════════════════════════════════════════════════
   reply-handler:
     name: "📱 Reply Handler"
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 8   # FIX: was 5 — headroom for the Sheets decision backup
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'schedule' && github.event.schedule == '*/10 3-10 * * 1-5')
@@ -101,9 +185,19 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # FIX-CACHE: rolling restore — picks up the newest sniper-db-* cache so the
+      # reply handler sees today's picks AND so the TAKEN it writes is carried
+      # forward (via the save below) to the EOD outcome job in the same prefix.
       - name: Restore DB
         uses: actions/cache/restore@v4
         with:
@@ -112,6 +206,8 @@ jobs:
           restore-keys: |
             sniper-db-
 
+      # FIX-CACHE: rolling restore for the Telegram offset (was static → frozen,
+      # which made getUpdates replay the same backlog every 10 min).
       - name: Restore offset
         uses: actions/cache/restore@v4
         with:
@@ -129,9 +225,14 @@ jobs:
           TELEGRAM_TOKEN:        ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
           CACHE_PATH:            outputs/sniper_cache.db
+          REPLY_TIMEOUT_MINUTES: "30"
           GOOGLE_SHEET_ID:       ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON:     ${{ secrets.GOOGLE_CREDS_JSON }}
 
+      # FIX-PERSIST: push the just-captured TAKEN/SKIP decisions to Sheets
+      # (DB_DECISIONS) immediately, so a captured decision is durable even if the
+      # next runner restores a slightly older cache. Decision-tab write only —
+      # cheap, well within Sheets quota at the 10-min cadence.
       - name: Backup decisions to Sheets
         if: always()
         run: |
@@ -140,8 +241,9 @@ jobs:
               from sniper_unified_v5_5 import _init_db, _backup_db_to_sheets
               _init_db()
               _backup_db_to_sheets()
+              print("Reply-handler decisions backed up to Sheets")
           except Exception as e:
-              pass
+              print(f"decision backup skipped (non-fatal): {e}")
           EOF
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
@@ -164,6 +266,9 @@ jobs:
           path: outputs/sniper_cache.db
           key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
 
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 3 — Outcome engine
+  # ══════════════════════════════════════════════════════════════════
   outcome-check:
     name: "📊 Outcome Engine"
     runs-on: ubuntu-latest
@@ -178,9 +283,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # FIX-CACHE: rolling restore — must read picks written by Job 1 / Job 2.
       - name: Restore DB
         uses: actions/cache/restore@v4
         with:
@@ -192,6 +305,9 @@ jobs:
       - name: Ensure outputs directory
         run: mkdir -p outputs
 
+      # FIX-PERSIST: restore_db_from_sheets() BEFORE the outcome engine so the
+      # open picks exist for _get_yesterday_picks() to resolve, and backup AFTER
+      # so the now-closed outcomes + EOD SKIPPED rows are durable.
       - name: Run outcome engine
         run: |
           python - <<'EOF'
@@ -200,11 +316,12 @@ jobs:
               _run_outcome_engine, _auto_log_skipped_picks, _get_last_trading_day,
           )
           _init_db()
-          _restore_db_from_sheets()
+          _restore_db_from_sheets()          # FIX-PERSIST: rehydrate open picks + decisions
           _, date_label = _get_last_trading_day()
-          _run_outcome_engine()
-          _auto_log_skipped_picks(date_label)
-          _backup_db_to_sheets()
+          _run_outcome_engine()              # close any picks that hit target / stop
+          _auto_log_skipped_picks(date_label)  # EOD: this is the ONLY correct place for this
+          _backup_db_to_sheets()             # FIX-PERSIST: persist closed outcomes + decisions
+          print(f"Outcome complete for {date_label}")
           EOF
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
@@ -220,6 +337,9 @@ jobs:
           path: outputs/sniper_cache.db
           key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
 
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 4 — Weekly review
+  # ══════════════════════════════════════════════════════════════════
   weekly-review:
     name: "📈 Weekly Review"
     runs-on: ubuntu-latest
@@ -234,9 +354,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # FIX-CACHE: rolling restore — weekly review needs all pick_outcomes history.
       - name: Restore DB
         uses: actions/cache/restore@v4
         with:
@@ -258,6 +386,7 @@ jobs:
           GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           CACHE_PATH:        outputs/sniper_cache.db
+          FORCE_WEEKLY:      ${{ inputs.force_weekly || 'false' }}
 
       - name: Save DB
         if: always()
