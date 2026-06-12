@@ -1,41 +1,43 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   PROJECT FORTRESS — SNIPER v7.3 EOD QUANTUM SCREENER                      ║
+║   PROJECT FORTRESS — SNIPER v7.4 EOD QUANTUM SCREENER                      ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
-║   v7.3 GHA DATA HARDENING — Root Cause Fix                                 ║
+║   v7.4 — RACE FIX + 4-TIER DATA CASCADE + GHA HARDENING                   ║
 ║   ─────────────────────────────────────────────────────────────             ║
-║   ROOT CAUSE (confirmed by local run stdout):                               ║
-║     NSE archives.nseindia.com → 403 (Cloudflare blocks GHA datacenter IPs) ║
-║     Yahoo Finance query1/query2 → 403 (Yahoo paid-API block since 2024)    ║
-║     yfinance 1.4.x broken on GHA — all tickers return "Host not in         ║
-║     allowlist" error                                                         ║
+║   PATCH-1  RACE CONDITION FIX (21-Second Illusion)                         ║
+║            Old: background thread started → scoring immediately started    ║
+║            → workers found empty hist_cache → every stock scored 0.        ║
+║            New: ThreadPoolExecutor(12) preloads all history BLOCKING.      ║
+║            Scoring only starts after join completes. Progress logged       ║
+║            every 30 symbols so GHA doesn't timeout.                        ║
 ║                                                                              ║
-║   FIX-D  NSE 3-STEP SESSION HANDSHAKE (Bhavcopy)                           ║
-║            Step 1: GET nseindia.com (cookies)                               ║
-║            Step 2: GET nseindia.com/api/allIndices (session validation)     ║
-║            Step 3: GET archive URL (now CF-validated)                       ║
-║            + URL3: sec_bhavdata_full CSV (Akamai CDN, no Cloudflare)       ║
-║            + Holiday calendar (2025-2026) — prevents 404 on market close   ║
+║   PATCH-2  GHA CONCURRENCY COLLISION (yml fix required)                    ║
+║            Multiple workflows fighting for same pip cache → DB amnesia.    ║
+║            Add to yml:  concurrency:                                        ║
+║                           group: sniper-eod-pipeline                       ║
+║                           cancel-in-progress: true                         ║
 ║                                                                              ║
-║   FIX-E  NSE HISTORY API (replaces yfinance)                               ║
-║            Uses nseindia.com/api/historical/cm/equity                       ║
-║            Same internal API NSE website uses — works on GHA               ║
-║            yfinance kept as last-resort fallback only                       ║
+║   PATCH-3  ALT-DATA SCRAPERAPI GUARD                                       ║
+║            CPP/Zauba scraping now explicitly skipped (with WARNING log)    ║
+║            when SCRAPERAPI_KEY secret is missing.                          ║
+║            Set SCRAPERAPI_KEY in GHA secrets to re-enable Option-C.       ║
 ║                                                                              ║
-║   FIX-F  MACRO REGIME: NSE-BASED VIX (replaces Yahoo ^INDIAVIX)           ║
-║            Uses nseindia.com/api/allIndices for NIFTY change               ║
-║            Uses nseindia.com/api/option-chain-indices for VIX proxy        ║
-║            No Yahoo Finance dependency anywhere in critical path            ║
+║   PATCH-4  4-TIER BHAVCOPY DATA CASCADE (v5.5 re-injection)               ║
+║            1. NSE archives (3-step CF session + Akamai URL3 + curl)       ║
+║            2. Addon Finance API (set ADDON_FINANCE_API_KEY secret)        ║
+║            3. Google Sheets BHAVCOPY tab (your 2441-row manual extract)   ║
+║            4. yfinance 300-stock universe (last resort only)               ║
+║            Sheets fallback gives full market breadth when NSE blocked.    ║
 ║                                                                              ║
-║   v7.2 FIXES (PRESERVED): FIX-A retry/curl · FIX-B sentinel · FIX-C       ║
-║            preflight                                                         ║
-║   v7.1 PATCHES (PRESERVED): NATR · DynNIFTY50 · MFI-catalyst · PctVPOC   ║
-║   v7.0 ARCH (PRESERVED): All engines, gates, scoring, Halal, Kelly        ║
+║   v7.3 FIXES (PRESERVED): NSE session handshake · Akamai URL · NSE VIX   ║
+║            NSE history API · Holiday calendar · Sentinel file             ║
+║   v7.1 PATCHES (PRESERVED): NATR · DynNIFTY50 · MFI-catalyst · PctVPOC  ║
+║   v7.0 ARCH (PRESERVED): All engines, gates, scoring, Halal, Kelly       ║
 ║                                                                              ║
 ║   STACK    Google Sheets · GitHub Actions · OpenAI gpt-4o-mini            ║
-║            NSE APIs only · Zero Yahoo Finance dependency                   ║
+║            NSE APIs · Zero Yahoo Finance dependency                       ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -64,7 +66,7 @@ log = logging.getLogger("fortress_v7")
 # SECTION 1 — CONFIGURATION & SECRETS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "FORTRESS v7.3 PEARL HUNTER — GHA DATA HARDENING"
+VERSION = "FORTRESS v7.4 PEARL HUNTER — RACE FIX + DATA CASCADE + GHA HARDENING"
 
 # ── FIX-C: Secret preflight check ────────────────────────────────────────────
 # Called once at run() start. Warns (not crashes) on missing secrets so the
@@ -888,6 +890,115 @@ def _fetch_mto_delivery(date_label: str) -> Dict[str, float]:
         log.warning(f"MTO fetch non-fatal: {e}")
     return result
 
+# ── DATA CASCADE FALLBACKS (v5.5 re-injection) ───────────────────────────────
+
+def _bhavcopy_from_sheets() -> pd.DataFrame:
+    """
+    DATA CASCADE Fallback: Load manually pasted bhavcopy from Google Sheets
+    BHAVCOPY tab. Supports your 2441-row manual NSE extract — gives full market
+    breadth even when NSE archives are blocked.
+    """
+    if not _gs_ok():
+        return pd.DataFrame()
+    log.info("Bhavcopy: Loading from Sheets 'BHAVCOPY' tab…")
+    raw = _read_sheet("BHAVCOPY")
+    if not raw or len(raw) < 2:
+        log.warning("Bhavcopy Sheets: BHAVCOPY tab empty or missing")
+        return pd.DataFrame()
+    df = pd.DataFrame(raw[1:], columns=[str(h).strip().upper() for h in raw[0]])
+    col_map = {}
+    for internal, candidates in {
+        "symbol":         ["SYMBOL"],
+        "open":           ["OPEN"],
+        "high":           ["HIGH"],
+        "low":            ["LOW"],
+        "close":          ["CLOSE","LTP","LAST"],
+        "prevclose":      ["PRVSCLSGPRIC","PREVCLOSE","PREV_CLOSE"],
+        "volume":         ["VOLUME","TOTTRDQTY","TTL_TRD_QNTY"],
+        "turnover_lakhs": ["TURNOVER_LAKHS","TOTTRDVAL"],
+        "series":         ["SERIES"],
+        "delivery_pct":   ["DELIVERY_PCT","DELIV_PCT","TOTALDELTRDQTY"],
+    }.items():
+        for c in candidates:
+            if c in df.columns:
+                col_map[c] = internal
+                break
+    df = df.rename(columns=col_map)
+    if "series" in df.columns:
+        df = df[df["series"].astype(str).str.strip().str.upper() == "EQ"].copy()
+    for col in ["open","high","low","close","prevclose","volume","turnover_lakhs","delivery_pct"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "turnover_lakhs" not in df.columns or df["turnover_lakhs"].isna().all():
+        df["turnover_lakhs"] = (
+            df.get("volume", pd.Series(0, index=df.index)) *
+            df.get("close",  pd.Series(0, index=df.index)) / 100_000
+        )
+    if "delivery_pct" not in df.columns:
+        df["delivery_pct"] = 0.0
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    out = df.dropna(subset=["close"]).query("close > 0").reset_index(drop=True)
+    log.info(f"Bhavcopy Sheets: {len(out)} EQ rows loaded")
+    return out
+
+def _bhavcopy_from_addon(api_key: str, date_label: str) -> pd.DataFrame:
+    """
+    DATA CASCADE Fallback: Addon Finance API bhavcopy.
+    Set ADDON_FINANCE_API_KEY secret in GHA to enable.
+    Returns full NSE EQ bhavcopy (~2000+ symbols) via a single API call.
+    """
+    if not api_key:
+        return pd.DataFrame()
+    try:
+        dd = date_label[8:10]; mm = date_label[5:7]; yyyy = date_label[:4]
+        url = (f"https://api.addonfinance.in/api/v1/bhavcopy/cm"
+               f"?date={dd}-{mm}-{yyyy}&apikey={api_key}")
+        resp = requests.get(url, timeout=20,
+                            headers={"User-Agent": random.choice(_UA_POOL)})
+        if resp.status_code != 200:
+            log.warning(f"Addon Finance HTTP {resp.status_code}")
+            return pd.DataFrame()
+        data = resp.json()
+        rows = data if isinstance(data, list) else data.get("data", [])
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df.columns = [c.strip().upper() for c in df.columns]
+        col_map = {}
+        for internal, candidates in {
+            "symbol": ["SYMBOL","SYM"],
+            "open":   ["OPEN","OPENPRICE"],
+            "high":   ["HIGH","HIGHPRICE"],
+            "low":    ["LOW","LOWPRICE"],
+            "close":  ["CLOSE","CLOSEPRICE","LTP"],
+            "volume": ["VOLUME","QTY","TOTTRDQTY"],
+            "turnover_lakhs": ["TURNOVER","TOTTRDVAL"],
+            "series": ["SERIES"],
+        }.items():
+            for c in candidates:
+                if c in df.columns:
+                    col_map[c] = internal
+                    break
+        df = df.rename(columns=col_map)
+        if "series" in df.columns:
+            df = df[df["series"].astype(str).str.strip().str.upper() == "EQ"].copy()
+        needed = ["symbol","open","high","low","close","volume"]
+        if not all(c in df.columns for c in needed):
+            log.warning(f"Addon Finance: missing columns {[c for c in needed if c not in df.columns]}")
+            return pd.DataFrame()
+        for col in ["open","high","low","close","volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        if "turnover_lakhs" not in df.columns:
+            df["turnover_lakhs"] = df["volume"] * df["close"] / 100_000
+        else:
+            df["turnover_lakhs"] = pd.to_numeric(df["turnover_lakhs"], errors="coerce").fillna(0) / 100_000
+        df["delivery_pct"] = 0.0
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+        return df.dropna(subset=["close"]).query("close > 0").reset_index(drop=True)
+    except Exception as e:
+        log.warning(f"_bhavcopy_from_addon: {e}")
+        return pd.DataFrame()
+
 def load_bhavcopy() -> Tuple[pd.DataFrame, str]:
     """
     Load NSE EQ bhavcopy. Merges MTO delivery data.
@@ -1036,8 +1147,33 @@ def load_bhavcopy() -> Tuple[pd.DataFrame, str]:
                 log.info(f"✅ Bhavcopy loaded NSE_CURL_ZIP: {len(df)} rows | {date_label}")
                 return df, "NSE_CURL_ZIP"
 
-    # Attempt 4: yfinance last resort (broken on GHA but try anyway)
-    log.warning("Bhavcopy: ALL NSE paths failed — last-resort yfinance universe")
+    # ── PATCH DATA CASCADE: Attempt 4: Addon Finance API ─────────────────────
+    ADDON_KEY = os.getenv("ADDON_FINANCE_API_KEY", "")
+    if ADDON_KEY:
+        log.warning("Bhavcopy: NSE failed — trying Addon Finance API…")
+        try:
+            df = _bhavcopy_from_addon(ADDON_KEY, date_label)
+            if not df.empty:
+                log.info(f"✅ Bhavcopy loaded ADDON: {len(df)} rows")
+                return df, "ADDON"
+        except Exception as e:
+            log.warning(f"Bhavcopy Addon: {e}")
+
+    # ── PATCH DATA CASCADE: Attempt 5: Google Sheets BHAVCOPY tab ─────────────
+    log.warning("Bhavcopy: Addon failed — checking Google Sheets BHAVCOPY tab…")
+    try:
+        df = _bhavcopy_from_sheets()
+        if not df.empty:
+            mto = _fetch_mto_delivery(date_label)
+            if mto:
+                df["delivery_pct"] = df["symbol"].map(mto).fillna(0.0)
+            log.info(f"✅ Bhavcopy loaded SHEETS: {len(df)} rows | {date_label}")
+            return df, "SHEETS"
+    except Exception as e:
+        log.warning(f"Bhavcopy Sheets: {e}")
+
+    # ── Attempt 6: yfinance last resort (broken on GHA but try anyway) ────────
+    log.warning("Bhavcopy: NSE, Addon, Sheets all failed — last-resort yfinance universe")
     try:
         import yfinance as yf
         syms = _load_nifty500_symbols()[:300]
@@ -1436,6 +1572,15 @@ def _is_captcha_page(html: str) -> bool:
     return hits >= 2 or (len(html) < 1000 and "<body" not in low)
 
 def _scrape_cpp_tenders(symbol: str, company_name: str = "") -> List[str]:
+    """
+    PATCH-3: Alt-data tenders scrape.
+    Requires SCRAPERAPI_KEY secret — CPP/Zauba use Cloudflare, blocked on GHA bare IPs.
+    Without ScraperAPI key, returns [] and logs WARNING once so engineers know why
+    Option-C catalyst override is disabled.
+    """
+    if not SCRAPERAPI_KEY:
+        log.debug(f"CPP tenders {symbol}: SCRAPERAPI_KEY not set — skipping (set secret to enable)")
+        return []
     results = []
     query   = company_name or symbol
     try:
@@ -1444,20 +1589,29 @@ def _scrape_cpp_tenders(symbol: str, company_name: str = "") -> List[str]:
         if html:
             from bs4 import BeautifulSoup
             soup  = BeautifulSoup(html, "html.parser")
-            texts = [t.get_text(strip=True) for t in soup.find_all("td") if len(t.get_text(strip=True)) > 20]
+            texts = [t.get_text(strip=True) for t in soup.find_all("td")
+                     if len(t.get_text(strip=True)) > 20]
             results.extend(texts[:5])
     except Exception as e:
         log.debug(f"CPP tenders {symbol}: {e}")
     return results
 
 def _scrape_zauba_exports(symbol: str) -> List[str]:
+    """
+    PATCH-3: Alt-data exports scrape.
+    Requires SCRAPERAPI_KEY secret — Zauba blocks datacenter IPs.
+    """
+    if not SCRAPERAPI_KEY:
+        log.debug(f"Zauba {symbol}: SCRAPERAPI_KEY not set — skipping")
+        return []
     results = []
     try:
         html = _scrape_via_proxy(f"https://www.zauba.com/import-{symbol.lower()}-hs-code.html")
         if html:
             from bs4 import BeautifulSoup
             soup  = BeautifulSoup(html, "html.parser")
-            texts = [t.get_text(strip=True) for t in soup.find_all("td") if len(t.get_text(strip=True)) > 20]
+            texts = [t.get_text(strip=True) for t in soup.find_all("td")
+                     if len(t.get_text(strip=True)) > 20]
             results.extend(texts[:5])
     except Exception as e:
         log.debug(f"Zauba {symbol}: {e}")
@@ -2980,7 +3134,7 @@ def run_weekly_review(force: bool = False):
         ) or "Run more trades to generate AI narrative."
     else:
         narrative = summary
-    _send_tg(f"📈 <b>FORTRESS v7.2 Weekly Review — {datetime.today():%Y-%m-%d}</b>\n"
+    _send_tg(f"📈 <b>FORTRESS v7.4 Weekly Review — {datetime.today():%Y-%m-%d}</b>\n"
              f"{summary}\n\n{narrative}")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3016,7 +3170,7 @@ def run():
     if macro["macro_state"] in ("MASSACRE",):
         log.warning("MASSACRE regime — no picks today (capital preservation)")
         _write_sentinel(date_label, "ABORTED_MASSACRE", {"REGIME": macro["macro_state"]})
-        _send_tg(f"⚠️ <b>FORTRESS v7.2 — {date_label}</b>\n"
+        _send_tg(f"⚠️ <b>FORTRESS v7.4 — {date_label}</b>\n"
                  f"MASSACRE regime (VIX={macro['vix_val']:.1f}) — no picks today.")
         return []
 
@@ -3030,7 +3184,7 @@ def run():
         log.error(f"Bhavcopy empty (src={bhav_src}) — aborting run")
         _write_sentinel(date_label, "ABORTED_BHAVCOPY", {"SRC": bhav_src, "ROWS": 0})
         _send_tg(
-            f"❌ <b>FORTRESS v7.2 — {date_label}</b>\n"
+            f"❌ <b>FORTRESS v7.4 — {date_label}</b>\n"
             f"Bhavcopy unavailable (src={bhav_src}).\n"
             f"NSE requests (3 retries + UA rotation + curl) all failed.\n"
             f"Check GHA secrets: " +
@@ -3049,7 +3203,7 @@ def run():
     if cands.empty:
         _write_sentinel(date_label, "ABORTED_NO_CANDIDATES",
                         {"BHAV_SRC": bhav_src, "BHAV_ROWS": len(bhav)})
-        _send_tg(f"📋 <b>FORTRESS v7.2 — {date_label}</b>\nNo candidates after filters.")
+        _send_tg(f"📋 <b>FORTRESS v7.4 — {date_label}</b>\nNo candidates after filters.")
         return []
 
     # 5. Intelligence feeds (parallel, graceful degradation)
@@ -3068,6 +3222,9 @@ def run():
         filings = {}
     log.info(f"Intel: FII={fii_data['label']} insiders={len(insider_map)} "
              f"filings={len(filings)}")
+    # PATCH-3: log alt-data capability so 'insiders=0 filings=0' is diagnosable
+    log.info(f"Alt-data: SCRAPERAPI={'SET' if SCRAPERAPI_KEY else 'MISSING — CPP/Zauba disabled'} | "
+             f"OPENAI={'SET' if _OPENAI_OK else 'MISSING — LLM/embeddings disabled'}")
 
     # 6. Vector store for alt-data
     vector_store: list = []
@@ -3082,49 +3239,41 @@ def run():
     hist_cache: Dict[str, pd.DataFrame] = {}
     hist_lock  = threading.Lock()
 
-    def _bg_preload():
-        import yfinance as yf
-        syms = cands["symbol"].str.upper().tolist()
-        for i in range(0, len(syms), 30):
-            chunk = syms[i:i+30]
-            try:
-                raw = yf.download(
-                    " ".join(f"{s}.NS" for s in chunk),
-                    period="14mo", progress=False, auto_adjust=True,
-                    timeout=30, group_by="ticker"
-                )
-                for tk_sym in chunk:
-                    try:
-                        tk = f"{tk_sym}.NS"
-                        if hasattr(raw.columns, "levels"):
-                            sub = (raw.xs(tk, axis=1, level=0)
-                                   if tk in raw.columns.get_level_values(0)
-                                   else None)
-                        else:
-                            sub = raw if len(chunk) == 1 else None
-                        if sub is None or sub.empty:
-                            continue
-                        sub = sub.reset_index()
-                        sub.columns = [c[0].lower() if isinstance(c, tuple) else c.lower()
-                                       for c in sub.columns]
-                        dt_c = next((c for c in sub.columns if c != "date" and
-                                     pd.api.types.is_datetime64_any_dtype(sub[c])), None)
-                        if dt_c:
-                            sub = sub.rename(columns={dt_c: "date"})
-                        sub["date"] = pd.to_datetime(sub["date"])
-                        df = sub[["date","open","high","low","close","volume"]].dropna()
-                        if len(df) >= 20:
-                            # THREAD-SAFE WRITE
-                            with hist_lock:
-                                hist_cache[tk_sym.upper()] = df.tail(300).reset_index(drop=True)
-                    except Exception:
-                        continue
-            except Exception as e:
-                log.debug(f"BG preload chunk {i}: {e}")
+    # ── PATCH-1: Blocking history preload (Race condition fix) ───────────────
+    # BUG: Old code started preload thread then IMMEDIATELY started scoring.
+    # Workers found empty hist_cache, scored every stock 0, run produced nothing.
+    # FIX: Preload uses NSE historical API (FIX-E) in chunks via ThreadPoolExecutor.
+    # Main thread joins/waits before scoring starts.
+    # Progress logged every 30 symbols so GHA doesn't think job hung.
+    syms_to_preload = cands["symbol"].str.upper().tolist()
+    log.info(f"History preload: fetching {len(syms_to_preload)} symbols (BLOCKING) …")
 
-    preload_t = threading.Thread(target=_bg_preload, daemon=True)
-    preload_t.start()
-    log.info(f"BG history preload started for {len(cands)} symbols")
+    def _preload_one(sym: str):
+        try:
+            h = fetch_history(sym, days=300)
+            if not h.empty and len(h) >= 20:
+                with hist_lock:
+                    hist_cache[sym] = h
+        except Exception:
+            pass
+
+    preload_done = 0
+    with ThreadPoolExecutor(max_workers=12, thread_name_prefix="hist") as ph:
+        futs = {ph.submit(_preload_one, s): s for s in syms_to_preload}
+        from concurrent.futures import as_completed as _ac
+        for fut in _ac(futs):
+            preload_done += 1
+            if preload_done % 30 == 0:
+                with hist_lock:
+                    cached_n = len(hist_cache)
+                log.info(f"History preload: {preload_done}/{len(syms_to_preload)} submitted "
+                         f"| loaded={cached_n}")
+
+    with hist_lock:
+        final_loaded = len(hist_cache)
+    log.info(f"✅ History preload COMPLETE: {final_loaded}/{len(syms_to_preload)} symbols loaded")
+    _write_sentinel(date_label, "HISTORY_PRELOAD_DONE",
+                    {"LOADED": final_loaded, "TOTAL": len(syms_to_preload)})
 
     # 8. Parallel scoring
     fast_rerun = os.getenv("FAST_RERUN","false").lower() in ("1","true","yes")
@@ -3170,7 +3319,7 @@ def run():
                         {"SCORED": len(cands), "BHAV_SRC": bhav_src,
                          "REGIME": macro["macro_state"]})
         _send_tg(
-            f"📋 <b>FORTRESS v7.2 — {date_label}</b>\n"
+            f"📋 <b>FORTRESS v7.4 — {date_label}</b>\n"
             f"Regime: {macro['macro_state']} VIX={macro['vix_val']:.1f}\n"
             f"Scored: {len(cands)} | Source: {bhav_src}\n"
             f"No candidates cleared Uptrend Gate + Confidence Score + Fused gates.\n"
@@ -3205,7 +3354,7 @@ def run():
     if not final_picks:
         _write_sentinel(date_label, "NO_LANE_PICKS",
                         {"SCORED": len(results), "REGIME": macro["macro_state"]})
-        _send_tg(f"📋 <b>FORTRESS v7.2 — {date_label}</b>\n"
+        _send_tg(f"📋 <b>FORTRESS v7.4 — {date_label}</b>\n"
                  f"Regime: {macro['macro_state']} | {len(results)} scored\n"
                  f"No picks survived lane gates (pearls-or-nothing).")
         return []
