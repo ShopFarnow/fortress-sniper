@@ -66,7 +66,7 @@ log = logging.getLogger("fortress_v7")
 # SECTION 1 — CONFIGURATION & SECRETS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "FORTRESS v7.5 PEARL HUNTER — GATE DIAGNOSTICS + FULL CASCADE"
+VERSION = "FORTRESS v7.5.1.1 — VPOC SCORING RESTORED + GATE RECALIBRATED"
 
 # ── FIX-C: Secret preflight check ────────────────────────────────────────────
 # Called once at run() start. Warns (not crashes) on missing secrets so the
@@ -2026,6 +2026,37 @@ def fortress_score(symbol: str, today_row: dict, hist: pd.DataFrame,
         story_parts.append(f"🐳 WHALE del={order_flow.get('delivery_pct',0):.0f}% "
                            f"vol={order_flow.get('vol_ratio',1):.1f}x")
 
+    # 8b. VPOC proximity scoring (v5.5 re-injection — 60 pts max)
+    # This block was accidentally deleted in v7 migration while the 80-pt gate
+    # was kept, making the gate mathematically impossible to reach.
+    # Restored: layer1=at VPOC (+25), layer2=high vol spike (+20), layer3=multi-bounce (+15)
+    vpoc     = float(order_flow.get("vpoc", 0))
+    vol_ratio = float(order_flow.get("vol_ratio", 1.0))
+    at_vpoc  = bool(order_flow.get("at_vpoc_support", False))
+    vpoc_pts = 0
+    if vpoc > 0 and close > 0:
+        pct_from_vpoc = abs(close - vpoc) / close
+        # Layer 1: at VPOC — price within 2% of volume-weighted floor
+        if at_vpoc:
+            vpoc_pts += 25
+            story_parts.append(f"VPOC floor ₹{vpoc:.0f}")
+        elif pct_from_vpoc < 0.05:
+            vpoc_pts += 12
+        # Layer 2: high-volume spike at/near VPOC confirms institutional interest
+        if vol_ratio >= 2.0 and pct_from_vpoc < 0.05:
+            vpoc_pts += 20
+            story_parts.append(f"vol spike {vol_ratio:.1f}x at VPOC")
+        elif vol_ratio >= 1.5 and pct_from_vpoc < 0.05:
+            vpoc_pts += 10
+        # Layer 3: multi-bounce confirmation — price tested VPOC and held
+        # Proxy: at_vpoc + uptrend + whale (3 independent signals agreeing)
+        if at_vpoc and uptrend_ok and order_flow.get("whale_flag"):
+            vpoc_pts += 15
+            story_parts.append("VPOC triple-confirm")
+        elif at_vpoc and uptrend_ok:
+            vpoc_pts += 8
+    fort_pts += min(vpoc_pts, 60)   # cap at original 60-pt block max
+
     # 9. RSI momentum
     if 50 <= rsi14 <= 70:  fort_pts += 8
     elif rsi14 > 70:       fort_pts += 4
@@ -2625,8 +2656,7 @@ def score_one_symbol(args: tuple) -> Optional[dict]:
         fort = fortress_score(sym, row, hist, fii_data, insider_map,
                               filings, macro, order_flow)
         fp = fort.get("fort_pts", 0) if fort else 0
-        if not fort or fp < 80:
-            ut = fort.get("uptrend_ok", False) if fort else False
+        if not fort or fp < 45:  # v7.5: adjusted for lean scoring (60pts VPOC block removed in v7)
             ma50  = fort.get("ma50",  0) if fort else 0
             ma200 = fort.get("ma200", 0) if fort else 0
             _rej("FORT_PTS_LOW",
@@ -3140,7 +3170,7 @@ def run_weekly_review(force: bool = False):
         ) or "Run more trades to generate AI narrative."
     else:
         narrative = summary
-    _send_tg(f"📈 <b>FORTRESS v7.5 Weekly Review — {datetime.today():%Y-%m-%d}</b>\n"
+    _send_tg(f"📈 <b>FORTRESS v7.5.1 Weekly Review — {datetime.today():%Y-%m-%d}</b>\n"
              f"{summary}\n\n{narrative}")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3176,7 +3206,7 @@ def run():
     if macro["macro_state"] in ("MASSACRE",):
         log.warning("MASSACRE regime — no picks today (capital preservation)")
         _write_sentinel(date_label, "ABORTED_MASSACRE", {"REGIME": macro["macro_state"]})
-        _send_tg(f"⚠️ <b>FORTRESS v7.5 — {date_label}</b>\n"
+        _send_tg(f"⚠️ <b>FORTRESS v7.5.1 — {date_label}</b>\n"
                  f"MASSACRE regime (VIX={macro['vix_val']:.1f}) — no picks today.")
         return []
 
@@ -3190,7 +3220,7 @@ def run():
         log.error(f"Bhavcopy empty (src={bhav_src}) — aborting run")
         _write_sentinel(date_label, "ABORTED_BHAVCOPY", {"SRC": bhav_src, "ROWS": 0})
         _send_tg(
-            f"❌ <b>FORTRESS v7.5 — {date_label}</b>\n"
+            f"❌ <b>FORTRESS v7.5.1 — {date_label}</b>\n"
             f"Bhavcopy unavailable (src={bhav_src}).\n"
             f"NSE requests (3 retries + UA rotation + curl) all failed.\n"
             f"Check GHA secrets: " +
@@ -3209,7 +3239,7 @@ def run():
     if cands.empty:
         _write_sentinel(date_label, "ABORTED_NO_CANDIDATES",
                         {"BHAV_SRC": bhav_src, "BHAV_ROWS": len(bhav)})
-        _send_tg(f"📋 <b>FORTRESS v7.5 — {date_label}</b>\nNo candidates after filters.")
+        _send_tg(f"📋 <b>FORTRESS v7.5.1 — {date_label}</b>\nNo candidates after filters.")
         return []
 
     # 5. Intelligence feeds (parallel, graceful degradation)
@@ -3339,7 +3369,7 @@ def run():
         log.info(f"  Passed all gates  : {len(results)}")
         log.info(f"  APEX_MIN_SCORE    : {APEX_MIN_SCORE}  (lower = more picks)")
         log.info(f"  CONFIDENCE_MIN    : {CONFIDENCE_MIN}  (lower = more picks)")
-        log.info(f"  FORT_PTS gate     : 80/200          (lower = more picks)")
+        log.info(f"  FORT_PTS gate     : 45/200 (restored 60-pt VPOC block, gate recalibrated)")
         log.info(f"  Uptrend gate      : Price>50MA>200MA (required for VCP pts)")
         log.info(f"  Regime            : {macro['macro_state']} VIX={macro['vix_val']}")
         log.info(f"  FII               : {fii_data['label']}")
@@ -3363,7 +3393,7 @@ def run():
                         {"SCORED": len(cands), "BHAV_SRC": bhav_src,
                          "REGIME": macro["macro_state"]})
         _send_tg(
-            f"📋 <b>FORTRESS v7.5 — {date_label}</b>\n"
+            f"📋 <b>FORTRESS v7.5.1 — {date_label}</b>\n"
             f"Regime: {macro['macro_state']} VIX={macro['vix_val']:.1f}\n"
             f"Scored: {len(cands)} | Source: {bhav_src}\n"
             f"No candidates cleared Uptrend Gate + Confidence Score + Fused gates.\n"
@@ -3398,7 +3428,7 @@ def run():
     if not final_picks:
         _write_sentinel(date_label, "NO_LANE_PICKS",
                         {"SCORED": len(results), "REGIME": macro["macro_state"]})
-        _send_tg(f"📋 <b>FORTRESS v7.5 — {date_label}</b>\n"
+        _send_tg(f"📋 <b>FORTRESS v7.5.1 — {date_label}</b>\n"
                  f"Regime: {macro['macro_state']} | {len(results)} scored\n"
                  f"No picks survived lane gates (pearls-or-nothing).")
         return []
