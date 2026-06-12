@@ -1,40 +1,42 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   PROJECT FORTRESS — SNIPER v7.1 EOD QUANTUM SCREENER                      ║
+║   PROJECT FORTRESS — SNIPER v7.2 EOD QUANTUM SCREENER                      ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
-║   v7.1 ADVERSARIAL KILL-LIST PATCHES (Quant Team Audit)                    ║
+║   v7.2 FORENSIC HARDENING (GHA Hollow-Shell Fix)                           ║
 ║   ─────────────────────────────────────────────────────────────             ║
-║   PATCH-1  NATR NORMALISATION (Fatal Flaw 1 — Math Failure)                ║
-║            VCP coil now uses natr14/natr100 = (ATR/Close) ratio.          ║
-║            Momentum stocks that 3× in price no longer penalised.          ║
-║            Same fix wired into APEX VCP factor + Bayesian vcp_tight.      ║
+║   FIX-A   NSE BHAVCOPY RETRY + CURL FALLBACK                               ║
+║            GHA datacenter IPs hit NSE 403/503 intermittently.             ║
+║            v7.2 adds: exponential-backoff retry (3×), random UA rotation, ║
+║            cookie-refresh before each attempt, and a final curl-subprocess ║
+║            fallback that bypasses Python's requests stack entirely.        ║
+║            Empty bhavcopy → run_diagnostics() writes forensic sentinel    ║
+║            to outputs/ so artifact is never a hollow 1.3 KB skeleton.     ║
 ║                                                                              ║
-║   PATCH-2  DYNAMIC NIFTY50 GRAVITY GATE (Fatal Flaw 2 — Regime Failure)   ║
-║            Options gravity suppression restricted to NIFTY50 stocks only. ║
-║            Mid/small-caps bypass index OI wall entirely.                   ║
-║            NIFTY50 list fetched live from NSE each run (no hardcoding).    ║
-║            Survives semi-annual index reconstitution.                      ║
+║   FIX-B   RUN DIAGNOSTICS + SENTINEL FILE                                  ║
+║            Every run writes outputs/last_run.txt with version, date,      ║
+║            bhavcopy source/rows, regime, candidate count, and pick count. ║
+║            GHA artifact now always ≥ 1 KB of forensic data even on abort. ║
+║            Telegram abort messages include bhavcopy_src for root-cause.   ║
 ║                                                                              ║
-║   PATCH-3  MFI-GATED SEMANTIC CATALYST (Fatal Flaw 3 — AI Failure)        ║
-║            Semantic match ONLY triggers catalyst_sub if MFI < 40           ║
-║            OR whale_flag OR delivery_pct > 55%.                            ║
-║            Forces the math to prove the money behind the story.            ║
+║   FIX-C   SECRET PREFLIGHT CHECK                                           ║
+║            On startup: verify OPENAI_API_KEY, TELEGRAM_TOKEN,             ║
+║            GOOGLE_SHEET_ID, GOOGLE_CREDS_JSON are all set.                ║
+║            Log WARNING (not error) for each missing secret so run         ║
+║            degrades gracefully rather than crashing silently.              ║
 ║                                                                              ║
-║   PATCH-4  %-TICK VPOC (Fatal Flaw 4 — Statistical Failure)               ║
-║            Logarithmic 0.5%-bucket VPOC replaces 10-bin histogram.        ║
-║            Gap-up spikes no longer destroy consolidation resolution.       ║
-║            No scipy dependency — pure numpy, GHA-safe.                    ║
+║   v7.1 ADVERSARIAL PATCHES (PRESERVED)                                     ║
+║            PATCH-1 NATR normalised VCP/Bayesian/APEX                      ║
+║            PATCH-2 Dynamic NIFTY50 options gravity gate                   ║
+║            PATCH-3 MFI-gated semantic catalyst                            ║
+║            PATCH-4 %-tick logarithmic VPOC                                ║
 ║                                                                              ║
-║   FROM v7.0 (PRESERVED)                                                     ║
-║            Uptrend Gate: Price > 50MA > 200MA before VCP/VDU              ║
-║            Confidence Score: cross-signal std gate                         ║
-║            Thread-safe zero-copy hist_cache                                ║
-║            Fortress 200-pt · APEX 7-engine · Three-lane architecture      ║
-║            4-layer Halal Screen · Bayesian 14-node · Kelly sizing         ║
+║   v7.0 ARCHITECTURE (PRESERVED)                                             ║
+║            Uptrend Gate · Confidence Score · Thread-safe hist_cache       ║
+║            Fortress 200-pt · APEX 7-engine · Three-lane                   ║
+║            4-layer Halal · Bayesian 14-node · Kelly · Meta-labeler        ║
 ║            Phase-2 ATR stops · Phase-3 order flow · Phase-4 alt-data     ║
-║            Meta-labeler veto · Options gravity · Weekly review            ║
 ║                                                                              ║
 ║   STACK    Google Sheets · GitHub Actions · OpenAI gpt-4o-mini            ║
 ║            NSE Bhavcopy + yfinance · Zero paid infra                      ║
@@ -43,7 +45,7 @@
 
 import os, io, sys, re, json, math, time, random, logging, hashlib
 import threading, warnings, asyncio, queue, itertools, collections
-import sqlite3
+import sqlite3, subprocess
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -66,7 +68,60 @@ log = logging.getLogger("fortress_v7")
 # SECTION 1 — CONFIGURATION & SECRETS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "FORTRESS v7.1 PEARL HUNTER + ADVERSARIAL PATCHES"
+VERSION = "FORTRESS v7.2 PEARL HUNTER + ADVERSARIAL PATCHES + FORENSIC HARDENING"
+
+# ── FIX-C: Secret preflight check ────────────────────────────────────────────
+# Called once at run() start. Warns (not crashes) on missing secrets so the
+# run degrades gracefully and the artifact log shows exact root cause.
+def _preflight_secrets() -> dict:
+    """
+    Check all required GitHub Actions secrets are set.
+    Returns dict of {secret_name: bool}.  Logs WARNING for each missing one.
+    Does NOT abort — caller decides whether to proceed in degraded mode.
+    """
+    checks = {
+        "OPENAI_API_KEY":    bool(os.getenv("OPENAI_API_KEY",    "")),
+        "TELEGRAM_TOKEN":    bool(os.getenv("TELEGRAM_TOKEN",    "")),
+        "TELEGRAM_CHAT_ID":  bool(os.getenv("TELEGRAM_CHAT_ID",  "")),
+        "GOOGLE_SHEET_ID":   bool(os.getenv("GOOGLE_SHEET_ID",   "")),
+        "GOOGLE_CREDS_JSON": bool(os.getenv("GOOGLE_CREDS_JSON", "")),
+    }
+    for k, ok in checks.items():
+        if not ok:
+            log.warning(f"SECRET MISSING: {k} — related features will degrade gracefully")
+        else:
+            log.info(f"SECRET OK: {k}")
+    all_ok = all(checks.values())
+    if all_ok:
+        log.info("✅ All secrets present")
+    else:
+        missing = [k for k, v in checks.items() if not v]
+        log.warning(f"⚠️ Missing secrets: {missing}")
+    return checks
+
+# ── FIX-B: Run sentinel / diagnostic writer ──────────────────────────────────
+_OUTPUTS_DIR = Path(os.getenv("CACHE_PATH", "outputs/sniper_cache.db")).parent
+
+def _write_sentinel(date_label: str, stage: str, extra: dict = None):
+    """
+    FIX-B: Write outputs/last_run.txt on every run (even aborts).
+    Guarantees the GHA artifact is never an empty 1.3 KB skeleton.
+    The sentinel is plain-text so it's human-readable in the artifact download.
+    """
+    try:
+        _OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        lines = [
+            f"VERSION : {VERSION}",
+            f"DATE    : {date_label}",
+            f"STAGE   : {stage}",
+            f"UTCTIME : {datetime.utcnow().isoformat()}",
+        ]
+        if extra:
+            for k, v in extra.items():
+                lines.append(f"{k:8s}: {v}")
+        (_OUTPUTS_DIR / "last_run.txt").write_text("\n".join(lines) + "\n")
+    except Exception as e:
+        log.debug(f"_write_sentinel: {e}")
 
 # LLM
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
@@ -716,45 +771,59 @@ def load_bhavcopy() -> Tuple[pd.DataFrame, str]:
     """
     _, date_label = _get_last_trading_day()
     dd, mm, yyyy  = date_label[8:10], date_label[5:7], date_label[:4]
-    urls = [
-        f"https://archives.nseindia.com/content/historical/EQUITIES/{yyyy}/"
-        f"{mm.upper()[:3]}/cm{dd}{mm.upper()[:3]}{yyyy}bhav.csv.zip",
-        f"https://nsearchives.nseindia.com/content/cm/"
-        f"BhavCopy_NSE_CM_0_{dd}{mm}{yyyy}_F_0000.csv.zip",
+
+    # ── FIX-A: Rotating User-Agent pool ──────────────────────────────────────
+    # GHA runner IPs are known datacenter ranges. NSE/Cloudflare fingerprints
+    # the UA string. Rotating reduces systematic 403s.
+    _UA_POOL = [
+        ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) "
+         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15"),
+        ("Mozilla/5.0 (X11; Linux x86_64) "
+         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+        ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) "
+         "Gecko/20100101 Firefox/124.0"),
     ]
-    for url in urls:
+
+    def _make_headers(ua: str) -> dict:
+        return {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://www.nseindia.com/",
+            "Connection": "keep-alive",
+        }
+
+    def _parse_bhav_zip(content: bytes) -> Optional[pd.DataFrame]:
+        """Parse NSE bhavcopy zip bytes → clean DataFrame or None."""
+        from zipfile import ZipFile
         try:
-            sess = requests.Session()
-            sess.get("https://www.nseindia.com", headers=_NSE_HEADERS, timeout=8)
-            resp = sess.get(url, headers=_NSE_HEADERS, timeout=20)
-            if resp.status_code != 200 or len(resp.content) < 5000:
-                continue
-            from zipfile import ZipFile
-            zf       = ZipFile(io.BytesIO(resp.content))
+            zf       = ZipFile(io.BytesIO(content))
             csv_name = [n for n in zf.namelist() if n.endswith(".csv")][0]
             df_raw   = pd.read_csv(io.BytesIO(zf.read(csv_name)))
             df_raw.columns = [c.strip().upper() for c in df_raw.columns]
             col_map = {}
             for c in df_raw.columns:
                 cl = c.lower()
-                if "symbol" in cl:                col_map[c] = "symbol"
-                elif "series" in cl:              col_map[c] = "series"
-                elif cl == "open":                col_map[c] = "open"
-                elif cl == "high":                col_map[c] = "high"
-                elif cl == "low":                 col_map[c] = "low"
-                elif "prevclose" in cl:           col_map[c] = "prevclose"
-                elif cl in ("close","ltp"):       col_map[c] = "close"
+                if "symbol" in cl:                  col_map[c] = "symbol"
+                elif "series" in cl:                col_map[c] = "series"
+                elif cl == "open":                  col_map[c] = "open"
+                elif cl == "high":                  col_map[c] = "high"
+                elif cl == "low":                   col_map[c] = "low"
+                elif "prevclose" in cl:             col_map[c] = "prevclose"
+                elif cl in ("close","ltp"):         col_map[c] = "close"
                 elif "qty" in cl or "volume" in cl: col_map[c] = "volume"
                 elif "val" in cl or "turnover" in cl: col_map[c] = "turnover_lakhs"
-                elif "deliv" in cl:               col_map[c] = "delivery_pct"
-                elif "isin" in cl:                col_map[c] = "isin"
+                elif "deliv" in cl:                 col_map[c] = "delivery_pct"
+                elif "isin" in cl:                  col_map[c] = "isin"
             df_raw = df_raw.rename(columns=col_map)
             if "series" in df_raw.columns:
                 df_raw = df_raw[df_raw["series"] == "EQ"].copy()
             needed = ["symbol","open","high","low","close","volume"]
             if not all(c in df_raw.columns for c in needed):
-                continue
-            # ZERO-COPY: select and assign columns directly without chained assignment
+                return None
             df = df_raw[needed].copy()
             for col in ["open","high","low","close","volume"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
@@ -766,21 +835,83 @@ def load_bhavcopy() -> Tuple[pd.DataFrame, str]:
                 df["turnover_lakhs"] = df["volume"] * df["close"] / 100_000
             df["delivery_pct"] = (
                 pd.to_numeric(df_raw["delivery_pct"], errors="coerce").fillna(0)
-                if "delivery_pct" in df_raw.columns
-                else 0.0
+                if "delivery_pct" in df_raw.columns else 0.0
             )
             df["symbol"] = df["symbol"].str.strip().str.upper()
-            # Merge MTO delivery (authoritative source)
-            mto = _fetch_mto_delivery(date_label)
-            if mto:
-                df["delivery_pct"] = df["symbol"].map(mto).fillna(0.0)
-            log.info(f"Bhavcopy loaded NSE: {len(df)} rows")
-            return df.dropna(subset=["close"]).reset_index(drop=True), "NSE_DIRECT"
+            return df.dropna(subset=["close"]).reset_index(drop=True)
         except Exception as e:
-            log.debug(f"Bhavcopy NSE attempt: {e}")
+            log.debug(f"_parse_bhav_zip: {e}")
+            return None
 
-    # yfinance fallback
-    log.warning("Bhavcopy: NSE failed — falling back to yfinance universe")
+    def _curl_download(url: str) -> Optional[bytes]:
+        """
+        FIX-A: subprocess curl fallback — bypasses Python requests stack
+        entirely. curl uses its own TLS/UA and often succeeds when requests
+        gets a 403 from NSE's Cloudflare layer on GHA IPs.
+        """
+        try:
+            result = subprocess.run(
+                ["curl", "-sL", "--max-time", "30",
+                 "-H", f"User-Agent: {random.choice(_UA_POOL)}",
+                 "-H", "Referer: https://www.nseindia.com/",
+                 "-H", "Accept-Encoding: gzip, deflate, br",
+                 "--compressed", url],
+                capture_output=True, timeout=35,
+            )
+            if result.returncode == 0 and len(result.stdout) > 5000:
+                return result.stdout
+        except Exception as e:
+            log.debug(f"_curl_download: {e}")
+        return None
+
+    urls = [
+        f"https://archives.nseindia.com/content/historical/EQUITIES/{yyyy}/"
+        f"{mm.upper()[:3]}/cm{dd}{mm.upper()[:3]}{yyyy}bhav.csv.zip",
+        f"https://nsearchives.nseindia.com/content/cm/"
+        f"BhavCopy_NSE_CM_0_{dd}{mm}{yyyy}_F_0000.csv.zip",
+    ]
+
+    # FIX-A: 3 attempts per URL with exponential backoff + UA rotation
+    for url in urls:
+        for attempt in range(3):
+            try:
+                ua   = random.choice(_UA_POOL)
+                hdrs = _make_headers(ua)
+                sess = requests.Session()
+                # Cookie-refresh: NSE validates session cookie before serving archives
+                sess.get("https://www.nseindia.com", headers=hdrs, timeout=10)
+                time.sleep(0.5 + attempt * 1.5)   # backoff: 0.5 / 2.0 / 3.5 s
+                resp = sess.get(url, headers=hdrs, timeout=25)
+                log.info(f"Bhavcopy NSE attempt {attempt+1} → HTTP {resp.status_code} "
+                         f"({len(resp.content)} bytes) | {url[-40:]}")
+                if resp.status_code == 200 and len(resp.content) > 5000:
+                    df = _parse_bhav_zip(resp.content)
+                    if df is not None and not df.empty:
+                        mto = _fetch_mto_delivery(date_label)
+                        if mto:
+                            df["delivery_pct"] = df["symbol"].map(mto).fillna(0.0)
+                        log.info(f"Bhavcopy loaded NSE (requests): {len(df)} rows")
+                        return df, "NSE_DIRECT"
+                elif resp.status_code in (403, 503, 429):
+                    log.warning(f"Bhavcopy NSE HTTP {resp.status_code} attempt {attempt+1} "
+                                f"— retrying with different UA")
+            except Exception as e:
+                log.warning(f"Bhavcopy NSE attempt {attempt+1} exception: {e}")
+
+        # FIX-A: curl subprocess fallback for this URL
+        log.info(f"Bhavcopy: trying curl fallback for {url[-50:]}")
+        raw_bytes = _curl_download(url)
+        if raw_bytes:
+            df = _parse_bhav_zip(raw_bytes)
+            if df is not None and not df.empty:
+                mto = _fetch_mto_delivery(date_label)
+                if mto:
+                    df["delivery_pct"] = df["symbol"].map(mto).fillna(0.0)
+                log.info(f"Bhavcopy loaded NSE (curl): {len(df)} rows")
+                return df, "NSE_CURL"
+
+    # Final fallback: yfinance universe
+    log.warning("Bhavcopy: NSE + curl both failed — falling back to yfinance universe")
     try:
         import yfinance as yf
         syms = _load_nifty500_symbols()[:300]
@@ -812,7 +943,11 @@ def load_bhavcopy() -> Tuple[pd.DataFrame, str]:
             except Exception:
                 continue
         df = pd.DataFrame(rows)
-        return df, "YFINANCE"
+        if not df.empty:
+            log.info(f"Bhavcopy loaded yfinance: {len(df)} rows")
+            return df, "YFINANCE"
+        log.error("Bhavcopy yfinance: empty result")
+        return pd.DataFrame(), "EMPTY"
     except Exception as e:
         log.error(f"Bhavcopy yfinance fallback: {e}")
         return pd.DataFrame(), "EMPTY"
@@ -2670,7 +2805,7 @@ def run_weekly_review(force: bool = False):
         ) or "Run more trades to generate AI narrative."
     else:
         narrative = summary
-    _send_tg(f"📈 <b>FORTRESS v7.0 Weekly Review — {datetime.today():%Y-%m-%d}</b>\n"
+    _send_tg(f"📈 <b>FORTRESS v7.2 Weekly Review — {datetime.today():%Y-%m-%d}</b>\n"
              f"{summary}\n\n{narrative}")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2680,6 +2815,7 @@ def run_weekly_review(force: bool = False):
 def run():
     log.info(f"{'='*70}")
     log.info(f"  {VERSION}")
+    log.info(f"  FIX-A NSE retry+curl | FIX-B sentinel | FIX-C preflight")
     log.info(f"  PATCH-1 NATR | PATCH-2 DynNIFTY50 | PATCH-3 MFI-Catalyst | PATCH-4 PctVPOC")
     log.info(f"  Uptrend Gate: ON | Confidence Min: {CONFIDENCE_MIN} | "
              f"Std Max: {CONFIDENCE_STD_MAX}")
@@ -2687,23 +2823,44 @@ def run():
 
     _init_db()
 
-    # 1. Trading day
+    # FIX-B: write sentinel immediately so artifact is never empty
     _, date_label = _get_last_trading_day()
+    _write_sentinel(date_label, "STARTED")
+
+    # FIX-C: preflight secret check
+    secrets_ok = _preflight_secrets()
+
     log.info(f"Date: {date_label}")
 
     # 2. Macro regime
     macro = fetch_macro_regime()
+    _write_sentinel(date_label, "MACRO_DONE", {
+        "REGIME ": macro["macro_state"],
+        "VIX    ": macro["vix_val"],
+    })
     if macro["macro_state"] in ("MASSACRE",):
         log.warning("MASSACRE regime — no picks today (capital preservation)")
-        _send_tg(f"⚠️ <b>FORTRESS v7.0 — {date_label}</b>\n"
+        _write_sentinel(date_label, "ABORTED_MASSACRE", {"REGIME": macro["macro_state"]})
+        _send_tg(f"⚠️ <b>FORTRESS v7.2 — {date_label}</b>\n"
                  f"MASSACRE regime (VIX={macro['vix_val']:.1f}) — no picks today.")
         return []
 
-    # 3. Bhavcopy
+    # 3. Bhavcopy — FIX-A retry/curl baked into load_bhavcopy()
     bhav, bhav_src = load_bhavcopy()
+    _write_sentinel(date_label, "BHAVCOPY_DONE", {
+        "SRC    ": bhav_src,
+        "ROWS   ": len(bhav),
+    })
     if bhav.empty:
-        log.error("Bhavcopy empty — aborting run")
-        _send_tg(f"❌ <b>FORTRESS v7.0 — {date_label}</b>\nBhavcopy unavailable — run aborted.")
+        log.error(f"Bhavcopy empty (src={bhav_src}) — aborting run")
+        _write_sentinel(date_label, "ABORTED_BHAVCOPY", {"SRC": bhav_src, "ROWS": 0})
+        _send_tg(
+            f"❌ <b>FORTRESS v7.2 — {date_label}</b>\n"
+            f"Bhavcopy unavailable (src={bhav_src}).\n"
+            f"NSE requests (3 retries + UA rotation + curl) all failed.\n"
+            f"Check GHA secrets: " +
+            (", ".join(k for k, v in secrets_ok.items() if not v) or "all present")
+        )
         return []
     log.info(f"Bhavcopy: {len(bhav)} rows from {bhav_src}")
 
@@ -2715,7 +2872,9 @@ def run():
     ].head(MAX_CANDIDATES).copy()
     log.info(f"Candidates after price/liquidity filter: {len(cands)}")
     if cands.empty:
-        _send_tg(f"📋 <b>FORTRESS v7.0 — {date_label}</b>\nNo candidates after filters.")
+        _write_sentinel(date_label, "ABORTED_NO_CANDIDATES",
+                        {"BHAV_SRC": bhav_src, "BHAV_ROWS": len(bhav)})
+        _send_tg(f"📋 <b>FORTRESS v7.2 — {date_label}</b>\nNo candidates after filters.")
         return []
 
     # 5. Intelligence feeds (parallel, graceful degradation)
@@ -2832,10 +2991,14 @@ def run():
     log.info(f"Scored {len(cands)} | Passed all gates: {len(results)}")
 
     if not results:
+        _write_sentinel(date_label, "NO_PICKS",
+                        {"SCORED": len(cands), "BHAV_SRC": bhav_src,
+                         "REGIME": macro["macro_state"]})
         _send_tg(
-            f"📋 <b>FORTRESS v7.0 — {date_label}</b>\n"
+            f"📋 <b>FORTRESS v7.2 — {date_label}</b>\n"
             f"Regime: {macro['macro_state']} VIX={macro['vix_val']:.1f}\n"
-            f"No candidates cleared Uptrend Gate + Confidence Score + Fused gates today.\n"
+            f"Scored: {len(cands)} | Source: {bhav_src}\n"
+            f"No candidates cleared Uptrend Gate + Confidence Score + Fused gates.\n"
             f"Pearls-or-nothing ✨"
         )
         return []
@@ -2865,7 +3028,9 @@ def run():
 
     final_picks = [w for w in winners.values() if w]
     if not final_picks:
-        _send_tg(f"📋 <b>FORTRESS v7.0 — {date_label}</b>\n"
+        _write_sentinel(date_label, "NO_LANE_PICKS",
+                        {"SCORED": len(results), "REGIME": macro["macro_state"]})
+        _send_tg(f"📋 <b>FORTRESS v7.2 — {date_label}</b>\n"
                  f"Regime: {macro['macro_state']} | {len(results)} scored\n"
                  f"No picks survived lane gates (pearls-or-nothing).")
         return []
@@ -2891,6 +3056,14 @@ def run():
 
     log.info(f"✅ Run complete | {len(final_picks)} pick(s) | "
              f"{[p['symbol'] for p in final_picks]}")
+    _write_sentinel(date_label, "COMPLETE", {
+        "PICKS  ": len(final_picks),
+        "SYMBOLS": " ".join(p["symbol"] for p in final_picks),
+        "BHAV   ": bhav_src,
+        "SCORED ": len(results),
+        "REGIME ": macro["macro_state"],
+        "VIX    ": macro.get("vix_val", 0),
+    })
     return final_picks
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2899,7 +3072,7 @@ def run():
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Fortress Sniper v7.0 EOD Pearl Hunter")
+    parser = argparse.ArgumentParser(description="Fortress Sniper v7.2 EOD Pearl Hunter")
     parser.add_argument("--weekly-review",  action="store_true")
     parser.add_argument("--outcome-only",   action="store_true")
     parser.add_argument("--store-vector",   metavar="SYMBOL")
