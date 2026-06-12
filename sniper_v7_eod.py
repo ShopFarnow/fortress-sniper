@@ -74,7 +74,7 @@ log = logging.getLogger("fortress_v7")
 # SECTION 1 — CONFIGURATION & SECRETS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "FORTRESS v8.1 — APEX PREDATOR (SESSION_ARMOR+TARGETED_INTEL+SOFT_GATE+SAST+SECTOR+PLEDGE)"
+VERSION = "FORTRESS v8.2 — APEX PREDATOR (HEIST_BEFORE_GATE+BASE_FORMING_FULL_SCORE)"
 
 # ── FIX-C: Secret preflight check ────────────────────────────────────────────
 # Called once at run() start. Warns (not crashes) on missing secrets so the
@@ -2125,9 +2125,9 @@ def fortress_score(symbol: str, today_row: dict, hist: pd.DataFrame,
         if ratio < 0.60:   vcp_score = 20
         elif ratio < 0.70: vcp_score = 14
         elif ratio < 0.80: vcp_score = 8
-        # PATCH 3: base_forming gets 50% weight (accumulation not yet confirmed)
-        if is_base_forming:
-            vcp_score = vcp_score // 2
+        # v8.2 FIX: removed base_forming //2 penalty — was making gate
+        # mathematically impossible for early-stage setups. base_forming
+        # now scores same as full uptrend; the tier is informational only.
         if vcp_score:
             tag = "base" if is_base_forming else "VCP"
             story_parts.append(f"{tag} coil NATR={ratio:.2f}")
@@ -2155,9 +2155,7 @@ def fortress_score(symbol: str, today_row: dict, hist: pd.DataFrame,
             if vdu_r < 0.40:   vdu_score = 15
             elif vdu_r < 0.60: vdu_score = 10
             elif vdu_r < 0.80: vdu_score = 5
-            # PATCH 3: base_forming half-weight
-            if is_base_forming:
-                vdu_score = vdu_score // 2
+            # v8.2 FIX: removed base_forming //2 penalty (same reason as VCP)
     fort_pts += vdu_score
 
     # 5. FII/DII
@@ -2319,12 +2317,12 @@ def apex_composite(symbol: str, fortress: dict, hist: pd.DataFrame,
     natr14_a = fortress.get("natr14", (atr14 / close * 100) if close > 0 else 5)
     vcp_pct  = natr14_a * 100  # convert to %, e.g. 0.018 → 1.8%
     vcp_s = 15 if vcp_pct < 1.5 else (10 if vcp_pct < 2.5 else (5 if vcp_pct < 4 else 0))
-    # v8.1: uptrend = full, base_forming = half, downtrend = 0
+    # v8.1: uptrend = full, base_forming = full (v8.2: removed half-weight penalty),
+    # downtrend = 0
     uptrend_reason = fortress.get("uptrend_reason", "")
     if not fortress.get("uptrend_ok", True):
         vcp_s = 0      # downtrend — no VCP credit
-    elif "base_forming" in uptrend_reason:
-        vcp_s = vcp_s // 2   # accumulation tier — half credit
+    # base_forming: full credit (tier is informational, not penalised)
     scores.append(("vcp", vcp_s, 15))
 
     # 6. VPOC support
@@ -3048,11 +3046,12 @@ def score_one_symbol(args: tuple) -> Optional[dict]:
         # Phase 3: EOD order flow
         order_flow = compute_eod_order_flow(sym, row, hist)
 
-        # ── v8.1 PATCH 2: Late-stage targeted intel (runs AFTER history/flow) ─
-        # Replaces run-start global dump. Only called for math-gate survivors.
-        # Use passed-in maps as base; override with fresh precision data.
+        # ── v8.2 FIX: PRECISION HEIST RUNS BEFORE FORTRESS_SCORE ─────────────
+        # BUG v8.1: heist ran AFTER fp<45 gate → never fired for any stock.
+        # FIX: hydrate live_insider_map/live_filings NOW so fortress_score
+        # receives real insider/filing data and awards the +15–30pt bounty
+        # that allows institutional setups to clear the gate.
         target_insider, target_filing = fetch_target_intel(sym)
-        # Merge: fresh precision data wins over stale global dump
         live_insider_map = dict(insider_map)
         live_filings     = dict(filings)
         if target_insider.get("count", 0) > 0:
@@ -3060,11 +3059,11 @@ def score_one_symbol(args: tuple) -> Optional[dict]:
         if target_filing.get("subject", "None") != "None":
             live_filings[sym] = target_filing
 
-        # Fortress scoring
+        # Fortress scoring (now uses live precision data)
         fort = fortress_score(sym, row, hist, fii_data, live_insider_map,
                               live_filings, macro, order_flow)
         fp = fort.get("fort_pts", 0) if fort else 0
-        if not fort or fp < 45:  # v7.5: adjusted for lean scoring (60pts VPOC block removed in v7)
+        if not fort or fp < 45:
             ma50  = fort.get("ma50",  0) if fort else 0
             ma200 = fort.get("ma200", 0) if fort else 0
             _rej("FORT_PTS_LOW",
