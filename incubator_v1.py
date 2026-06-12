@@ -59,7 +59,7 @@ log = logging.getLogger("incubator_v1")
 # SECTION 1 — CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "INCUBATOR v2.0 STONE HUNTER (patched: ETF-ban + EPS-hard-gate + Screener-concall)"
+VERSION = "INCUBATOR v3.0 STONE HUNTER (price-before-slice + yf-eps + 6pct-slope)"
 
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MINI_MODEL  = os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini")
@@ -74,7 +74,7 @@ GOOGLE_CREDS_JSON  = os.getenv("GOOGLE_CREDS_JSON", "")
 SCRAPERAPI_KEY     = os.getenv("SCRAPERAPI_KEY", "")
 
 # Stage 1 thresholds
-STAGE1_MA200_FLAT_PCT   = float(os.getenv("STAGE1_MA200_FLAT_PCT",   "0.03"))   # ±3% over 13W
+STAGE1_MA200_FLAT_PCT   = float(os.getenv("STAGE1_MA200_FLAT_PCT",   "0.06"))   # ±6% — allows natural rounding bottoms
 STAGE1_BOX_WIDTH_MAX    = float(os.getenv("STAGE1_BOX_WIDTH_MAX",    "0.35"))   # <35% box
 STAGE1_BOX_WEEKS_MIN    = int(os.getenv("STAGE1_BOX_WEEKS_MIN",      "12"))     # ≥12 weeks
 STAGE1_PRICE_FROM_MA200 = float(os.getenv("STAGE1_PRICE_FROM_MA200", "0.20"))   # within 20%
@@ -327,7 +327,7 @@ def load_universe() -> pd.DataFrame:
             df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
             df = df.dropna(subset=["close"]).query("close > 0").reset_index(drop=True)
 
-            # PATCH 1: BAN ETFs, INDEX FUNDS, BONDS
+            # PATCH 1a: BAN ETFs, INDEX FUNDS, BONDS
             etf_keywords = ['ETF', 'BEES', 'QLITY', 'NIFTY', 'GSEC', 'BOND', 'LIQUIDCASE',
                             'LIQUID', 'GILT', 'CPSE', 'BHARAT', 'MAFSETF', 'JUNIORBEES']
             etf_pattern = '|'.join(etf_keywords)
@@ -335,7 +335,11 @@ def load_universe() -> pd.DataFrame:
             df = df[~df['symbol'].str.contains(etf_pattern, na=False)]
             log.info(f"ETF/Index filter removed {before - len(df)} symbols, {len(df)} remain")
 
-            # PATCH 1: SORT BY LIQUIDITY (turnover), NOT ALPHABET
+            # PATCH 1b: PRICE FILTER BEFORE head(400) — ensures 400 affordable stocks, not large-caps
+            df = df[(df["close"] >= MIN_PRICE) & (df["close"] <= MAX_PRICE)]
+            log.info(f"Price filter ₹{MIN_PRICE:.0f}-{MAX_PRICE:.0f}: {len(df)} remain")
+
+            # PATCH 1c: SORT BY LIQUIDITY (turnover), NOT ALPHABET
             if "turnover_lakhs" in df.columns:
                 df = df.sort_values("turnover_lakhs", ascending=False)
                 log.info("Universe sorted by turnover_lakhs (liquidity) ✅")
@@ -382,6 +386,10 @@ def load_universe() -> pd.DataFrame:
             before = len(df)
             df = df[~df['symbol'].str.contains(etf_pattern, na=False)]
             log.info(f"ETF/Index filter removed {before - len(df)} symbols, {len(df)} remain")
+
+            # PATCH 1b: PRICE FILTER BEFORE head(400) — guarantees 400 affordable candidates
+            df = df[(df["close"] >= MIN_PRICE) & (df["close"] <= MAX_PRICE)]
+            log.info(f"Price filter ₹{MIN_PRICE:.0f}-{MAX_PRICE:.0f}: {len(df)} remain")
 
             # PATCH 1: SORT BY LIQUIDITY, NOT ALPHABET
             if "turnover_lakhs" in df.columns:
@@ -647,6 +655,27 @@ def fetch_quarterly_results(symbol: str) -> List[dict]:
                     })
         except Exception as e:
             log.debug(f"screener.in fallback {symbol}: {e}")
+
+    # PATCH 2: yfinance fallback — free, unblocked, works for NSE stocks
+    if not results:
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(f"{symbol}.NS")
+            q_fin = ticker.quarterly_income_stmt
+            if q_fin is not None and not q_fin.empty:
+                for dt in q_fin.columns[:4]:
+                    net_inc = float(q_fin.loc["Net Income", dt]) if "Net Income" in q_fin.index else 0.0
+                    rev     = float(q_fin.loc["Total Revenue", dt]) if "Total Revenue" in q_fin.index else 0.0
+                    eps     = float(q_fin.loc["Basic EPS", dt]) if "Basic EPS" in q_fin.index else 0.0
+                    results.append({
+                        "period":     dt.strftime("%Y-%m-%d"),
+                        "eps":        eps,
+                        "revenue":    rev,
+                        "net_profit": net_inc,
+                    })
+                log.debug(f"yfinance quarterly fallback {symbol}: {len(results)} quarters ✅")
+        except Exception as e:
+            log.debug(f"yfinance quarterly fallback {symbol}: {e}")
 
     return results
 
