@@ -8,7 +8,7 @@ concurrency:
 on:
   schedule:
     # Friday 16:00 IST = 10:30 UTC (30 min after NSE Friday close)
-    - cron: '30 10 * * 5'
+    - cron: '30 00 * * 1'
   workflow_dispatch:
     inputs:
       symbol:
