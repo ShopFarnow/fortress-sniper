@@ -59,7 +59,7 @@ log = logging.getLogger("incubator_v1")
 # SECTION 1 — CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "INCUBATOR v1.0 STONE HUNTER"
+VERSION = "INCUBATOR v2.0 STONE HUNTER (patched: ETF-ban + EPS-hard-gate + Screener-concall)"
 
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MINI_MODEL  = os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini")
@@ -326,6 +326,21 @@ def load_universe() -> pd.DataFrame:
                 df["turnover_lakhs"] = df.get("volume", 0) * df.get("close", 0) / 100_000
             df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
             df = df.dropna(subset=["close"]).query("close > 0").reset_index(drop=True)
+
+            # PATCH 1: BAN ETFs, INDEX FUNDS, BONDS
+            etf_keywords = ['ETF', 'BEES', 'QLITY', 'NIFTY', 'GSEC', 'BOND', 'LIQUIDCASE',
+                            'LIQUID', 'GILT', 'CPSE', 'BHARAT', 'MAFSETF', 'JUNIORBEES']
+            etf_pattern = '|'.join(etf_keywords)
+            before = len(df)
+            df = df[~df['symbol'].str.contains(etf_pattern, na=False)]
+            log.info(f"ETF/Index filter removed {before - len(df)} symbols, {len(df)} remain")
+
+            # PATCH 1: SORT BY LIQUIDITY (turnover), NOT ALPHABET
+            if "turnover_lakhs" in df.columns:
+                df = df.sort_values("turnover_lakhs", ascending=False)
+                log.info("Universe sorted by turnover_lakhs (liquidity) ✅")
+
+            df = df.head(400).reset_index(drop=True)
             log.info(f"Universe: {len(df)} rows from Sheets BHAVCOPY ✅")
             return df
 
@@ -358,8 +373,23 @@ def load_universe() -> pd.DataFrame:
                     df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
             df["turnover_lakhs"] = df.get("turnover_lakhs", 0) / 100_000
             df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+            df = df.dropna(subset=["close"]).query("close > 0").reset_index(drop=True)
+
+            # PATCH 1: BAN ETFs, INDEX FUNDS, BONDS
+            etf_keywords = ['ETF', 'BEES', 'QLITY', 'NIFTY', 'GSEC', 'BOND', 'LIQUIDCASE',
+                            'LIQUID', 'GILT', 'CPSE', 'BHARAT', 'MAFSETF', 'JUNIORBEES']
+            etf_pattern = '|'.join(etf_keywords)
+            before = len(df)
+            df = df[~df['symbol'].str.contains(etf_pattern, na=False)]
+            log.info(f"ETF/Index filter removed {before - len(df)} symbols, {len(df)} remain")
+
+            # PATCH 1: SORT BY LIQUIDITY, NOT ALPHABET
+            if "turnover_lakhs" in df.columns:
+                df = df.sort_values("turnover_lakhs", ascending=False)
+                log.info("Universe sorted by turnover_lakhs (liquidity) ✅")
+
             log.info(f"Universe: {len(df)} rows from NSE bhavcopy ✅")
-            return df.dropna(subset=["close"]).query("close > 0").reset_index(drop=True)
+            return df.head(400).reset_index(drop=True)
     except Exception as e:
         log.warning(f"NSE bhavcopy: {e}")
 
@@ -631,10 +661,10 @@ def check_eps_acceleration(symbol: str) -> Tuple[bool, dict]:
 
     qtrs = fetch_quarterly_results(symbol)
     if len(qtrs) < 2:
-        details["reason"] = f"insufficient quarterly data: {len(qtrs)} quarters"
-        # Soft pass — don't kill stock just because NSE API didn't return data
-        details["score"]  = 10
-        return True, details
+        details["reason"] = f"insufficient quarterly data: {len(qtrs)} quarters — REJECTED"
+        # PATCH 2: Hard reject — blind gamble without EPS data
+        details["score"] = 0
+        return False, details
 
     latest = qtrs[0]
     prior  = qtrs[1]
@@ -653,9 +683,9 @@ def check_eps_acceleration(symbol: str) -> Tuple[bool, dict]:
         val_latest = latest["revenue"]
         val_prior  = prior["revenue"]
     else:
-        details["reason"] = "no financial data available"
-        details["score"]  = 5
-        return True, details   # soft pass — don't veto on missing data
+        details["reason"] = "no financial data available — REJECTED"
+        details["score"]  = 0
+        return False, details   # PATCH 2: Hard reject — no data = no trade
 
     # Both must be positive (no loss-making turnarounds — separate strategy)
     if val_prior <= 0:
@@ -800,6 +830,30 @@ def _fetch_concall_text(symbol: str) -> str:
                         break
         except Exception as e:
             log.debug(f"concall BSE {symbol}: {e}")
+
+    # PATCH 3: Source 3 — Screener.in concall page (most reliable for Indian mid-caps)
+    if not text and SCRAPERAPI_KEY:
+        try:
+            # Screener.in concall page for this symbol
+            screener_url = f"https://www.screener.in/company/{symbol}/concalls/"
+            resp = requests.get(
+                "https://api.scraperapi.com/",
+                params={"api_key": SCRAPERAPI_KEY, "url": screener_url, "render": "false"},
+                timeout=30,
+            )
+            if resp.status_code == 200 and len(resp.text) > 500:
+                raw_html = resp.text
+                # Extract transcript text — Screener wraps it in <div class="con-call">
+                # or just grab all visible text between script/style tags
+                clean = re.sub(r'<script[^>]*>.*?</script>', '', raw_html, flags=re.DOTALL)
+                clean = re.sub(r'<style[^>]*>.*?</style>',  '', clean, flags=re.DOTALL)
+                clean = re.sub(r'<[^>]+>', ' ', clean)
+                clean = re.sub(r'\s+', ' ', clean).strip()
+                if len(clean) > 500:
+                    text = clean
+                    log.info(f"Concall {symbol}: scraped Screener.in ({len(text)} chars) ✅")
+        except Exception as e:
+            log.debug(f"concall Screener.in {symbol}: {e}")
 
     return text[:8000]
 
