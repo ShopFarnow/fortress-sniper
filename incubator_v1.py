@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   PROJECT FORTRESS — INCUBATOR v10.0 (THE INSIDER SYNDICATE)                ║
+║   PROJECT FORTRESS — INCUBATOR v12.0 (THE INSIDER SYNDICATE)                ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
 ║   MISSION: Find stocks at ₹40 before they become ₹150 (3-6 month horizon) ║
@@ -63,7 +63,7 @@ log = logging.getLogger("incubator_v6")
 # SECTION 1 — CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "INCUBATOR v10.0 INSIDER SYNDICATE (yf-grounded-sharia + conf90-signal-gate)"
+VERSION = "INCUBATOR v12.0 INSIDER SYNDICATE (fixed-headers-38col + all-fields-aligned)"
 
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MINI_MODEL  = os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini")
@@ -725,6 +725,90 @@ def check_rubble_gate(symbol: str, weekly: pd.DataFrame,
     return True, details
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8b — UPGRADE 2.2: SECTOR ROTATION ALPHA
+# ══════════════════════════════════════════════════════════════════════════════
+# Indian market moves in 6-month sector cycles. A Stone in an accelerating
+# sector breaks out faster. A Stone in a dying sector stays a stone forever.
+# Checks NIFTY sector index 13-week momentum — adds up to +20 score bonus.
+
+# Map NSE industry keywords → NIFTY sector index Yahoo Finance tickers
+_SECTOR_INDEX_MAP = {
+    "Cement":         "^CNXMETAL",   # proxy — no direct NIFTY Cement index on YF
+    "Metals":         "^CNXMETAL",
+    "Metal":          "^CNXMETAL",
+    "Realty":         "^CNXREALTY",
+    "Real Estate":    "^CNXREALTY",
+    "Pharma":         "^CNXPHARMA",
+    "Pharmaceuticals": "^CNXPHARMA",
+    "IT":             "^CNXIT",
+    "Software":       "^CNXIT",
+    "Technology":     "^CNXIT",
+    "Auto":           "^CNXAUTO",
+    "Automobile":     "^CNXAUTO",
+    "FMCG":           "^CNXFMCG",
+    "Consumer":       "^CNXFMCG",
+    "Energy":         "^CNXENERGY",
+    "Power":          "^CNXENERGY",
+    "Finance":        "^CNXFIN",
+    "Banks":          "^NSEBANK",
+    "Infra":          "^CNXINFRA",
+    "Infrastructure": "^CNXINFRA",
+    "Media":          "^CNXMEDIA",
+}
+
+_SECTOR_ALPHA_CACHE: Dict[str, Tuple[float, float]] = {}   # ticker → (momentum_pct, ts)
+
+def get_sector_alpha(industry: str) -> Tuple[int, str]:
+    """
+    Returns (sector_alpha_score 0-20, description).
+    Checks if the stock's NIFTY sector index is in a 13-week Stage 2 uptrend.
+    Stocks in accelerating sectors score higher — they break out faster.
+    score 20 = sector strongly accelerating
+    score 10 = sector mildly positive
+    score  0 = sector flat or declining
+    score -10 = sector in strong downtrend (headwind)
+    """
+    if not industry or industry == "Unknown":
+        return 0, "Sector unknown"
+
+    # Find matching sector index
+    sector_ticker = None
+    for kw, idx_ticker in _SECTOR_INDEX_MAP.items():
+        if kw.lower() in industry.lower():
+            sector_ticker = idx_ticker
+            break
+
+    if not sector_ticker:
+        return 0, f"No sector index mapped for: {industry}"
+
+    # Cache for 1 hour — same index used for multiple stocks in same run
+    now = time.time()
+    cached = _SECTOR_ALPHA_CACHE.get(sector_ticker)
+    if cached and (now - cached[1]) < 3600:
+        momentum = cached[0]
+    else:
+        try:
+            import yfinance as yf
+            idx = yf.download(sector_ticker, period="4mo", interval="1wk",
+                              progress=False, auto_adjust=True)
+            if idx.empty or len(idx) < 13:
+                return 0, f"Insufficient sector data: {sector_ticker}"
+            closes = idx["Close"].values.astype(float)
+            momentum = (closes[-1] - closes[-13]) / closes[-13]   # 13-week return
+            _SECTOR_ALPHA_CACHE[sector_ticker] = (momentum, now)
+            log.debug(f"SectorAlpha {sector_ticker}: 13w momentum={momentum*100:+.1f}%")
+        except Exception as e:
+            log.debug(f"SectorAlpha fetch {sector_ticker}: {e}")
+            return 0, f"Sector fetch error: {e}"
+
+    # Score based on momentum
+    if momentum > 0.15:    return  20, f"Sector strongly accelerating ({momentum*100:+.0f}% 13w)"
+    elif momentum > 0.05:  return  10, f"Sector mildly positive ({momentum*100:+.0f}% 13w)"
+    elif momentum > -0.05: return   0, f"Sector flat ({momentum*100:+.0f}% 13w)"
+    elif momentum > -0.15: return  -5, f"Sector declining ({momentum*100:+.0f}% 13w)"
+    else:                  return -10, f"Sector in downtrend ({momentum*100:+.0f}% 13w)"
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SECTION 9 — GATE 2: EPS ACCELERATION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1112,17 +1196,19 @@ Rules:
 #   1. Corporate Announcements — order wins, expansions, acquisitions
 #   2. SAST Insider Trades (PIT) — promoter/director open-market buying
 
-def fetch_insider_and_filings(symbol: str) -> Tuple[str, str]:
+def fetch_insider_and_filings(symbol: str) -> Tuple[str, str, float]:
     """
-    Fetch NSE Corporate Announcements + SAST Insider Trades for symbol.
-    Returns (filings_text, insider_text) — raw strings for the LLM.
+    Fetch NSE Corporate Announcements + SAST Insider Trades + Promoter Pledge % for symbol.
+    Returns (filings_text, insider_text, pledge_pct)
+    pledge_pct = % of promoter shares pledged (0.0 = clean, >50 = red flag)
     """
     sess = _get_nse_session()
     filings_text = "No recent corporate filings found."
     insider_text = "No recent insider trades found."
+    pledge_pct   = -1.0   # -1 = unknown (API failed)
 
     if not sess:
-        return filings_text, insider_text
+        return filings_text, insider_text, pledge_pct
 
     # ── 1. Corporate Announcements ────────────────────────────────────────────
     try:
@@ -1154,7 +1240,6 @@ def fetch_insider_and_filings(symbol: str) -> Tuple[str, str]:
             lines = []
             for item in (data or [])[:8]:
                 mode = str(item.get("acqMode", ""))
-                # Only capture buying events
                 if any(kw in mode for kw in ["Buy", "Market Purchase", "Market Buy",
                                               "Acquisition", "ESOP"]):
                     person = str(item.get("personName", item.get("name", "")))
@@ -1171,28 +1256,51 @@ def fetch_insider_and_filings(symbol: str) -> Tuple[str, str]:
     except Exception as e:
         log.debug(f"Insider fetch {symbol}: {e}")
 
-    return filings_text, insider_text
+    # ── 3. Promoter Pledge % (UPGRADE 2.3 — Promoter Trust Score) ────────────
+    # Diamond: buying + 0% pledge. Red flag: buying + >50% pledge = debt stress.
+    try:
+        url = (f"https://www.nseindia.com/api/corporate-shareholding-patterns"
+               f"?index=equities&symbol={symbol}")
+        r = sess.get(url, timeout=12)
+        if r.status_code == 200:
+            data = r.json()
+            items = data if isinstance(data, list) else data.get("data", [])
+            if items:
+                latest = items[0]   # most recent quarter
+                # NSE returns pledged shares as % of promoter holding
+                pledged = float(latest.get("promoterPledgedShares",
+                                latest.get("percPledgedSharesPromoter",
+                                latest.get("pledgedPct", -1))) or -1)
+                if pledged >= 0:
+                    pledge_pct = pledged
+                    log.debug(f"Pledge {symbol}: {pledge_pct:.1f}%")
+    except Exception as e:
+        log.debug(f"Pledge fetch {symbol}: {e}")
+
+    return filings_text, insider_text, pledge_pct
 
 
-def insider_friend_audit(symbol: str, filings: str, insiders: str) -> dict:
+def insider_friend_audit(symbol: str, filings: str, insiders: str,
+                         pledge_pct: float = -1.0) -> dict:
     """
     The Insider Friend LLM Audit.
-    Reads legally binding NSE filings and SAST trades as if you have an
-    insider friend at a hedge fund reading the same data 3 months early.
+    Reads legally binding NSE filings + SAST trades.
+    UPGRADE 2.1: Also extracts risk/exit signals — high risk lowers confidence_score.
+    UPGRADE 2.3: Classifies DIAMOND (buying + 0% pledge) vs RED_FLAG (buying + >50% pledge).
 
-    Looks for:
-    1. Promoter/director open-market buying (confidence signal)
-    2. Stealth catalysts: new factories, land acquisition, order wins, capex
-
-    Returns dict with stealth_catalyst_found, insider_buying_found, summary, score, confidence_score
+    Returns dict with all signals + pearl_grade (DIAMOND / PEARL / SKIP)
     """
     result = {
         "stealth_catalyst_found": False,
         "insider_buying_found":   False,
         "insider_summary":        "DATA_MISSING: No filing data extracted.",
+        "risk_flags":             "",
+        "risk_penalty":           0,
         "capex_signal":           False,
         "margin_signal":          False,
         "confidence_score":       0,
+        "pledge_pct":             pledge_pct,
+        "pearl_grade":            "UNKNOWN",
         "score":                  0,
     }
 
@@ -1216,27 +1324,36 @@ RECENT CORPORATE ANNOUNCEMENTS (last 8):
 RECENT PROMOTER/INSIDER BUYING (SAST/PIT filings):
 {insiders[:2000]}
 
-Task: Find the "Stealth Catalyst" — the reason this stock will break out 3 months from now
-before retail investors notice.
-
+Task A — Find the ENTRY catalyst (3 months early):
 Look ONLY for explicitly stated evidence of:
-1. Promoters, directors, or founders buying their own company's stock from open market.
-2. New capacity expansion, new factory/plant announcement, land acquisition, greenfield/brownfield capex.
-3. Massive new order wins, long-term supply contracts, or government tenders won.
-4. Merger/acquisition or delisting announcement that could unlock value.
+1. Promoters/directors/founders buying their own stock from open market.
+2. New capacity expansion, factory, land acquisition, greenfield/brownfield capex.
+3. Massive new order wins, long-term contracts, government tenders won.
+4. Merger/acquisition or delisting announcement.
 
-Do NOT speculate. Do NOT infer. Only report what is EXPLICITLY stated in the documents.
+Task B — Find EXIT RISK signals (the reason NOT to hold):
+Look for EXPLICIT management mentions of:
+1. Increased competition or market share loss.
+2. Raw material cost headwinds or margin compression.
+3. Regulatory hurdles, license risks, or legal proceedings.
+4. Debt stress, working capital issues, or dividend cuts.
+
+Do NOT speculate. Only report what is EXPLICITLY stated in the documents.
 
 Respond ONLY in this exact JSON format (no markdown):
 {{
   "stealth_catalyst_found": true/false,
   "insider_buying_found": true/false,
   "capex_expansion": true/false,
-  "insider_summary": "1-2 sentence plain-English summary of what you found, or NONE if nothing",
+  "insider_summary": "1-2 sentence summary of catalyst found, or NONE",
+  "risk_flags": "1 sentence on risks found, or NONE if no risks mentioned",
+  "risk_severity": 0-3,
   "confidence_score": 0-100
-}}"""
+}}
 
-    raw = _call_openai(prompt, max_tokens=250)
+risk_severity: 0=no risks, 1=minor mentions, 2=significant headwinds, 3=existential threat"""
+
+    raw = _call_openai(prompt, max_tokens=300)
     if raw:
         try:
             parsed = json.loads(re.sub(r"```json|```", "", raw).strip())
@@ -1244,17 +1361,47 @@ Respond ONLY in this exact JSON format (no markdown):
             result["insider_buying_found"]   = bool(parsed.get("insider_buying_found",   False))
             result["capex_signal"]           = bool(parsed.get("capex_expansion",        False))
             result["insider_summary"]        = str(parsed.get("insider_summary", "NONE"))[:200]
-            result["confidence_score"]       = int(parsed.get("confidence_score", 0))
+            result["risk_flags"]             = str(parsed.get("risk_flags", "NONE"))[:150]
+            risk_severity                    = int(parsed.get("risk_severity", 0))
+            base_conf                        = int(parsed.get("confidence_score", 0))
 
-            # Score: insider buying = +25, stealth catalyst = +25, capex = +10
+            # UPGRADE 2.1: Risk penalty on confidence_score
+            # severity 1 = -5, severity 2 = -15, severity 3 = -30
+            risk_penalty = {0: 0, 1: 5, 2: 15, 3: 30}.get(risk_severity, 0)
+            result["risk_penalty"]    = risk_penalty
+            result["confidence_score"] = max(0, base_conf - risk_penalty)
+            if risk_penalty > 0:
+                log.info(f"  ⚠️ Risk penalty {symbol}: severity={risk_severity} "
+                         f"conf {base_conf}→{result['confidence_score']} | {result['risk_flags'][:60]}")
+
+            # UPGRADE 2.3: Promoter Trust / Pledge classification
+            buying = result["insider_buying_found"]
+            if buying and pledge_pct == 0.0:
+                result["pearl_grade"] = "DIAMOND"   # clean promoter buying — max conviction
+                log.info(f"  💎 DIAMOND {symbol}: insider buying + 0% pledge")
+            elif buying and pledge_pct > 50.0:
+                result["pearl_grade"] = "RED_FLAG"  # debt-stressed promoter — veto
+                log.info(f"  🚩 RED_FLAG {symbol}: buying but pledge={pledge_pct:.0f}% — debt stress")
+            elif buying:
+                result["pearl_grade"] = "PEARL"     # buying, pledge unknown or moderate
+            else:
+                result["pearl_grade"] = "WATCH"     # no buying signal
+
+            # Score: diamond=60, pearl=50, catalyst=25, capex=10. Red flag = 0.
             score = 0
-            if result["insider_buying_found"]:   score += 25
-            if result["stealth_catalyst_found"]: score += 25
-            if result["capex_signal"]:           score += 10
-            result["score"] = score
+            if result["pearl_grade"] == "RED_FLAG":
+                score = 0   # hard veto on pledge > 50%
+            else:
+                if result["pearl_grade"] == "DIAMOND":        score += 60
+                elif result["insider_buying_found"]:           score += 50
+                if result["stealth_catalyst_found"]:           score += 25
+                if result["capex_signal"]:                     score += 10
+                score = max(0, score - risk_penalty)   # risk penalty applies to score too
 
-            log.info(f"InsiderAudit {symbol}: catalyst={result['stealth_catalyst_found']} "
-                     f"insider_buy={result['insider_buying_found']} "
+            result["score"] = score
+            log.info(f"InsiderAudit {symbol}: grade={result['pearl_grade']} "
+                     f"catalyst={result['stealth_catalyst_found']} "
+                     f"insider={result['insider_buying_found']} pledge={pledge_pct:.0f}% "
                      f"conf={result['confidence_score']} score={score}")
         except Exception as e:
             log.debug(f"InsiderAudit parse {symbol}: {e}")
@@ -1312,11 +1459,26 @@ def score_stone_math(symbol: str, bhav_row: dict) -> Optional[dict]:
 
     math_score = g1.get("score", 0) + g2.get("score", 0) + g3.get("score", 0)
 
+    # UPGRADE 2.2: Sector Rotation Alpha — bonus/penalty based on sector momentum
+    industry = "Unknown"
+    try:
+        import yfinance as yf
+        info = yf.Ticker(f"{sym}.NS").info
+        industry = info.get("industry", "Unknown") or "Unknown"
+    except Exception:
+        pass
+    sector_alpha, sector_desc = get_sector_alpha(industry)
+    math_score = max(0, math_score + sector_alpha)
+    log.debug(f"  SectorAlpha {sym}: {sector_desc} → score adj {sector_alpha:+d}")
+
     return {
-        "symbol":     sym,
-        "close":      close,
-        "math_score": math_score,
-        "weekly_df":  weekly,
+        "symbol":       sym,
+        "close":        close,
+        "math_score":   math_score,
+        "sector_alpha": sector_alpha,
+        "sector_desc":  sector_desc,
+        "industry":     industry,
+        "weekly_df":    weekly,
         "g1": g1, "g2": g2, "g3": g3,
     }
 
@@ -1343,24 +1505,30 @@ def _send_tg(text: str):
 
 def send_telegram_stones(stones: List[dict], date_label: str, total_scanned: int):
     lines = [
-        f"🕴️ <b>INSIDER SYNDICATE v10.0 — {date_label}</b>",
+        f"🕴️ <b>INSIDER SYNDICATE v12.0 — {date_label}</b>",
         f"Scanned: {total_scanned} | Pearls found: {len(stones)}",
         "",
     ]
     for s in stones[:TOP_N_STONES]:
-        catalyst_tag = "🔥 STEALTH CATALYST" if s.get("stealth_catalyst") else ""
-        insider_tag  = "👤 INSIDER BUYING"   if s.get("insider_buying")   else ""
-        capex_tag    = "🏗 CAPEX"            if s.get("capex_signal")     else ""
+        grade      = s.get("pearl_grade", "WATCH")
+        grade_icon = {"DIAMOND": "💎", "PEARL": "🪨", "WATCH": "👁", "UNKNOWN": "❓"}.get(grade, "🪨")
+        catalyst_tag = "🔥 CATALYST"    if s.get("stealth_catalyst") else ""
+        insider_tag  = "👤 INSIDER BUY" if s.get("insider_buying")   else ""
+        capex_tag    = "🏗 CAPEX"       if s.get("capex_signal")     else ""
         tags = " | ".join(t for t in [catalyst_tag, insider_tag, capex_tag] if t)
+        pledge_str = f" | Pledge {s['pledge_pct']:.0f}%" if s.get("pledge_pct", -1) >= 0 else ""
+        sector_str = f"\n   📊 {s['sector_desc']}" if s.get("sector_alpha", 0) != 0 and s.get("sector_desc") else ""
         lines += [
-            f"💎 <b>{s['symbol']}</b> — Score {s['total_score']} | Conf {s.get('insider_confidence',0)}%",
+            f"{grade_icon} <b>{s['symbol']}</b> [{grade}] — Score {s['total_score']} | Conf {s.get('insider_confidence',0)}%{pledge_str}",
             f"   Close ₹{s['close']:.0f} | {s.get('discount_pct',0):.0f}% below 52W High",
-            f"   EPS {s.get('eps_growth_pct',0):+.0f}% QoQ | Sponge {s.get('sponge_weeks',0)}w",
-            f"   Target ₹{s['target_25pct']:.0f} (+{s['upside_6m_pct']:.0f}% in 6m)",
-            f"   Stop ₹{s['stop_loss']:.0f} | {tags}",
+            f"   EPS {s.get('eps_growth_pct',0):+.0f}% QoQ | Sponge {s.get('sponge_weeks',0)}w{sector_str}",
+            f"   Target ₹{s['target_25pct']:.0f} (+{s['upside_6m_pct']:.0f}% in 6m) | Stop ₹{s['stop_loss']:.0f}",
+            f"   {tags}",
         ]
-        if s.get("insider_summary") and "DATA_MISSING" not in s["insider_summary"]:
+        if s.get("insider_summary") and "DATA_MISSING" not in s.get("insider_summary", ""):
             lines.append(f"   🤫 <i>{s['insider_summary'][:120]}</i>")
+        if s.get("risk_flags") and s.get("risk_flags") not in ("NONE", ""):
+            lines.append(f"   ⚠️ <i>Risk: {s['risk_flags'][:100]}</i>")
         lines.append("")
     if not stones:
         lines.append("No stealth insider action detected this week.")
@@ -1372,45 +1540,86 @@ def send_telegram_stones(stones: List[dict], date_label: str, total_scanned: int
 # ══════════════════════════════════════════════════════════════════════════════
 
 _INCUBATOR_HEADER = [
-    "Date","Symbol","TotalScore","RubbleScore","EPSScore","SpongeScore","InsiderScore",
-    "Close","MA200","Discount%","High52W","Low52W","BoxWeeks","BoxWidth%","MA200Slope%",
-    "EPS_Growth%","EPS_Latest","EPS_Prior","EPS_Metric",
-    "DryUpWeeks","SpongeWeeks",
-    "StealthCatalyst","InsiderBuying","CapexSignal","InsiderConfidence","InsiderSummary",
-    "StopLoss","Target30%","Target80%","Upside6m%","Upside12m%",
+    # Identity
+    "Date", "Symbol", "PearlGrade",
+    # Scores
+    "TotalScore", "RubbleScore", "EPSScore", "SpongeScore", "SectorAlpha", "InsiderScore",
+    # Price & technicals
+    "Close", "MA200", "Discount%", "High52W", "Low52W",
+    "BoxWeeks", "BoxWidth%", "MA200Slope%",
+    # EPS
+    "EPS_Growth%", "EPS_Latest", "EPS_Prior", "EPS_Metric",
+    # Volume
+    "DryUpWeeks", "SpongeWeeks",
+    # Sector
+    "Industry", "SectorDesc",
+    # Insider audit
+    "StealthCatalyst", "InsiderBuying", "CapexSignal",
+    "Pledge%", "InsiderConfidence", "RiskPenalty", "InsiderSummary", "RiskFlags",
+    # Targets
+    "StopLoss", "Target30%", "Target80%", "Upside6m%", "Upside12m%",
 ]
 
 def _stone_to_row(s: dict) -> list:
     return [
-        s.get("run_date",""),        s.get("symbol",""),
-        s.get("total_score",0),      s.get("rubble_score",0),
-        s.get("eps_score",0),        s.get("sponge_score",0),   s.get("insider_score",0),
-        s.get("close",0),            s.get("ma200",0),
-        s.get("discount_pct",0),     s.get("high_52w",0),       s.get("low_52w",0),
-        s.get("box_weeks",0),        s.get("box_width_pct",0),  s.get("ma200_slope_pct",0),
-        s.get("eps_growth_pct",0),   s.get("eps_latest",0),     s.get("eps_prior",0),
-        s.get("eps_metric","EPS"),
-        s.get("dry_up_weeks",0),     s.get("sponge_weeks",0),
+        # Identity
+        s.get("run_date", ""),
+        s.get("symbol", ""),
+        s.get("pearl_grade", "WATCH"),
+        # Scores
+        s.get("total_score", 0),
+        s.get("rubble_score", 0),
+        s.get("eps_score", 0),
+        s.get("sponge_score", 0),
+        s.get("sector_alpha", 0),
+        s.get("insider_score", 0),
+        # Price & technicals
+        s.get("close", 0),
+        s.get("ma200", 0),
+        s.get("discount_pct", 0),
+        s.get("high_52w", 0),
+        s.get("low_52w", 0),
+        s.get("box_weeks", 0),
+        s.get("box_width_pct", 0),
+        s.get("ma200_slope_pct", 0),
+        # EPS
+        s.get("eps_growth_pct", 0),
+        s.get("eps_latest", 0),
+        s.get("eps_prior", 0),
+        s.get("eps_metric", "EPS"),
+        # Volume
+        s.get("dry_up_weeks", 0),
+        s.get("sponge_weeks", 0),
+        # Sector
+        s.get("industry", ""),
+        s.get("sector_desc", ""),
+        # Insider audit
         "✅" if s.get("stealth_catalyst") else "",
         "✅" if s.get("insider_buying")   else "",
         "✅" if s.get("capex_signal")     else "",
-        s.get("insider_confidence",0),
-        s.get("insider_summary","")[:100],
-        s.get("stop_loss",0),
-        s.get("target_25pct",0),     s.get("target_60pct",0),
-        s.get("upside_6m_pct",0),    s.get("upside_12m_pct",0),
+        s.get("pledge_pct", -1),
+        s.get("insider_confidence", 0),
+        s.get("risk_penalty", 0),
+        s.get("insider_summary", "")[:120],
+        s.get("risk_flags", "")[:100],
+        # Targets
+        s.get("stop_loss", 0),
+        s.get("target_25pct", 0),
+        s.get("target_60pct", 0),
+        s.get("upside_6m_pct", 0),
+        s.get("upside_12m_pct", 0),
     ]
 
 def push_stones_to_sheets(stones: List[dict], date_label: str):
     existing = _read_sheet("INCUBATOR")
-    rows = existing if existing else [_INCUBATOR_HEADER]
-    # Remove today's entries if rerun
-    rows = [r for r in rows if not (len(r) > 0 and str(r[0]) == date_label)]
-    if not rows:
-        rows = [_INCUBATOR_HEADER]
+    # Strip header row(s) and today's data rows, always re-write fresh header
+    data_rows = [r for r in existing
+                 if r and str(r[0]) not in (date_label, "Date", _INCUBATOR_HEADER[0])]
+    rows = [_INCUBATOR_HEADER] + data_rows
     for s in stones:
         rows.append(_stone_to_row(s))
     _push_sheet("INCUBATOR", rows)
+    log.info(f"INCUBATOR: {len(stones)} pearls written, {len(rows)-1} total rows ✅")
 
 # ── Sandbox Training Logs ─────────────────────────────────────────────────────
 
@@ -1432,7 +1641,8 @@ def push_run_log(date_label: str, scanned: int, s1: int, halal: int,
                  pearls: int, top5: List[str], duration_sec: float):
     """Append one summary row per run to RUN_LOG tab."""
     existing = _read_sheet("RUN_LOG")
-    rows = existing if existing else [_RUN_LOG_HEADER]
+    data_rows = [r for r in existing if r and str(r[0]) not in ("Date", _RUN_LOG_HEADER[0])]
+    rows = [_RUN_LOG_HEADER] + data_rows
     rows.append([
         date_label, VERSION, scanned, s1, halal, pearls,
         " | ".join(top5), round(duration_sec, 1), "",
@@ -1449,7 +1659,8 @@ def push_rejects_log(rejects: List[dict], date_label: str):
     if not rejects:
         return
     existing = _read_sheet("REJECTS_LOG")
-    rows = existing if existing else [_REJECTS_LOG_HEADER]
+    data_rows = [r for r in existing if r and str(r[0]) not in ("Date", _REJECTS_LOG_HEADER[0])]
+    rows = [_REJECTS_LOG_HEADER] + data_rows
     for r in rejects:
         rows.append([
             date_label,
@@ -1467,13 +1678,13 @@ def push_rejects_log(rejects: List[dict], date_label: str):
 def push_sharia_log(sharia_decisions: List[dict], date_label: str):
     """
     Append all Stage 2 Sharia audit decisions to SHARIA_LOG tab.
-    Each dict: {symbol, compliant, company_name, industry, biz_profile, reason, layer}
     Training corpus for fine-tuning or rule-extraction on halal/haram classifications.
     """
     if not sharia_decisions:
         return
     existing = _read_sheet("SHARIA_LOG")
-    rows = existing if existing else [_SHARIA_LOG_HEADER]
+    data_rows = [r for r in existing if r and str(r[0]) not in ("Date", _SHARIA_LOG_HEADER[0])]
+    rows = [_SHARIA_LOG_HEADER] + data_rows
     for d in sharia_decisions:
         rows.append([
             date_label,
@@ -1510,7 +1721,7 @@ def run():
     bhav = load_universe()
     if bhav.empty:
         log.error("Universe empty — abort")
-        _send_tg(f"❌ <b>INSIDER SYNDICATE v10.0 — {date_label}</b>\nUniverse unavailable.")
+        _send_tg(f"❌ <b>INSIDER SYNDICATE v12.0 — {date_label}</b>\nUniverse unavailable.")
         return []
     _write_sentinel("UNIVERSE_LOADED", {"ROWS": len(bhav)})
 
@@ -1519,7 +1730,7 @@ def run():
     log.info(f"Candidates after turnover gate: {len(cands)}")
 
     if cands.empty:
-        _send_tg(f"📋 <b>INSIDER SYNDICATE v10.0 — {date_label}</b>\nNo candidates after turnover filter.")
+        _send_tg(f"📋 <b>INSIDER SYNDICATE v12.0 — {date_label}</b>\nNo candidates after turnover filter.")
         return []
 
     # ── STAGE 1: Pure Quantitative & Fundamental Sweep ───────────────────────
@@ -1588,12 +1799,17 @@ def run():
         sym = item["symbol"]
         log.info(f"  🕵️ Heisting NSE data for {sym}...")
 
-        # Scrape NSE corporate announcements + SAST insider trades via curl_cffi
-        filings, insiders = fetch_insider_and_filings(sym)
+        # Scrape NSE corporate announcements + SAST insider trades + pledge % via curl_cffi
+        filings, insiders, pledge_pct = fetch_insider_and_filings(sym)
 
-        # Insider Friend LLM reads the legal filings
-        audit = insider_friend_audit(sym, filings, insiders)
+        # Insider Friend LLM reads the legal filings (+ risk extraction + pledge classification)
+        audit = insider_friend_audit(sym, filings, insiders, pledge_pct)
         total_score = item["math_score"] + audit.get("score", 0)
+
+        # Hard veto: promoter buying under debt stress (pledge > 50%)
+        if audit.get("pearl_grade") == "RED_FLAG":
+            log.info(f"  🚩 RED_FLAG VETO {sym} | pledge={pledge_pct:.0f}% debt stress — skip")
+            continue
 
         has_signal   = audit.get("stealth_catalyst_found") or audit.get("insider_buying_found")
         confidence   = audit.get("confidence_score", 0)
@@ -1631,6 +1847,10 @@ def run():
             "ma200_slope_pct":        g1.get("ma200_slope_pct", 0),
             "ma200":                  g1.get("ma200", 0),
             "rubble_score":           g1.get("score", 0),
+            # Sector alpha (upgrade 2.2)
+            "sector_alpha":           item.get("sector_alpha", 0),
+            "sector_desc":            item.get("sector_desc", ""),
+            "industry":               item.get("industry", ""),
             # EPS
             "eps_growth_pct":         g2.get("eps_growth_pct", 0),
             "eps_latest":             g2.get("eps_latest", 0),
@@ -1641,10 +1861,14 @@ def run():
             "dry_up_weeks":           g3.get("dry_up_weeks", 0),
             "sponge_weeks":           g3.get("sponge_weeks", 0),
             "sponge_score":           g3.get("score", 0),
-            # Insider audit
+            # Insider audit (upgrades 2.1 + 2.3)
+            "pearl_grade":            audit.get("pearl_grade", "WATCH"),
             "stealth_catalyst":       audit.get("stealth_catalyst_found", False),
             "insider_buying":         audit.get("insider_buying_found", False),
             "capex_signal":           audit.get("capex_signal", False),
+            "pledge_pct":             audit.get("pledge_pct", -1),
+            "risk_flags":             audit.get("risk_flags", "")[:100],
+            "risk_penalty":           audit.get("risk_penalty", 0),
             "insider_summary":        audit.get("insider_summary", "")[:150],
             "insider_confidence":     audit.get("confidence_score", 0),
             "insider_score":          audit.get("score", 0),
@@ -1657,11 +1881,14 @@ def run():
             "run_date":               date_label,
         })
 
-    # Final sort — prioritise insider signal, then math
-    stones.sort(key=lambda x: (
-        x["insider_buying"] + x["stealth_catalyst"],
-        x["total_score"]
-    ), reverse=True)
+    # Final sort — DIAMOND first, then catalyst+buying, then math score
+    def _sort_key(x):
+        grade_order = {"DIAMOND": 3, "PEARL": 2, "WATCH": 1, "UNKNOWN": 0}
+        return (grade_order.get(x.get("pearl_grade", "UNKNOWN"), 0),
+                int(x.get("stealth_catalyst", False)) + int(x.get("insider_buying", False)),
+                x["total_score"])
+
+    stones.sort(key=_sort_key, reverse=True)
     top_stones = stones[:TOP_N_STONES]
     run_duration = time.time() - run_start
 
@@ -1699,7 +1926,7 @@ def run():
 
     if not top_stones:
         _send_tg(
-            f"🕴️ <b>INSIDER SYNDICATE v10.0 — {date_label}</b>\n"
+            f"🕴️ <b>INSIDER SYNDICATE v12.0 — {date_label}</b>\n"
             f"Scanned {total} stocks. No Pearls surfaced this week.\n"
             f"No stealth insider action detected. We wait in the shadows. 🕐"
         )
@@ -1716,7 +1943,7 @@ def run():
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Fortress Incubator v10.0 Insider Syndicate")
+    parser = argparse.ArgumentParser(description="Fortress Incubator v11.0 Insider Syndicate")
     parser.add_argument("--symbol", help="Score a single symbol for debug")
     args = parser.parse_args()
 
