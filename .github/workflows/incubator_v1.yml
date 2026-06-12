@@ -1,0 +1,123 @@
+name: Fortress Incubator v1.0 Stone Hunter
+
+# ── Concurrency: never let two incubator runs collide ────────────────────────
+concurrency:
+  group: incubator-pipeline
+  cancel-in-progress: true
+
+on:
+  schedule:
+    # Friday 16:00 IST = 10:30 UTC (30 min after NSE Friday close)
+    - cron: '30 10 * * 5'
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Debug single symbol (e.g. CHAMBLFERT). Leave blank for full scan.'
+        required: false
+        default: ''
+
+jobs:
+  incubator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # Stone scan takes longer than sniper (weekly history + LLM)
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── 3. Pip cache ─────────────────────────────────────────────────────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-incubator-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-incubator-${{ runner.os }}-
+
+      # ── 4. Install deps ───────────────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            requests \
+            numpy \
+            pandas \
+            yfinance \
+            gspread \
+            google-auth \
+            google-auth-oauthlib \
+            openai \
+            beautifulsoup4 \
+            lxml \
+            pdfminer.six
+
+      # ── 5. Outputs dir ────────────────────────────────────────────────────────
+      - name: Ensure outputs directory
+        run: mkdir -p outputs
+
+      # ── 6. Full scan ──────────────────────────────────────────────────────────
+      - name: Run Incubator v1.0 — Full Friday Scan
+        if: ${{ github.event.inputs.symbol == '' }}
+        env:
+          # ── LLM ──────────────────────────────────────────────────────────────
+          OPENAI_API_KEY:         ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MINI_MODEL:      gpt-4o-mini
+          # ── Telegram ─────────────────────────────────────────────────────────
+          TELEGRAM_TOKEN:         ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
+          # ── Google Sheets ─────────────────────────────────────────────────────
+          GOOGLE_SHEET_ID:        ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON:      ${{ secrets.GOOGLE_CREDS_JSON }}
+          # ── Alt-data (optional) ────────────────────────────────────────────────
+          SCRAPERAPI_KEY:         ${{ secrets.SCRAPERAPI_KEY }}
+          # ── Stone screening thresholds ─────────────────────────────────────────
+          MIN_PRICE:              15
+          MAX_PRICE:              500
+          MIN_TURNOVER_LAKHS:     20
+          MAX_CANDIDATES:         400
+          STONE_SCORE_MIN:        60
+          TOP_N_STONES:           5
+          # ── Weinstein Stage 1 ──────────────────────────────────────────────────
+          STAGE1_MA200_FLAT_PCT:  0.03      # ±3% slope over 13 weeks
+          STAGE1_BOX_WIDTH_MAX:   0.35      # <35% high/low range
+          STAGE1_BOX_WEEKS_MIN:   12        # ≥12 weeks in base
+          STAGE1_PRICE_FROM_MA200: 0.20     # price within 20% of 200MA
+          # ── EPS gate ──────────────────────────────────────────────────────────
+          EPS_ACCEL_PCT_MIN:      0.25      # ≥25% QoQ EPS growth
+          # ── Sponge volume ──────────────────────────────────────────────────────
+          SPONGE_DRY_VOL_PCT:     0.60      # red weeks < 60% avg vol
+          SPONGE_WET_VOL_PCT:     1.50      # sponge week > 150% avg vol
+          # ── Infrastructure ─────────────────────────────────────────────────────
+          CACHE_PATH:             outputs/incubator_cache.db
+        run: python incubator_v1.py
+
+      # ── 7. Single symbol debug ────────────────────────────────────────────────
+      - name: Run Incubator — Debug Single Symbol
+        if: ${{ github.event.inputs.symbol != '' }}
+        env:
+          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          SCRAPERAPI_KEY:    ${{ secrets.SCRAPERAPI_KEY }}
+          CACHE_PATH:        outputs/incubator_cache.db
+          STONE_SCORE_MIN:   0    # show full score even if below threshold
+        run: python incubator_v1.py --symbol ${{ github.event.inputs.symbol }}
+
+      # ── 8. Upload artifact ────────────────────────────────────────────────────
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: incubator-v1-${{ github.run_id }}
+          path: outputs/
+          retention-days: 30     # keep stones longer than sniper picks
+          if-no-files-found: warn
+          compression-level: 6
