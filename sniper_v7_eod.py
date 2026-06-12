@@ -54,6 +54,14 @@ import requests
 import numpy as np
 import pandas as pd
 
+# v8.0: curl_cffi for NSE Akamai/TLS-fingerprint bypass (SAST + Pledge data)
+try:
+    from curl_cffi import requests as curl_requests
+    _CURL_CFFI_OK = True
+except ImportError:
+    _CURL_CFFI_OK = False
+    log_placeholder = None  # will use log after init
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +74,7 @@ log = logging.getLogger("fortress_v7")
 # SECTION 1 — CONFIGURATION & SECRETS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "FORTRESS v7.5.1.1 — VPOC SCORING RESTORED + GATE RECALIBRATED"
+VERSION = "FORTRESS v8.0 — APEX PREDATOR (SAST+SECTOR_VELOCITY+MATERIALITY+PLEDGE_GATE)"
 
 # ── FIX-C: Secret preflight check ────────────────────────────────────────────
 # Called once at run() start. Warns (not crashes) on missing secrets so the
@@ -177,6 +185,31 @@ CONV_LANE_FUSED_MIN    = int(os.getenv("CONV_LANE_FUSED_MIN", "70"))
 LANE_FORTRESS_MIN = int(os.getenv("LANE_FORTRESS_MIN", "100"))
 LANE_APEX_MIN     = int(os.getenv("LANE_APEX_MIN", "55"))
 LANE_FUSED_MIN    = int(os.getenv("LANE_FUSED_MIN", "60"))
+
+# ── v8.0: Pledge Gate ─────────────────────────────────────────────────────────
+# Promoter pledge > this % → auto-skip (flash-crash risk)
+PLEDGE_GATE_MAX_PCT   = float(os.getenv("PLEDGE_GATE_MAX_PCT", "50.0"))
+PLEDGE_GATE_ENABLED   = os.getenv("PLEDGE_GATE_ENABLED", "true").lower() in ("1","true","yes")
+
+# ── v8.0: Sector Velocity (Momentum Multiplier) ───────────────────────────────
+# Fused score penalty when sector index is bleeding while stock breaks out
+SECTOR_VELOCITY_ENABLED  = os.getenv("SECTOR_VELOCITY_ENABLED", "true").lower() in ("1","true","yes")
+SECTOR_VELOCITY_PENALTY  = float(os.getenv("SECTOR_VELOCITY_PENALTY", "15.0"))  # pts deducted from fused
+# NIFTY sector index symbols mapped to our internal sector labels
+SECTOR_INDEX_MAP: Dict[str, str] = {
+    "IT":        "^CNXIT",
+    "PHARMA":    "^CNXPHARMA",
+    "FMCG":      "^CNXFMCG",
+    "METAL":     "^CNXMETAL",
+    "ENERGY":    "^CNXENERGY",
+    "BANK":      "^NSEBANK",
+    "FINANCE":   "^CNXFINANCE",
+    "REALTY":    "^CNXREALTY",
+    "AUTO":      "^CNXAUTO",
+    "INFRA":     "^CNXINFRA",
+    "CHEMICALS": "^CNXCHEM",
+    "TEXTILE":   "^CNXTEXTILE",
+}
 
 CAPACITY_MAX_OPEN = int(os.getenv("CAPACITY_MAX_OPEN", "4"))
 CAPACITY_MAX_WEEK = int(os.getenv("CAPACITY_MAX_WEEK", "6"))
@@ -2205,6 +2238,7 @@ def bayes_win_probability(fortress: dict, apex: dict,
     mfi   = fortress.get("mfi",   50)
     atr14  = fortress.get("atr14", 1)
     atr100 = fortress.get("atr100", atr14)  # v7.0: use actual atr100, not atr14 twice
+    close  = fortress.get("close", 1) or 1  # FIX: was undefined in v7
     # PATCH-1: use natr for Bayesian volatility comparisons
     natr14_b  = fortress.get("natr14",  atr14  / (close + 1e-9))
     natr100_b = fortress.get("natr100", atr100 / (close + 1e-9))
@@ -2247,6 +2281,7 @@ def llm_enrich_pick(symbol: str, fortress: dict, apex: dict,
         "llm_why": fortress.get("story","Technical setup"),
         "llm_verdict": "QUALIFIED", "llm_confidence": 0.60,
         "llm_catalyst": "", "llm_narrative": "",
+        "llm_material_catalyst": True,  # v8.0
     }
     if not _OPENAI_OK:
         return default
@@ -2270,25 +2305,40 @@ Filing: {fil.get('subject','None')[:60]}
 Alt-data: {alt_match.get('match_label','') or 'None'}
 Delivery%: {fortress.get('delivery_pct',0):.0f}% | VolRatio: {fortress.get('vol_ratio',1):.1f}x
 
+CRITICAL MATERIALITY RULE (v8.0):
+- The company market cap is approximately ₹{round(fortress.get('close',0) * 5e6 / 1e7, 0):.0f} Cr (estimated).
+- If any tender/contract/export value is mentioned in the alt-data or filing, you MUST check:
+  Is the monetary value >= 2% of the estimated market cap?
+  If NO → classify that catalyst as "NOISE" and set "has_material_catalyst" to false.
+  If YES → it is material; set "has_material_catalyst" to true.
+- Do NOT hype small-value contracts as "NEW CONTRACT WIN" for large companies.
+
 Respond ONLY as JSON (no markdown):
 {{
   "verdict": "STRONG_BUY|BUY|HOLD|SKIP",
   "confidence": 0.0-1.0,
   "why": "≤15 words: key edge",
   "catalyst": "primary catalyst or empty string",
+  "has_material_catalyst": true/false,
   "risk_note": "≤10 words: main risk"
 }}"""
 
-    raw = _call_openai(prompt, max_tokens=200, cache_ttl_days=1)
+    raw = _call_openai(prompt, max_tokens=250, cache_ttl_days=1)
     if raw:
         try:
             parsed = json.loads(re.sub(r"```json|```", "", raw).strip())
+            # v8.0: if LLM says catalyst is noise, zero it out
+            catalyst_str = str(parsed.get("catalyst",""))
+            if not parsed.get("has_material_catalyst", True):
+                catalyst_str = ""   # MATERIALITY FILTER: LLM classified as NOISE
+                log.debug(f"LLM materiality filter: {sym} catalyst classified NOISE")
             return {
                 "llm_why":       str(parsed.get("why",""))[:120],
                 "llm_verdict":   str(parsed.get("verdict","QUALIFIED")),
                 "llm_confidence": float(parsed.get("confidence", 0.60)),
-                "llm_catalyst":  str(parsed.get("catalyst",""))[:80],
+                "llm_catalyst":  catalyst_str[:80],
                 "llm_narrative": str(parsed.get("risk_note",""))[:80],
+                "llm_material_catalyst": bool(parsed.get("has_material_catalyst", True)),
             }
         except Exception:
             pass
@@ -2603,6 +2653,216 @@ def _intelligence_hash(fii_data: dict, insider_map: dict, filings: dict) -> str:
     data = f"{fii_data.get('label')}{len(insider_map)}{len(filings)}"
     return hashlib.md5(data.encode()).hexdigest()[:8]
 
+# ══════════════════════════════════════════════════════════════════════════════
+# v8.0 UPGRADE 1 — SAST INSIDER CHECK (Real Whale Injection)
+# Uses curl_cffi TLS-fingerprint bypass to hit NSE SAST endpoint.
+# Called AFTER a stock passes Fortress/APEX math gate.
+# If Promoter/Director bought in last 72h AND matches volume spike → DIAMOND.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _nse_sast_check(symbol: str, days_back: int = 3) -> dict:
+    """
+    Fetch NSE SAST (Substantial Acquisition of Shares / Insider Trading) filings
+    for the given symbol using curl_cffi Akamai bypass.
+
+    Returns:
+        {
+          "promoter_bought": bool,   # True if Promoter/Director buy in last 72h
+          "total_value_cr": float,   # Total acquisition value in Crores
+          "acquirer":       str,     # Name of acquirer
+          "trade_date":     str,     # Most recent trade date
+          "sast_ok":        bool,    # curl_cffi available and call succeeded
+        }
+    Falls back gracefully to {"promoter_bought": False, "sast_ok": False} on any failure.
+    """
+    fallback = {"promoter_bought": False, "total_value_cr": 0.0,
+                "acquirer": "", "trade_date": "", "sast_ok": False}
+    if not _CURL_CFFI_OK:
+        log.debug(f"SAST {symbol}: curl_cffi not installed — pip install curl_cffi")
+        return fallback
+    cutoff = (datetime.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    try:
+        # Step 1: warm up NSE session with curl_cffi (impersonate Chrome)
+        sess = curl_requests.Session(impersonate="chrome110")
+        sess.get("https://www.nseindia.com", timeout=12,
+                 headers={**_NSE_HEADERS, "Accept": "text/html"})
+        time.sleep(1.0)
+        # Step 2: fetch insider trading / SAST data
+        url = (f"https://www.nseindia.com/api/corporates-pit"
+               f"?symbol={symbol}&issuer=&from={cutoff}&to="
+               f"{datetime.today().strftime('%Y-%m-%d')}"
+               f"&ca_type=insider")
+        resp = sess.get(url, timeout=15,
+                        headers={**_NSE_HEADERS,
+                                 "Accept": "application/json, text/plain, */*",
+                                 "X-Requested-With": "XMLHttpRequest",
+                                 "Referer": f"https://www.nseindia.com/companies-listing/corporate-filings-insider-trading"})
+        if resp.status_code != 200:
+            log.debug(f"SAST {symbol}: HTTP {resp.status_code}")
+            return {**fallback, "sast_ok": True}
+        data  = resp.json()
+        rows  = data.get("data", data) if isinstance(data, dict) else data
+        best: dict = {}
+        total_val  = 0.0
+        for row in (rows if isinstance(rows, list) else []):
+            # category check: Promoter / Director / KMP are meaningful
+            category = str(row.get("acqType", "") or row.get("personCategory", "")).lower()
+            if not any(k in category for k in ["promoter", "director", "kmp", "cfo", "ceo"]):
+                continue
+            txn_type = str(row.get("tdpTransactionType", "") or row.get("transactionType", "")).upper()
+            if "BUY" not in txn_type and "ACQUIRE" not in txn_type:
+                continue
+            shares = float(row.get("secAcq", 0) or row.get("sharesAcquired", 0) or 0)
+            price  = float(row.get("tdpAcqPrice", 0) or row.get("pricePerShare", 0) or 0)
+            val_cr = shares * price / 1e7
+            total_val += val_cr
+            if val_cr > best.get("total_value_cr", 0):
+                best = {
+                    "promoter_bought": True,
+                    "total_value_cr":  round(val_cr, 2),
+                    "acquirer":        str(row.get("acqName", "") or row.get("personName", ""))[:60],
+                    "trade_date":      str(row.get("tdpTransactionDate", "") or
+                                          row.get("dateOfAcquisition", ""))[:10],
+                    "sast_ok":         True,
+                }
+        if best:
+            best["total_value_cr"] = round(total_val, 2)
+            log.info(f"SAST {symbol}: Promoter buy ₹{total_val:.1f}Cr by {best['acquirer']} ✅")
+            return best
+        return {**fallback, "sast_ok": True}
+    except Exception as e:
+        log.debug(f"SAST {symbol}: {e}")
+        return fallback
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v8.0 UPGRADE 2 — SECTOR ALPHA (Momentum Multiplier)
+# Fetches NIFTY sector index change % to detect dying sectors.
+# A perfect breakout in a bleeding sector is a bull trap.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SECTOR_ALPHA_CACHE: Dict[str, dict] = {}
+_SECTOR_ALPHA_LOCK  = threading.Lock()
+
+def get_sector_alpha(sector: str) -> dict:
+    """
+    Fetch the daily % change for the NIFTY sector index corresponding to `sector`.
+    Returns:
+        {
+          "sector_chg_pct": float,   # today's % change of sector index
+          "sector_ok":      bool,    # True = sector healthy (not bleeding)
+          "index_symbol":   str,     # e.g. "^CNXIT"
+          "source":         str,
+        }
+    Cached per run (one call per sector). Falls back to neutral on failure.
+    """
+    with _SECTOR_ALPHA_LOCK:
+        if sector in _SECTOR_ALPHA_CACHE:
+            return _SECTOR_ALPHA_CACHE[sector]
+
+    fallback = {"sector_chg_pct": 0.0, "sector_ok": True,
+                "index_symbol": "", "source": "FALLBACK"}
+    idx_sym = SECTOR_INDEX_MAP.get(sector.upper())
+    if not idx_sym or not SECTOR_VELOCITY_ENABLED:
+        with _SECTOR_ALPHA_LOCK:
+            _SECTOR_ALPHA_CACHE[sector] = fallback
+        return fallback
+
+    try:
+        sess = _get_nse_session()
+        resp = sess.get(
+            "https://www.nseindia.com/api/allIndices",
+            headers={**_NSE_HEADERS,
+                     "Accept": "application/json, text/plain, */*",
+                     "X-Requested-With": "XMLHttpRequest"},
+            timeout=12
+        )
+        if resp.status_code != 200:
+            raise ValueError(f"allIndices HTTP {resp.status_code}")
+        indices = resp.json().get("data", [])
+        # Match by indexSymbol or index name
+        for idx in indices:
+            sym_field = str(idx.get("indexSymbol", "") or idx.get("index", "")).upper()
+            if sym_field == idx_sym.lstrip("^").upper() or idx_sym.lstrip("^").upper() in sym_field:
+                chg = float(idx.get("percentChange", idx.get("pChange", 0.0)) or 0)
+                result = {
+                    "sector_chg_pct": round(chg, 2),
+                    "sector_ok":      chg >= -1.0,   # bleeding = down > 1%
+                    "index_symbol":   idx_sym,
+                    "source":         "NSE_ALLINDICES",
+                }
+                with _SECTOR_ALPHA_LOCK:
+                    _SECTOR_ALPHA_CACHE[sector] = result
+                log.debug(f"SectorAlpha {sector} ({idx_sym}): {chg:+.2f}% "
+                          f"{'✅' if result['sector_ok'] else '🩸'}")
+                return result
+    except Exception as e:
+        log.debug(f"get_sector_alpha {sector}: {e}")
+
+    with _SECTOR_ALPHA_LOCK:
+        _SECTOR_ALPHA_CACHE[sector] = fallback
+    return fallback
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v8.0 UPGRADE 4 — PLEDGE GATE (Flash-Crash Shield)
+# Fetches promoter pledge % via curl_cffi NSE bypass.
+# If pledge > PLEDGE_GATE_MAX_PCT → SKIPPED regardless of technicals.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PLEDGE_CACHE: Dict[str, float] = {}
+_PLEDGE_LOCK  = threading.Lock()
+
+def _fetch_pledge_pct(symbol: str) -> float:
+    """
+    Fetch promoter pledge % from NSE shareholding pattern API.
+    Returns pledge % (0–100). Returns -1.0 if data unavailable (non-fatal).
+    Cached per symbol per run.
+    """
+    with _PLEDGE_LOCK:
+        if symbol in _PLEDGE_CACHE:
+            return _PLEDGE_CACHE[symbol]
+
+    pledge_pct = -1.0
+    try:
+        if _CURL_CFFI_OK:
+            sess = curl_requests.Session(impersonate="chrome110")
+            sess.get("https://www.nseindia.com", timeout=10,
+                     headers={**_NSE_HEADERS, "Accept": "text/html"})
+            time.sleep(0.5)
+            resp = sess.get(
+                f"https://www.nseindia.com/api/corporates-shp?symbol={symbol}",
+                timeout=12,
+                headers={**_NSE_HEADERS,
+                         "Accept": "application/json, text/plain, */*",
+                         "X-Requested-With": "XMLHttpRequest",
+                         "Referer": "https://www.nseindia.com/"}
+            )
+        else:
+            nse_sess = _get_nse_session()
+            resp = nse_sess.get(
+                f"https://www.nseindia.com/api/corporates-shp?symbol={symbol}",
+                headers={**_NSE_HEADERS, "X-Requested-With": "XMLHttpRequest"},
+                timeout=12
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            rows = data.get("data", data) if isinstance(data, dict) else data
+            for row in (rows if isinstance(rows, list) else []):
+                cat = str(row.get("category", "") or row.get("shareholderType", "")).lower()
+                if "promoter" in cat:
+                    pledged = float(row.get("pledgedSharesPct", 0) or
+                                    row.get("percentPledged", 0) or 0)
+                    if pledged >= 0:
+                        pledge_pct = pledged
+                        break
+    except Exception as e:
+        log.debug(f"_fetch_pledge_pct {symbol}: {e}")
+
+    with _PLEDGE_LOCK:
+        _PLEDGE_CACHE[symbol] = pledge_pct
+    return pledge_pct
+
 def score_one_symbol(args: tuple) -> Optional[dict]:
     """
     v7.5: Full gate diagnostics on every rejection.
@@ -2661,10 +2921,22 @@ def score_one_symbol(args: tuple) -> Optional[dict]:
             ma200 = fort.get("ma200", 0) if fort else 0
             _rej("FORT_PTS_LOW",
                  f"fort={fp}/200 close={close:.0f} ma50={ma50:.0f} ma200={ma200:.0f} "
-                 f"uptrend={'✅' if ut else '❌'} "
+                 f"uptrend={'✅' if (fort.get('uptrend_ok') if fort else False) else '❌'} "
                  f"rsi={fort.get('rsi14',0):.0f} adx={fort.get('adx14',0):.0f}"
                  if fort else f"fort={fp}/200")
             return None
+
+        # ── v8.0 UPGRADE 4: PLEDGE GATE (Flash-Crash Shield) ────────────────
+        # Check BEFORE halal/apex — no point scoring a debt-stressed company.
+        if PLEDGE_GATE_ENABLED:
+            pledge_pct = _fetch_pledge_pct(sym)
+            if pledge_pct >= 0 and pledge_pct > PLEDGE_GATE_MAX_PCT:
+                log.info(f"  GATE {'PLEDGE_GATE':18s} | {sym:14s} | "
+                         f"pledge={pledge_pct:.1f}% > {PLEDGE_GATE_MAX_PCT:.0f}% "
+                         f"SKIPPED | reason: Debt-Stress Flash Crash Risk")
+                return None
+        else:
+            pledge_pct = -1.0
 
         # Halal L2-L4
         sector = get_sector(sym)
@@ -2680,6 +2952,39 @@ def score_one_symbol(args: tuple) -> Optional[dict]:
         apex_d  = apex_composite(sym, fort, hist, macro, fii_data)
         bayes_p = bayes_win_probability(fort, apex_d, macro, order_flow)
         fused   = fused_score(fort, apex_d, bayes_p)
+
+        # ── v8.0 UPGRADE 2: SECTOR VELOCITY (Momentum Multiplier) ───────────
+        # If sector index is bleeding, slash fused score to prevent bull-trap entries.
+        sector_alpha = get_sector_alpha(sector)
+        sector_bleeding = not sector_alpha.get("sector_ok", True)
+        if sector_bleeding and SECTOR_VELOCITY_ENABLED:
+            penalty = SECTOR_VELOCITY_PENALTY
+            fused   = max(0.0, round(fused - penalty, 1))
+            log.info(f"  SectorVelocity PENALTY {sym:14s} | "
+                     f"sector={sector} idx={sector_alpha.get('index_symbol','')} "
+                     f"chg={sector_alpha.get('sector_chg_pct',0):+.2f}% "
+                     f"fused-={penalty:.0f} → fused={fused:.1f}")
+            fort["story"] = (fort.get("story","") +
+                             f" | ⚠️ SECTOR BLEED {sector_alpha.get('sector_chg_pct',0):+.2f}%")
+
+        # ── v8.0 UPGRADE 1: SAST INSIDER CHECK (Real Whale Injection) ───────
+        # Only runs after stock passes math gates (keeps total latency low).
+        # 2-second NSE Heist: if volume spike + Promoter/Director buying → DIAMOND.
+        sast_result = {"promoter_bought": False, "total_value_cr": 0.0,
+                       "acquirer": "", "trade_date": "", "sast_ok": False}
+        diamond_upgrade = False
+        if order_flow.get("whale_flag") or order_flow.get("vol_ratio", 1.0) >= 1.5:
+            # Only heist when there's a volume spike worth investigating
+            sast_result = _nse_sast_check(sym, days_back=3)
+            if sast_result.get("promoter_bought") and sast_result.get("total_value_cr", 0) > 0:
+                diamond_upgrade = True
+                fort["grade"]  = "DIAMOND"
+                fort["story"]  = (fort.get("story","") +
+                                  f" | 💎 SAST: {sast_result['acquirer'][:30]} "
+                                  f"₹{sast_result['total_value_cr']:.1f}Cr PROMOTER BUY "
+                                  f"({sast_result['trade_date']})")
+                log.info(f"  💎 DIAMOND UPGRADE {sym}: SAST promoter buy confirmed "
+                         f"₹{sast_result['total_value_cr']:.1f}Cr")
 
         if fused < APEX_MIN_SCORE:
             _rej("FUSED_LOW",
@@ -2780,6 +3085,16 @@ def score_one_symbol(args: tuple) -> Optional[dict]:
             "bayes_pct":    bayes_p,
             "confidence_score": conf,          # v7.0 NEW
             "uptrend_ok":   fort.get("uptrend_ok", False),   # v7.0 NEW
+            # v8.0 NEW fields
+            "diamond_upgrade":    diamond_upgrade,
+            "sast_promoter_buy":  sast_result.get("promoter_bought", False),
+            "sast_value_cr":      sast_result.get("total_value_cr", 0.0),
+            "sast_acquirer":      sast_result.get("acquirer", ""),
+            "sector_chg_pct":     sector_alpha.get("sector_chg_pct", 0.0),
+            "sector_bleeding":    sector_bleeding,
+            "pledge_pct":         pledge_pct,
+            "llm_material_catalyst": llm.get("llm_material_catalyst", True),
+            # existing fields
             "close":        close,
             "stop_loss":    fort.get("stop_loss", 0),
             "buy_lo":       fort.get("buy_lo", 0),
@@ -2868,6 +3183,9 @@ _SCREENER_HEADER = [
     "Whale","VPOC","MA50","MA200","RS_Pct","HasCatalyst","AltData","HalalTier",
     "LLM_Verdict","LLM_Why","LLM_Catalyst","Story","MacroState","Lane",
     "MetaP_Win","KellyMult",
+    # v8.0 NEW
+    "Diamond","SAST_Buy","SAST_Cr","SAST_Acquirer",
+    "SectorChg%","SectorBleeding","PledgePct","MaterialCatalyst",
 ]
 
 def _pick_to_row(p: dict, date_label: str, lane: str = "",
@@ -2900,6 +3218,15 @@ def _pick_to_row(p: dict, date_label: str, lane: str = "",
         lane.upper(),
         round(p.get("meta_p_win", 0.5), 3),
         round(kelly_mult, 3),
+        # v8.0 NEW columns
+        "💎" if p.get("diamond_upgrade") else "",
+        "✅" if p.get("sast_promoter_buy") else "",
+        round(p.get("sast_value_cr", 0), 2),
+        p.get("sast_acquirer", "")[:40],
+        round(p.get("sector_chg_pct", 0), 2),
+        "🩸" if p.get("sector_bleeding") else "✅",
+        round(p.get("pledge_pct", -1), 1),
+        "✅" if p.get("llm_material_catalyst", True) else "NOISE",
     ]
 
 def push_screener_to_sheets(winners: dict, date_label: str,
@@ -2952,13 +3279,16 @@ def send_telegram_picks(winners: dict, macro: dict, fii_data: dict,
     for lane, w in winners.items():
         if not w:
             continue
-        conf = w.get("confidence_score", 0)
+        conf    = w.get("confidence_score", 0)
+        diamond = "💎 DIAMOND | " if w.get("diamond_upgrade") else ""
+        bleed   = f" | 🩸 SECTOR {w.get('sector_chg_pct',0):+.1f}%" if w.get("sector_bleeding") else ""
+        pledge  = f" | ⚠️ Pledge {w.get('pledge_pct',0):.0f}%" if (w.get("pledge_pct",-1) >= 0) else ""
         lines += [
-            f"🏆 <b>[{lane.upper()}] {w['symbol']}</b> — {w.get('grade','')}",
+            f"🏆 <b>[{lane.upper()}] {diamond}{w['symbol']}</b> — {w.get('grade','')}",
             f"   Fused={w.get('fused',0):.1f} | Conf={conf:.2f} | "
             f"Bayes={w.get('bayes_pct',0):.0f}%",
             f"   Uptrend={'✅' if w.get('uptrend_ok') else '❌'} | "
-            f"Entry ₹{w.get('buy_lo',0):.0f}–{w.get('buy_hi',0):.0f}",
+            f"Entry ₹{w.get('buy_lo',0):.0f}–{w.get('buy_hi',0):.0f}{bleed}{pledge}",
             f"   Stop ₹{w.get('stop_loss',0):.0f} | R1 ₹{w.get('r1',0):.0f}",
             f"   📖 {w.get('llm_why') or w.get('story','')[:60]}",
             "",
@@ -3182,8 +3512,13 @@ def run():
     log.info(f"  {VERSION}")
     log.info(f"  FIX-A NSE retry+curl | FIX-B sentinel | FIX-C preflight")
     log.info(f"  PATCH-1 NATR | PATCH-2 DynNIFTY50 | PATCH-3 MFI-Catalyst | PATCH-4 PctVPOC")
+    log.info(f"  v8.0: SAST Real-Whale | Sector-Velocity | Materiality-Filter | Pledge-Gate")
+    log.info(f"  curl_cffi: {'AVAILABLE' if _CURL_CFFI_OK else 'NOT INSTALLED (pip install curl_cffi)'}")
     log.info(f"  Uptrend Gate: ON | Confidence Min: {CONFIDENCE_MIN} | "
              f"Std Max: {CONFIDENCE_STD_MAX}")
+    log.info(f"  Pledge Gate: {'ON' if PLEDGE_GATE_ENABLED else 'OFF'} > {PLEDGE_GATE_MAX_PCT:.0f}% → SKIP")
+    log.info(f"  Sector Velocity: {'ON' if SECTOR_VELOCITY_ENABLED else 'OFF'} "
+             f"penalty={SECTOR_VELOCITY_PENALTY:.0f}pts when sector bleeding")
     log.info(f"{'='*70}")
 
     _init_db()
