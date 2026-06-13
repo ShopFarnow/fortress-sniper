@@ -8,3 +8,5 @@ tenacity
 cloudscraper
 openai
 lxml
+pytesseract>=0.3.10
+pdf2image>=1.17.0
